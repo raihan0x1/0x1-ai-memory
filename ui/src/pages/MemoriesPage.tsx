@@ -1,12 +1,32 @@
 import { useEffect, useState } from 'react';
 import { api, formatUtcTime } from '../api';
+import { IconSearch } from '../components/Icons';
 import { ModalDialog } from '../components/ModalDialog';
+import { RimSelect } from '../components/RimSelect';
 import type { ContextPreviewResponse, MemoryDetail, MemoryHit, Project } from '../types';
 
 interface MemoriesPageProps {
   projects: Project[];
   onChanged: () => Promise<void>;
 }
+
+const TYPE_OPTIONS = [
+  { value: '', label: 'All types' },
+  { value: 'decision', label: 'decision' },
+  { value: 'architecture', label: 'architecture' },
+  { value: 'bugfix', label: 'bugfix' },
+  { value: 'preference', label: 'preference' },
+  { value: 'pattern', label: 'pattern' },
+  { value: 'session_summary', label: 'session_summary' },
+];
+
+const CLIENT_OPTIONS = [
+  { value: '', label: 'All clients' },
+  { value: 'claude-code', label: 'Claude Code' },
+  { value: 'codex', label: 'Codex' },
+  { value: 'antigravity', label: 'Antigravity' },
+  { value: 't3-code', label: 'T3 Code' },
+];
 
 function readParam(name: string): string {
   return new URLSearchParams(window.location.search).get(name) ?? '';
@@ -23,7 +43,6 @@ export function MemoriesPage({ projects, onChanged }: MemoriesPageProps) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  // Inline disclosure & editing (modal is last resort in Hallmark app screens)
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [expandedDetail, setExpandedDetail] = useState<MemoryDetail | null>(null);
   const [editTitle, setEditTitle] = useState('');
@@ -35,7 +54,11 @@ export function MemoriesPage({ projects, onChanged }: MemoriesPageProps) {
   const [previewOpen, setPreviewOpen] = useState(false);
   const [preview, setPreview] = useState<ContextPreviewResponse | null>(null);
 
-  // Sync filter state to URL
+  const projectOptions = [
+    { value: '', label: 'All projects' },
+    ...projects.map((p) => ({ value: p.id, label: p.name, meta: p.privacy_mode })),
+  ];
+
   useEffect(() => {
     const url = new URL(window.location.href);
     const entries: [string, string][] = [
@@ -151,57 +174,43 @@ export function MemoriesPage({ projects, onChanged }: MemoriesPageProps) {
       </div>
 
       <div className="toolbar">
-        <input
-          type="search"
-          className="input"
-          aria-label="Search memories"
-          style={{ flex: '1 1 260px' }}
-          placeholder="Search decisions, bugfixes, files, or concepts"
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-        />
-        <select
-          className="select"
-          aria-label="Filter by project"
+        <div className="search-field">
+          <IconSearch className="search-field-icon" />
+          <input
+            type="search"
+            className="input"
+            aria-label="Search memories"
+            placeholder="Search decisions, bugfixes, files, or concepts"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+          />
+        </div>
+
+        <RimSelect
+          ariaLabel="Filter by project"
           value={projectId}
-          onChange={(e) => setProjectId(e.target.value)}
-        >
-          <option value="">All projects</option>
-          {projects.map((p) => (
-            <option key={p.id} value={p.id}>
-              {p.name}
-            </option>
-          ))}
-        </select>
-        <select
-          className="select"
-          aria-label="Filter by type"
+          options={projectOptions}
+          onChange={setProjectId}
+        />
+
+        <RimSelect
+          ariaLabel="Filter by type"
           value={memType}
-          onChange={(e) => setMemType(e.target.value)}
-        >
-          <option value="">All types</option>
-          <option value="decision">decision</option>
-          <option value="architecture">architecture</option>
-          <option value="bugfix">bugfix</option>
-          <option value="preference">preference</option>
-          <option value="pattern">pattern</option>
-          <option value="session_summary">session_summary</option>
-        </select>
-        <select
-          className="select"
-          aria-label="Filter by AI client"
+          options={TYPE_OPTIONS}
+          onChange={setMemType}
+        />
+
+        <RimSelect
+          ariaLabel="Filter by AI client"
           value={sourceClient}
-          onChange={(e) => setSourceClient(e.target.value)}
-        >
-          <option value="">All clients</option>
-          <option value="claude-code">Claude Code</option>
-          <option value="codex">Codex</option>
-          <option value="antigravity">Antigravity</option>
-          <option value="t3-code">T3 Code</option>
-        </select>
-        <label style={{ display: 'inline-flex', alignItems: 'center', gap: 'var(--space-xs)', fontSize: 'var(--text-xs)' }}>
+          options={CLIENT_OPTIONS}
+          onChange={setSourceClient}
+        />
+
+        <label className="rim-check-label">
           <input
             type="checkbox"
+            className="rim-check"
             checked={includeInactive}
             onChange={(e) => setIncludeInactive(e.target.checked)}
           />

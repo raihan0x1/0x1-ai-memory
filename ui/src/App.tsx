@@ -132,8 +132,15 @@ export function App() {
 
           <div className="topbar-meta" role="status">
             <span className="measure">${(summary?.today_cost_usd ?? 0).toFixed(4)} USD</span>
-            <span className={sseConnected ? 'telemetry-live' : 'telemetry-offline'}>
-              {sseConnected ? 'SSE live' : 'SSE offline'}
+            <span className="topbar-sep" aria-hidden="true" />
+            <span className="telemetry-status">
+              <span
+                className={`signal-square${sseConnected ? '' : ' signal-square--offline'}`}
+                aria-hidden="true"
+              />
+              <span className={sseConnected ? 'telemetry-live' : 'telemetry-offline'}>
+                {sseConnected ? 'SSE live' : 'SSE offline'}
+              </span>
             </span>
           </div>
         </div>

@@ -1,6 +1,7 @@
 import { useState, type FormEvent } from 'react';
 import { api, formatUtcTime } from '../api';
 import { ModalDialog } from '../components/ModalDialog';
+import { RimSelect } from '../components/RimSelect';
 import type { MemoryHit, Project, UsageSummary } from '../types';
 import type { Tab } from '../App';
 
@@ -13,6 +14,36 @@ interface StreamPageProps {
   onRefresh: () => Promise<void>;
   onNavigate: (tab: Tab) => void;
 }
+
+const CLIENT_OPTIONS = [
+  { value: '', label: 'All AI clients' },
+  { value: 'claude-code', label: 'Claude Code' },
+  { value: 'codex', label: 'Codex' },
+  { value: 'antigravity', label: 'Antigravity' },
+  { value: 't3-code', label: 'T3 Code' },
+  { value: 'mcp', label: 'MCP' },
+  { value: 'ui', label: 'Manual UI' },
+];
+
+const PRIVACY_OPTIONS = [
+  { value: 'full', label: 'Full', meta: 'distill' },
+  { value: 'local_only', label: 'Local-only', meta: 'no API' },
+  { value: 'paused', label: 'Paused', meta: 'off' },
+];
+
+const SCOPE_OPTIONS = [
+  { value: 'project', label: 'Project (shared across all AI clients)' },
+  { value: 'global', label: 'Global (personal preference across repos)' },
+];
+
+const TYPE_OPTIONS = [
+  { value: 'decision', label: 'decision' },
+  { value: 'architecture', label: 'architecture' },
+  { value: 'bugfix', label: 'bugfix' },
+  { value: 'preference', label: 'preference' },
+  { value: 'pattern', label: 'pattern' },
+  { value: 'session_summary', label: 'session_summary' },
+];
 
 export function StreamPage({
   summary,
@@ -54,6 +85,11 @@ export function StreamPage({
   });
 
   const activeProjectObj = projects.find((p) => p.id === projectFilter);
+  const projectFilterOptions = [
+    { value: '', label: 'All projects' },
+    ...projects.map((p) => ({ value: p.id, label: p.name, meta: p.privacy_mode })),
+  ];
+  const projectTargetOptions = projects.map((p) => ({ value: p.id, label: p.name }));
 
   async function handleSave(e: FormEvent) {
     e.preventDefault();
@@ -87,6 +123,8 @@ export function StreamPage({
     await onRefresh();
   }
 
+  const isZeroLlm = !summary || summary.active_provider === 'none';
+
   return (
     <div>
       <div className="page-head">
@@ -106,47 +144,61 @@ export function StreamPage({
         </div>
       </div>
 
-      {/* Signature Rim telemetry strip with corner ticks and tabular measurements */}
       <section className="metrics-strip ticks" aria-label="Live telemetry and budget meter">
         <div className="metric-cell">
-          <span className="metric-label">Daily spend</span>
-          <div className="metric-value">
-            ${(summary?.today_cost_usd ?? 0).toFixed(4)}
-            <span className="metric-unit">USD</span>
+          <div className="metric-head">
+            <span className="metric-label">Daily spend</span>
+            <div className="metric-value">
+              ${(summary?.today_cost_usd ?? 0).toFixed(4)}
+              <span className="metric-unit">USD</span>
+            </div>
           </div>
-          <span className="metric-sub measure">
-            {(summary?.today_total_tokens ?? 0).toLocaleString()} /{' '}
-            {(summary?.daily_token_cap ?? 250000).toLocaleString()} tok (cap $
-            {(summary?.daily_cost_cap_usd ?? 0.5).toFixed(2)})
-          </span>
-          <div className="meter-track" aria-label={`Daily budget used: ${budgetPct}%`}>
-            <div className={`meter-fill ${meterClass}`} style={{ width: `${budgetPct}%` }} />
+          <div>
+            <span className="metric-sub measure">
+              {(summary?.today_total_tokens ?? 0).toLocaleString()} /{' '}
+              {(summary?.daily_token_cap ?? 250000).toLocaleString()} tok (cap $
+              {(summary?.daily_cost_cap_usd ?? 0.5).toFixed(2)})
+            </span>
+            <div className="meter-row">
+              <div className="meter-track" aria-label={`Daily budget used: ${budgetPct}%`}>
+                <div className={`meter-fill ${meterClass}`} style={{ width: `${budgetPct}%` }} />
+              </div>
+              <span className="meter-pct measure">{budgetPct}%</span>
+            </div>
           </div>
         </div>
 
         <div className="metric-cell">
-          <span className="metric-label">Memory engine</span>
-          <div className="metric-value">{summary?.active_provider ?? 'none'}</div>
+          <div className="metric-head">
+            <span className="metric-label">Memory engine</span>
+            <div className={`metric-value${isZeroLlm ? ' metric-value--muted' : ''}`}>
+              {summary?.active_provider ?? 'none'}
+            </div>
+          </div>
           <span className="metric-sub">
-            {summary?.active_provider === 'none'
+            {isZeroLlm
               ? 'Zero-LLM safe mode ($0)'
               : `${summary?.active_model} (zero silent fallback)`}
           </span>
         </div>
 
         <div className="metric-cell">
-          <span className="metric-label">Active memories</span>
-          <div className="metric-value">{summary?.total_memories ?? 0}</div>
+          <div className="metric-head">
+            <span className="metric-label">Active memories</span>
+            <div className="metric-value">{summary?.total_memories ?? 0}</div>
+          </div>
           <span className="metric-sub measure">
-            {summary?.total_projects ?? 0} projects, {summary?.pending_raw_events ?? 0} raw events
-            queued
+            {summary?.total_projects ?? 0} projects, {summary?.pending_raw_events ?? 0} queued raw
+            events
           </span>
         </div>
 
         <div className="metric-cell">
-          <span className="metric-label">Stream and vectors</span>
-          <div className="metric-value metric-value--signal">
-            {sseConnected ? 'Live' : 'Offline'}
+          <div className="metric-head">
+            <span className="metric-label">Stream and vectors</span>
+            <div className="metric-value metric-value--signal">
+              {sseConnected ? 'Live' : 'Offline'}
+            </div>
           </div>
           <span className="metric-sub">{summary?.embedding_status ?? 'fts5'}</span>
         </div>
@@ -165,50 +217,37 @@ export function StreamPage({
       ) : null}
 
       <div className="toolbar">
-        <select
-          className="select"
-          aria-label="Filter by project"
+        <RimSelect
+          ariaLabel="Filter by project"
           value={projectFilter}
-          onChange={(e) => setProjectFilter(e.target.value)}
-        >
-          <option value="">All projects</option>
-          {projects.map((p) => (
-            <option key={p.id} value={p.id}>
-              {p.name} ({p.privacy_mode})
-            </option>
-          ))}
-        </select>
+          options={projectFilterOptions}
+          onChange={setProjectFilter}
+        />
 
-        <select
-          className="select"
-          aria-label="Filter by AI client"
+        <RimSelect
+          ariaLabel="Filter by AI client"
           value={clientFilter}
-          onChange={(e) => setClientFilter(e.target.value)}
-        >
-          <option value="">All AI clients</option>
-          <option value="claude-code">Claude Code</option>
-          <option value="codex">Codex</option>
-          <option value="antigravity">Antigravity</option>
-          <option value="t3-code">T3 Code</option>
-          <option value="mcp">MCP</option>
-          <option value="ui">Manual UI</option>
-        </select>
+          options={CLIENT_OPTIONS}
+          onChange={setClientFilter}
+        />
 
         {activeProjectObj ? (
-          <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-xs)', marginLeft: 'auto' }}>
-            <label htmlFor="proj-privacy" className="field-hint">
-              Project privacy
-            </label>
-            <select
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 'var(--space-xs)',
+              marginLeft: 'auto',
+            }}
+          >
+            <span className="field-hint">Project privacy</span>
+            <RimSelect
               id="proj-privacy"
-              className="select"
+              ariaLabel="Project privacy mode"
               value={activeProjectObj.privacy_mode}
-              onChange={(e) => handlePrivacyChange(activeProjectObj.id, e.target.value)}
-            >
-              <option value="full">Full (distill with active engine)</option>
-              <option value="local_only">Local-only (never call external API)</option>
-              <option value="paused">Paused (stop capturing)</option>
-            </select>
+              options={PRIVACY_OPTIONS}
+              onChange={(mode) => void handlePrivacyChange(activeProjectObj.id, mode)}
+            />
           </div>
         ) : null}
       </div>
@@ -236,6 +275,9 @@ export function StreamPage({
               No memories recorded yet. Connect Claude Code, Codex, Antigravity, or T3 Code, or save
               a decision directly.
             </p>
+            <span className="field-hint measure">
+              Local MCP ready at {window.location.origin}/mcp
+            </span>
             <div className="head-actions">
               <button
                 type="button"
@@ -308,49 +350,39 @@ export function StreamPage({
           <div className="grid-2">
             <div className="field">
               <label htmlFor="sm-scope">Scope</label>
-              <select
+              <RimSelect
                 id="sm-scope"
-                className="select"
+                ariaLabel="Memory scope"
+                fullWidth
                 value={scope}
-                onChange={(e) => setScope(e.target.value as 'project' | 'global')}
-              >
-                <option value="project">Project (shared across all AI clients)</option>
-                <option value="global">Global (personal preference across repos)</option>
-              </select>
+                options={SCOPE_OPTIONS}
+                onChange={(v) => setScope(v as 'project' | 'global')}
+              />
             </div>
             <div className="field">
               <label htmlFor="sm-type">Type</label>
-              <select
+              <RimSelect
                 id="sm-type"
-                className="select"
+                ariaLabel="Memory type"
+                fullWidth
                 value={memType}
-                onChange={(e) => setMemType(e.target.value)}
-              >
-                <option value="decision">decision</option>
-                <option value="architecture">architecture</option>
-                <option value="bugfix">bugfix</option>
-                <option value="preference">preference</option>
-                <option value="pattern">pattern</option>
-                <option value="session_summary">session_summary</option>
-              </select>
+                options={TYPE_OPTIONS}
+                onChange={setMemType}
+              />
             </div>
           </div>
 
-          {scope === 'project' && projects.length > 0 ? (
+          {scope === 'project' && projectTargetOptions.length > 0 ? (
             <div className="field">
               <label htmlFor="sm-project">Project</label>
-              <select
+              <RimSelect
                 id="sm-project"
-                className="select"
+                ariaLabel="Target project"
+                fullWidth
                 value={targetProject || projectFilter || projects[0]?.id || ''}
-                onChange={(e) => setTargetProject(e.target.value)}
-              >
-                {projects.map((p) => (
-                  <option key={p.id} value={p.id}>
-                    {p.name}
-                  </option>
-                ))}
-              </select>
+                options={projectTargetOptions}
+                onChange={setTargetProject}
+              />
             </div>
           ) : null}
 

@@ -1,60 +1,81 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import { api, formatUtcTime } from '../api';
+import { RimSelect } from '../components/RimSelect';
 import type { ConnectionTestResult, SettingsView, UsageEntry } from '../types';
 
 const PROVIDER_PRESETS: Record<
   string,
-  { label: string; model: string; baseUrl: string; note: string }
+  { label: string; meta: string; model: string; baseUrl: string; note: string }
 > = {
   none: {
-    label: 'Zero-LLM safe mode ($0)',
+    label: 'Zero-LLM safe mode',
+    meta: '$0',
     model: '',
     baseUrl: '',
     note: 'No background LLM calls. Hybrid FTS5 and vector search plus explicit memory_save run at $0 cost.',
   },
   openrouter: {
-    label: 'OpenRouter (recommended cheap API)',
+    label: 'OpenRouter (recommended)',
+    meta: 'API',
     model: 'google/gemini-2.5-flash-lite',
     baseUrl: 'https://openrouter.ai/api/v1',
     note: 'Decoupled distillation via OpenRouter with reasoning disabled and exact cost tracking. Supports env:OPENROUTER_API_KEY.',
   },
   gemini: {
     label: 'Google Gemini API',
+    meta: 'API',
     model: 'gemini-2.5-flash-lite',
     baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
     note: 'Direct JSON distillation via Gemini API. Supports env:GEMINI_API_KEY.',
   },
   ollama: {
     label: 'Ollama (local LLM)',
+    meta: 'local',
     model: 'qwen2.5-coder:7b',
     baseUrl: 'http://127.0.0.1:11434/v1',
     note: 'Zero external traffic and $0 API cost using your local Ollama server.',
   },
   openai_compatible: {
     label: 'OpenAI-compatible endpoint',
+    meta: 'API',
     model: 'gpt-4.1-nano',
     baseUrl: 'https://api.openai.com/v1',
     note: 'Works with OpenAI, LM Studio, DeepSeek, Groq, vLLM, or any /v1/chat/completions server.',
   },
   cli_claude: {
-    label: 'Opt-in: Claude CLI (claude -p)',
+    label: 'Claude CLI (claude -p)',
+    meta: 'opt-in',
     model: 'haiku',
     baseUrl: '',
     note: 'OPT-IN WARNING: Uses your Claude rolling quota and carries Anthropic consumer OAuth ToS caveats. Protected by OX1_MEMORY_INTERNAL=1 and disabled hooks.',
   },
   cli_codex: {
-    label: 'Opt-in: Codex CLI (codex exec)',
+    label: 'Codex CLI (codex exec)',
+    meta: 'opt-in',
     model: '',
     baseUrl: '',
     note: 'OPT-IN WARNING: Uses your Codex or ChatGPT rolling quota. Runs ephemeral read-only with features.hooks=false.',
   },
   cli_agy: {
-    label: 'Opt-in: Antigravity CLI (agy -p)',
+    label: 'Antigravity CLI (agy -p)',
+    meta: 'opt-in',
     model: '',
     baseUrl: '',
     note: 'OPT-IN WARNING: Uses Antigravity quota. Guarded by OX1_MEMORY_INTERNAL=1 recursion prevention.',
   },
 };
+
+const PROVIDER_OPTIONS = Object.entries(PROVIDER_PRESETS).map(([value, p]) => ({
+  value,
+  label: p.label,
+  meta: p.meta,
+}));
+
+const EMBEDDING_OPTIONS = [
+  { value: 'local_onnx', label: 'Local ONNX (fastembed, free and offline)', meta: '384d' },
+  { value: 'fts_only', label: 'FTS5 BM25 only (zero model download)', meta: 'BM25' },
+  { value: 'api', label: 'API embeddings (uses configured base URL)', meta: 'API' },
+];
 
 interface EnginePageProps {
   onSaved: () => Promise<void>;
@@ -219,18 +240,14 @@ export function EnginePage({ onSaved }: EnginePageProps) {
           <div className="grid-2">
             <div className="field">
               <label htmlFor="eng-provider">Memory LLM provider</label>
-              <select
+              <RimSelect
                 id="eng-provider"
-                className="select"
+                ariaLabel="Memory LLM provider"
+                fullWidth
                 value={provider}
-                onChange={(e) => onProviderChange(e.target.value)}
-              >
-                {Object.entries(PROVIDER_PRESETS).map(([k, v]) => (
-                  <option key={k} value={k}>
-                    {v.label}
-                  </option>
-                ))}
-              </select>
+                options={PROVIDER_OPTIONS}
+                onChange={onProviderChange}
+              />
             </div>
 
             <div className="field">
@@ -316,16 +333,14 @@ export function EnginePage({ onSaved }: EnginePageProps) {
           <div className="grid-2">
             <div className="field">
               <label htmlFor="eng-emb">Embeddings mode (1 runtime, no Python)</label>
-              <select
+              <RimSelect
                 id="eng-emb"
-                className="select"
+                ariaLabel="Embeddings mode"
+                fullWidth
                 value={embeddingMode}
-                onChange={(e) => setEmbeddingMode(e.target.value)}
-              >
-                <option value="local_onnx">Local ONNX (fastembed 384d, free and offline)</option>
-                <option value="fts_only">FTS5 BM25 only (zero model download)</option>
-                <option value="api">API embeddings (uses configured base URL)</option>
-              </select>
+                options={EMBEDDING_OPTIONS}
+                onChange={setEmbeddingMode}
+              />
             </div>
             <div className="field">
               <label htmlFor="eng-brief">SessionStart briefing budget (tokens)</label>
