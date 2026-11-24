@@ -9,7 +9,6 @@ ARCH="$(uname -m)"
 
 case "$OS:$ARCH" in
   Darwin:arm64|Darwin:aarch64) ASSET="0x1-memory-darwin-arm64.tar.gz" ;;
-  Darwin:x86_64)               ASSET="0x1-memory-darwin-x64.tar.gz" ;;
   Linux:x86_64|Linux:amd64)    ASSET="0x1-memory-linux-x64.tar.gz" ;;
   *)
     echo "No prebuilt binary for ${OS}/${ARCH} yet. Build from source:" >&2
