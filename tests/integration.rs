@@ -238,4 +238,93 @@ async fn end_to_end_cross_client_mcp_hooks_ui_and_budget_guard() {
     .await;
     let usage = state.db.recent_usage(5).unwrap();
     assert_eq!(usage[0].status, "budget_blocked");
+
+    // 7. Regression: /api/memories/{id}/timeline does NOT deadlock
+    let mems = state.db.search_memories(&Default::default(), None).unwrap();
+    assert!(!mems.is_empty());
+    let tl_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/memories/{}/timeline", mems[0].id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(tl_resp.status(), StatusCode::OK);
+    let tl_json = body_json(tl_resp).await;
+    assert_eq!(tl_json["timeline"].as_array().unwrap().len(), 1);
+
+    // 8. Regression: Non-localhost Origin and DNS-rebinding Host headers are blocked (403)
+    let evil_origin = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/memories")
+                .header("origin", "https://evil.example")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(evil_origin.status(), StatusCode::FORBIDDEN);
+
+    let evil_host = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/memories")
+                .header("host", "evil.example:41777")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(evil_host.status(), StatusCode::FORBIDDEN);
+
+    let ok_origin = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/memories")
+                .header("host", "127.0.0.1:41777")
+                .header("origin", "http://127.0.0.1:41777")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ok_origin.status(), StatusCode::OK);
+
+    // 9. Regression: local_only blocks cli_* providers too (zero off-machine leakage)
+    let proj_id = ox1_memory::project::resolve_project(&repo_dir).id;
+    state
+        .db
+        .set_project_privacy(&proj_id, "local_only")
+        .unwrap();
+    settings.provider = "cli_claude".into();
+    settings.daily_token_cap = 250_000;
+    state.db.save_settings(&settings).unwrap();
+    state
+        .db
+        .insert_raw_event(
+            &sess.id,
+            &proj_id,
+            "claude-code",
+            "prompt",
+            None,
+            r#"{"prompt":"secret repo"}"#,
+        )
+        .unwrap();
+    let usage_before = state.db.recent_usage(20).unwrap().len();
+    distill_session_once(
+        &state.db,
+        &state.embedder,
+        &state.llm,
+        &state.events_tx,
+        &sess.id,
+    )
+    .await;
+    assert_eq!(state.db.recent_usage(20).unwrap().len(), usage_before);
 }

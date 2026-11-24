@@ -175,8 +175,11 @@ async fn execute_tool_call(
                 .map(ToOwned::to_owned);
             let project_id =
                 resolve_optional_project(db, args.get("project").and_then(|v| v.as_str()));
+            let allow_ext = !db.is_project_local_only(project_id.as_deref());
             let q_vec = match query.as_deref() {
-                Some(q) if !q.trim().is_empty() => embedder.embed_text(q, &settings).await,
+                Some(q) if !q.trim().is_empty() => {
+                    embedder.embed_text(q, &settings, Some(db), allow_ext).await
+                }
                 _ => None,
             };
             let filter = SearchFilter {
@@ -256,8 +259,11 @@ async fn execute_tool_call(
                 .to_string();
             let project_id =
                 resolve_optional_project(db, args.get("project").and_then(|v| v.as_str()));
+            let allow_ext = !db.is_project_local_only(project_id.as_deref());
             let embed_input = format!("{title}\n{summary}\n{content}");
-            let vec = embedder.embed_text(&embed_input, &settings).await;
+            let vec = embedder
+                .embed_text(&embed_input, &settings, Some(db), allow_ext)
+                .await;
             let input = NewMemoryInput {
                 scope: args
                     .get("scope")
@@ -330,10 +336,22 @@ async fn execute_tool_call(
                     .and_then(|v| v.as_str())
                     .map(ToOwned::to_owned),
             };
+            let needs_reembed =
+                patch.title.is_some() || patch.summary.is_some() || patch.content.is_some();
             let updated = db
                 .update_memory(id, patch, None)
                 .map_err(|e| (-32603, e.to_string()))?;
             if let Some(ref mem) = updated {
+                if needs_reembed {
+                    let allow_ext = !db.is_project_local_only(mem.project_id.as_deref());
+                    let text = format!("{}\n{}\n{}", mem.title, mem.summary, mem.content);
+                    if let Some(vec) = embedder
+                        .embed_text(&text, &settings, Some(db), allow_ext)
+                        .await
+                    {
+                        let _ = db.set_memory_embedding(&mem.id, &vec);
+                    }
+                }
                 let _ = events_tx.send(StreamEvent {
                     kind: "memory_updated".into(),
                     timestamp: Utc::now().to_rfc3339(),

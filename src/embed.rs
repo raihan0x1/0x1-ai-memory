@@ -1,4 +1,6 @@
 use crate::config::{EMBEDDING_DIM, Settings};
+use crate::db::MemoryDb;
+use crate::scrub::redact_secrets;
 use anyhow::{Context, Result};
 use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 use serde_json::json;
@@ -87,21 +89,87 @@ impl Embedder {
         }
     }
 
-    /// Computes a 384-dim embedding if ready/configured. Never blocks startup or crashes FTS5 search.
-    pub async fn embed_text(&self, text: &str, settings: &Settings) -> Option<Vec<f32>> {
-        let trimmed = text.trim();
+    /// Computes a 384-dim embedding if ready/configured.
+    /// Always redacts secrets FIRST, respects `local_only` privacy, and enforces daily caps + ledger on API calls.
+    pub async fn embed_text(
+        &self,
+        text: &str,
+        settings: &Settings,
+        db: Option<&MemoryDb>,
+        allow_external_api: bool,
+    ) -> Option<Vec<f32>> {
+        let scrubbed = redact_secrets(text);
+        let trimmed = scrubbed.trim();
         if trimmed.is_empty() {
             return None;
         }
         match settings.embedding_mode.as_str() {
             "fts_only" => None,
-            "api" => match self.embed_via_api(trimmed, settings).await {
-                Ok(vec) => Some(vec),
-                Err(e) => {
-                    tracing::warn!(error = %e, "API embedding failed; falling back to FTS5");
-                    None
+            "api" => {
+                if !allow_external_api && !settings.is_local_base_url() {
+                    tracing::info!("Skipping external API embedding for local_only project");
+                    return None;
                 }
-            },
+                if let Some(ledger_db) = db
+                    && let Ok(summary) =
+                        ledger_db.usage_summary(settings, self.status_label(settings))
+                    && summary.budget_exhausted
+                {
+                    let _ = ledger_db.record_usage(
+                        &settings.provider,
+                        &settings.embedding_model,
+                        "embed",
+                        0,
+                        0,
+                        0.0,
+                        None,
+                        "budget_blocked",
+                        Some("Daily budget cap reached before API embedding"),
+                    );
+                    return None;
+                }
+                match self.embed_via_api(trimmed, settings).await {
+                    Ok((vec, tokens)) => {
+                        if let Some(ledger_db) = db {
+                            let cost = if settings.is_local_base_url() {
+                                0.0
+                            } else {
+                                (tokens as f64 / 1_000_000.0) * 0.02
+                            };
+                            let _ = ledger_db.record_usage(
+                                &settings.provider,
+                                &settings.embedding_model,
+                                "embed",
+                                tokens,
+                                0,
+                                cost,
+                                None,
+                                "ok",
+                                None,
+                            );
+                        }
+                        Some(vec)
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        if let Some(ledger_db) = db {
+                            let _ = ledger_db.record_usage(
+                                &settings.provider,
+                                &settings.embedding_model,
+                                "embed",
+                                0,
+                                0,
+                                0.0,
+                                None,
+                                "error",
+                                Some(&msg),
+                            );
+                        }
+                        tracing::warn!(error = %msg, "API embedding failed; falling back to FTS5");
+                        None
+                    }
+                }
+            }
             _ => {
                 let state = self.local_state.lock().unwrap().clone();
                 match state {
@@ -133,17 +201,66 @@ impl Embedder {
         }
     }
 
-    async fn embed_via_api(&self, text: &str, settings: &Settings) -> Result<Vec<f32>> {
+    async fn embed_via_api(&self, text: &str, settings: &Settings) -> Result<(Vec<f32>, i64)> {
         let base = settings.effective_base_url();
+        let input_text = text.chars().take(4000).collect::<String>();
+        let est_tokens = (input_text.len() / 4).max(1) as i64;
+
+        if settings.provider == "gemini" {
+            let api_key = settings
+                .resolve_api_key()
+                .context("Missing Gemini API key for embeddings")?;
+            let model = if settings.embedding_model.trim().is_empty()
+                || settings.embedding_model == "all-MiniLM-L6-v2"
+            {
+                "text-embedding-004".to_string()
+            } else {
+                settings
+                    .embedding_model
+                    .trim_start_matches("models/")
+                    .to_string()
+            };
+            let url = format!("{base}/models/{model}:embedContent");
+            let body = json!({
+                "model": format!("models/{model}"),
+                "content": { "parts": [{ "text": input_text }] },
+                "outputDimensionality": EMBEDDING_DIM
+            });
+            let resp = self
+                .http
+                .post(&url)
+                .header("x-goog-api-key", api_key)
+                .json(&body)
+                .send()
+                .await
+                .context("Gemini embedding HTTP request failed")?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let err_body = resp.text().await.unwrap_or_default();
+                anyhow::bail!("Gemini Embedding API {status}: {err_body}");
+            }
+            let val: serde_json::Value = resp.json().await?;
+            let arr = val["embedding"]["values"]
+                .as_array()
+                .context("Missing embedding.values in Gemini response")?;
+            let raw: Vec<f32> = arr
+                .iter()
+                .filter_map(|v| v.as_f64().map(|f| f as f32))
+                .collect();
+            return Ok((fit_to_dim(&raw, EMBEDDING_DIM), est_tokens));
+        }
+
         let url = format!("{base}/embeddings");
-        let model = if settings.embedding_model.trim().is_empty() {
+        let model = if settings.embedding_model.trim().is_empty()
+            || settings.embedding_model == "all-MiniLM-L6-v2"
+        {
             "text-embedding-3-small".to_string()
         } else {
             settings.embedding_model.clone()
         };
         let mut body = json!({
             "model": model,
-            "input": text.chars().take(4000).collect::<String>(),
+            "input": input_text,
         });
         if model.contains("text-embedding-3") {
             body["dimensions"] = json!(EMBEDDING_DIM);
@@ -162,11 +279,12 @@ impl Embedder {
         let arr = val["data"][0]["embedding"]
             .as_array()
             .context("Missing data[0].embedding in response")?;
+        let tokens = val["usage"]["total_tokens"].as_i64().unwrap_or(est_tokens);
         let raw: Vec<f32> = arr
             .iter()
             .filter_map(|v| v.as_f64().map(|f| f as f32))
             .collect();
-        Ok(fit_to_dim(&raw, EMBEDDING_DIM))
+        Ok((fit_to_dim(&raw, EMBEDDING_DIM), tokens))
     }
 }
 

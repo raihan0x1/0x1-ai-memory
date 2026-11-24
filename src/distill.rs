@@ -87,10 +87,11 @@ pub async fn distill_session_once(
         return;
     }
 
-    if privacy_mode == "local_only" && settings.is_external_api() {
+    if privacy_mode == "local_only" && settings.is_external_destination() {
         tracing::info!(
             project = %project_name,
-            "Skipping external LLM distillation for local_only project"
+            provider = %settings.provider,
+            "Skipping off-machine LLM distillation for local_only project"
         );
         let _ = db.mark_events_distilled(&event_ids);
         return;
@@ -161,7 +162,14 @@ pub async fn distill_session_once(
                     continue;
                 }
                 let embed_input = format!("{}\n{}\n{}", item.title, item.summary, item.content);
-                let vec = embedder.embed_text(&embed_input, &settings).await;
+                let vec = embedder
+                    .embed_text(
+                        &embed_input,
+                        &settings,
+                        Some(db),
+                        privacy_mode != "local_only",
+                    )
+                    .await;
                 let input = NewMemoryInput {
                     scope: item.scope,
                     project_id: Some(project_id.clone()),
@@ -233,14 +241,18 @@ async fn run_periodic_maintenance(
         }
     }
 
-    // 2. Backfill embeddings once lazy ONNX embedder becomes ready
+    // 2. Backfill embeddings once lazy ONNX embedder becomes ready (respecting local_only)
     if settings.embedding_mode != "fts_only"
         && let Ok(missing) = db.memories_missing_embeddings(10)
     {
-        for (mem_id, text) in missing {
-            if let Some(vec) = embedder.embed_text(&text, &settings).await {
+        for (mem_id, proj_id, text) in missing {
+            let allow_ext = !db.is_project_local_only(proj_id.as_deref());
+            if let Some(vec) = embedder
+                .embed_text(&text, &settings, Some(db), allow_ext)
+                .await
+            {
                 let _ = db.set_memory_embedding(&mem_id, &vec);
-            } else {
+            } else if settings.embedding_mode == "local_onnx" {
                 break;
             }
         }

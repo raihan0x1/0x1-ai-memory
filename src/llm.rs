@@ -390,7 +390,9 @@ impl MemoryLlmClient {
             .arg("-c")
             .arg("features.hooks=false")
             .arg("-c")
-            .arg("features.codex_hooks=false");
+            .arg("features.codex_hooks=false")
+            .arg("-c")
+            .arg("mcp_servers={}");
         if !settings.model.trim().is_empty() && !settings.model.contains('/') {
             cmd.arg("-m").arg(&settings.model);
         }

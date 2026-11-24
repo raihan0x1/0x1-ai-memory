@@ -270,7 +270,7 @@ impl ConnectorManager {
         let _ = self.backup_file(&settings_json)?;
 
         // 1. ~/.claude.json -> mcpServers["0x1-memory"]
-        let mut cj = read_json(&claude_json).unwrap_or_else(|_| json!({}));
+        let mut cj = read_json_or_empty(&claude_json)?;
         ensure_object(&mut cj);
         let servers = cj
             .as_object_mut()
@@ -288,7 +288,7 @@ impl ConnectorManager {
         write_json(&claude_json, &cj)?;
 
         // 2. ~/.claude/settings.json -> hooks
-        let mut sj = read_json(&settings_json).unwrap_or_else(|_| json!({}));
+        let mut sj = read_json_or_empty(&settings_json)?;
         ensure_object(&mut sj);
         let hooks = sj
             .as_object_mut()
@@ -422,11 +422,22 @@ impl ConnectorManager {
         let backup = self.backup_file(&config_toml)?;
         let _ = self.backup_file(&hooks_json)?;
 
-        // 1. Format-preserving TOML update via toml_edit
-        let existing_toml = std::fs::read_to_string(&config_toml).unwrap_or_default();
-        let mut doc = existing_toml
-            .parse::<DocumentMut>()
-            .unwrap_or_else(|_| DocumentMut::new());
+        // 1. Format-preserving TOML update via toml_edit (fail-safe: never clobber invalid TOML)
+        let mut doc = if config_toml.exists() {
+            let existing_toml = std::fs::read_to_string(&config_toml)?;
+            if existing_toml.trim().is_empty() {
+                DocumentMut::new()
+            } else {
+                existing_toml.parse::<DocumentMut>().with_context(|| {
+                    format!(
+                        "Refusing to overwrite invalid TOML in {} (fix syntax first)",
+                        config_toml.display()
+                    )
+                })?
+            }
+        } else {
+            DocumentMut::new()
+        };
 
         if !doc.contains_key("features") {
             doc["features"] = Item::Table(Table::new());
@@ -449,11 +460,10 @@ impl ConnectorManager {
         srv["tools"] = Item::Table(tools);
         doc["mcp_servers"]["0x1_memory"] = Item::Table(srv);
 
-        ensure_parent_dir(&config_toml)?;
-        std::fs::write(&config_toml, doc.to_string())?;
+        write_atomic(&config_toml, &doc.to_string())?;
 
         // 2. ~/.codex/hooks.json (static command so SHA-256 trust never breaks!)
-        let mut hj = read_json(&hooks_json).unwrap_or_else(|_| json!({}));
+        let mut hj = read_json_or_empty(&hooks_json)?;
         ensure_object(&mut hj);
         let hooks = hj
             .as_object_mut()
@@ -489,7 +499,7 @@ impl ConnectorManager {
                 "hooks": [{
                     "type": "command",
                     "command": static_cmd,
-                    "timeout": 10
+                    "timeoutSec": 10
                 }]
             });
             if let Some(m) = matcher {
@@ -570,6 +580,8 @@ impl ConnectorManager {
 
     fn connect_antigravity(&self) -> Result<Option<String>> {
         let plugin_dir = self.home_dir.join(".gemini/config/plugins/0x1-memory");
+        let backup = self.backup_file(&plugin_dir.join("hooks.json"))?;
+        let _ = self.backup_file(&plugin_dir.join("mcp_config.json"))?;
         std::fs::create_dir_all(plugin_dir.join("rules"))?;
         let bin = self.bin_str();
         let cmd = format!("\"{bin}\" hook antigravity --port {}", self.port);
@@ -621,8 +633,8 @@ impl ConnectorManager {
             }),
         )?;
 
-        std::fs::write(
-            plugin_dir.join("rules/AGENTS.md"),
+        write_atomic(
+            &plugin_dir.join("rules/AGENTS.md"),
             "# 0x1-ai-memory\n\n\
              You have shared cross-agent memory via the `0x1-memory` MCP server (shared with Claude Code, Codex, and T3 Code).\n\
              - Use `memory_search` to check prior architectural decisions or bugfixes before re-investigating.\n\
@@ -630,7 +642,7 @@ impl ConnectorManager {
              - Use `memory_save` when the user states a durable preference or makes a key architectural decision.\n",
         )?;
 
-        Ok(Some(plugin_dir.display().to_string()))
+        Ok(backup.or_else(|| Some(plugin_dir.display().to_string())))
     }
 
     fn disconnect_antigravity(&self) -> Result<()> {
@@ -690,11 +702,34 @@ fn read_json(path: &Path) -> Result<Value> {
     Ok(serde_json::from_str(&raw)?)
 }
 
-fn write_json(path: &Path, val: &Value) -> Result<()> {
+/// Returns empty JSON object only when file doesn't exist or is blank; fails safely on corrupt JSON.
+fn read_json_or_empty(path: &Path) -> Result<Value> {
+    if !path.exists() {
+        return Ok(json!({}));
+    }
+    let raw = std::fs::read_to_string(path)?;
+    if raw.trim().is_empty() {
+        return Ok(json!({}));
+    }
+    serde_json::from_str(&raw).with_context(|| {
+        format!(
+            "Refusing to overwrite invalid JSON in {} (fix syntax or comments first)",
+            path.display()
+        )
+    })
+}
+
+fn write_atomic(path: &Path, content: &str) -> Result<()> {
     ensure_parent_dir(path)?;
-    let pretty = serde_json::to_string_pretty(val)?;
-    std::fs::write(path, format!("{pretty}\n"))?;
+    let tmp = path.with_extension("ox1-tmp");
+    std::fs::write(&tmp, content)?;
+    std::fs::rename(&tmp, path)?;
     Ok(())
+}
+
+fn write_json(path: &Path, val: &Value) -> Result<()> {
+    let pretty = serde_json::to_string_pretty(val)?;
+    write_atomic(path, &format!("{pretty}\n"))
 }
 
 fn ensure_object(val: &mut Value) {
@@ -737,13 +772,15 @@ mod tests {
         let settings_raw = std::fs::read_to_string(home.join(".claude/settings.json")).unwrap();
         assert_eq!(settings_raw.matches("hook claude SessionStart").count(), 1);
 
-        // Connect Codex (preserves TOML comments!)
+        // Connect Codex (preserves TOML comments and uses Codex `timeoutSec` schema!)
         let codex = mgr.connect("codex", &db).unwrap();
         assert!(codex.connected);
         assert!(codex.needs_manual_step);
         let toml_raw = std::fs::read_to_string(home.join(".codex/config.toml")).unwrap();
         assert!(toml_raw.contains("# keep my comment"));
         assert!(toml_raw.contains("[mcp_servers.0x1_memory]"));
+        let codex_hooks_raw = std::fs::read_to_string(home.join(".codex/hooks.json")).unwrap();
+        assert!(codex_hooks_raw.contains("\"timeoutSec\": 10"));
 
         // Connect Antigravity (atomic plugin)
         let agy = mgr.connect("antigravity", &db).unwrap();
@@ -757,5 +794,19 @@ mod tests {
         assert!(!mgr.disconnect("claude-code", &db).unwrap().connected);
         assert!(!mgr.disconnect("codex", &db).unwrap().connected);
         assert!(!mgr.disconnect("antigravity", &db).unwrap().connected);
+
+        // Regression test: never silently clobber corrupt JSON or TOML configs
+        std::fs::write(home.join(".claude.json"), "{ // invalid jsonc").unwrap();
+        assert!(mgr.connect("claude-code", &db).is_err());
+        assert_eq!(
+            std::fs::read_to_string(home.join(".claude.json")).unwrap(),
+            "{ // invalid jsonc"
+        );
+        std::fs::write(home.join(".codex/config.toml"), "[broken =").unwrap();
+        assert!(mgr.connect("codex", &db).is_err());
+        assert_eq!(
+            std::fs::read_to_string(home.join(".codex/config.toml")).unwrap(),
+            "[broken ="
+        );
     }
 }

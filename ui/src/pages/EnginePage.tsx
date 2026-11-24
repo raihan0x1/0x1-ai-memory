@@ -95,6 +95,7 @@ export function EnginePage({ onSaved }: EnginePageProps) {
   const [dailyCostCap, setDailyCostCap] = useState(0.5);
   const [sessionBudget, setSessionBudget] = useState(450);
   const [embeddingMode, setEmbeddingMode] = useState('local_onnx');
+  const [embeddingModel, setEmbeddingModel] = useState('all-MiniLM-L6-v2');
   const [retentionDays, setRetentionDays] = useState(14);
   const [idleSeconds, setIdleSeconds] = useState(120);
 
@@ -117,6 +118,7 @@ export function EnginePage({ onSaved }: EnginePageProps) {
       setDailyCostCap(s.daily_cost_cap_usd);
       setSessionBudget(s.session_start_token_budget);
       setEmbeddingMode(s.embedding_mode);
+      setEmbeddingModel(s.embedding_model);
       setRetentionDays(s.raw_event_retention_days);
       setIdleSeconds(s.distill_idle_seconds);
     } catch (e) {
@@ -152,6 +154,7 @@ export function EnginePage({ onSaved }: EnginePageProps) {
         daily_cost_cap_usd: Number(dailyCostCap),
         session_start_token_budget: Number(sessionBudget),
         embedding_mode: embeddingMode,
+        embedding_model: embeddingModel,
         raw_event_retention_days: Number(retentionDays),
         distill_idle_seconds: Number(idleSeconds),
       };
@@ -357,6 +360,22 @@ export function EnginePage({ onSaved }: EnginePageProps) {
               />
             </div>
           </div>
+
+          {embeddingMode === 'api' ? (
+            <div className="field">
+              <label htmlFor="eng-emb-model">API embedding model</label>
+              <span className="field-hint">
+                e.g. text-embedding-3-small (OpenAI/OpenRouter), text-embedding-004 (Gemini), or
+                all-minilm (Ollama)
+              </span>
+              <input
+                id="eng-emb-model"
+                className="input input--mono"
+                value={embeddingModel}
+                onChange={(e) => setEmbeddingModel(e.target.value)}
+              />
+            </div>
+          ) : null}
 
           <div className="grid-2">
             <div className="field">

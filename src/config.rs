@@ -219,14 +219,37 @@ impl Settings {
         )
     }
 
+    /// True if dispatching to the active provider sends data off-machine (APIs or CLI tools).
+    pub fn is_external_destination(&self) -> bool {
+        match self.provider.as_str() {
+            "none" | "ollama" => false,
+            "openai_compatible" => !is_localhost_url(&self.effective_base_url()),
+            _ => true,
+        }
+    }
+
+    pub fn is_local_base_url(&self) -> bool {
+        is_localhost_url(&self.effective_base_url())
+    }
+
     pub fn redacted(&self) -> SettingsView {
         let has_key = self.resolve_api_key().is_some();
-        let masked = if self.api_key.trim().starts_with("env:") {
-            self.api_key.trim().to_string()
-        } else if self.api_key.trim().len() >= 8 {
-            let trimmed = self.api_key.trim();
-            format!("{}...{}", &trimmed[..4], &trimmed[trimmed.len() - 4..])
-        } else if !self.api_key.trim().is_empty() {
+        let trimmed = self.api_key.trim();
+        let char_count = trimmed.chars().count();
+        let masked = if trimmed.starts_with("env:") {
+            trimmed.to_string()
+        } else if char_count >= 8 {
+            let prefix: String = trimmed.chars().take(4).collect();
+            let suffix: String = trimmed
+                .chars()
+                .rev()
+                .take(4)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            format!("{prefix}...{suffix}")
+        } else if !trimmed.is_empty() {
             "••••••••".into()
         } else {
             String::new()
@@ -323,5 +346,50 @@ impl Settings {
         if let Some(v) = patch.distill_idle_seconds {
             self.distill_idle_seconds = v.clamp(15, 3600);
         }
+    }
+}
+
+pub fn is_localhost_url(url: &str) -> bool {
+    let lower = url.trim().to_ascii_lowercase();
+    let without_scheme = lower
+        .strip_prefix("http://")
+        .or_else(|| lower.strip_prefix("https://"))
+        .unwrap_or(&lower);
+    let host = without_scheme.split('/').next().unwrap_or("");
+    host == "127.0.0.1"
+        || host.starts_with("127.0.0.1:")
+        || host == "localhost"
+        || host.starts_with("localhost:")
+        || host == "[::1]"
+        || host.starts_with("[::1]:")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redacts_multibyte_utf8_api_key_without_panicking() {
+        let s = Settings {
+            api_key: "••••••••••".into(),
+            ..Default::default()
+        };
+        let view = s.redacted();
+        assert_eq!(view.api_key_masked, "••••...••••");
+    }
+
+    #[test]
+    fn identifies_external_destinations_including_cli_providers() {
+        let mut s = Settings::default();
+        assert!(!s.is_external_destination());
+        s.provider = "ollama".into();
+        assert!(!s.is_external_destination());
+        s.provider = "cli_claude".into();
+        assert!(s.is_external_destination());
+        s.provider = "openrouter".into();
+        assert!(s.is_external_destination());
+        s.provider = "openai_compatible".into();
+        s.base_url = "http://127.0.0.1:1234/v1".into();
+        assert!(!s.is_external_destination());
     }
 }

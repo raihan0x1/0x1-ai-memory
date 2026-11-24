@@ -1,4 +1,4 @@
-use crate::config::SettingsPatch;
+use crate::config::{SettingsPatch, is_localhost_url};
 use crate::connectors::ConnectorManager;
 use crate::db::MemoryDb;
 use crate::distill::DistillHandle;
@@ -9,8 +9,9 @@ use crate::mcp::handle_rpc;
 use crate::models::{NewMemoryInput, SearchFilter, StreamEvent, UpdateMemoryInput};
 use axum::{
     Json, Router,
-    extract::{Path as AxumPath, Query, State},
-    http::{HeaderMap, HeaderValue, StatusCode, Uri, header},
+    extract::{Path as AxumPath, Query, Request, State},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header},
+    middleware::{self, Next},
     response::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
@@ -26,7 +27,7 @@ use std::convert::Infallible;
 use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio_stream::{StreamExt, wrappers::BroadcastStream};
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 #[derive(Embed)]
 #[folder = "ui/dist/"]
@@ -46,9 +47,22 @@ pub struct AppState {
 
 pub fn build_router(state: AppState) -> Router {
     let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+        .allow_origin(AllowOrigin::predicate(|origin, _req_parts| {
+            origin.to_str().map(is_localhost_url).unwrap_or(false)
+        }))
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers([
+            header::CONTENT_TYPE,
+            header::AUTHORIZATION,
+            header::HeaderName::from_static("mcp-session-id"),
+            header::HeaderName::from_static("x-ox1-client"),
+        ]);
 
     Router::new()
         // Health & MCP Streamable HTTP
@@ -96,8 +110,34 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/connections/{client}/ping", post(api_ping_client))
         // Embedded React SPA fallback
         .fallback(static_ui_handler)
+        .layer(middleware::from_fn(localhost_guard))
         .layer(cors)
         .with_state(state)
+}
+
+/// Blocks cross-origin browser requests and DNS-rebinding Host headers on this localhost-only daemon.
+async fn localhost_guard(req: Request, next: Next) -> Response {
+    if let Some(host) = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        && !is_localhost_url(host)
+    {
+        return (StatusCode::FORBIDDEN, "Non-localhost Host header rejected").into_response();
+    }
+    if let Some(origin) = req
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        && !is_localhost_url(origin)
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            "Cross-origin request rejected (localhost only)",
+        )
+            .into_response();
+    }
+    next.run(req).await
 }
 
 async fn health(State(st): State<AppState>) -> Json<Value> {
@@ -218,8 +258,13 @@ async fn api_search_memories(
     Query(filter): Query<SearchFilter>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let settings = st.db.get_settings().map_err(internal_err)?;
+    let allow_ext = !st.db.is_project_local_only(filter.project_id.as_deref());
     let q_vec = match filter.query.as_deref() {
-        Some(q) if !q.trim().is_empty() => st.embedder.embed_text(q, &settings).await,
+        Some(q) if !q.trim().is_empty() => {
+            st.embedder
+                .embed_text(q, &settings, Some(&st.db), allow_ext)
+                .await
+        }
         _ => None,
     };
     let hits = st
@@ -237,8 +282,12 @@ async fn api_create_memory(
         input.source_client = Some("ui".into());
     }
     let settings = st.db.get_settings().map_err(internal_err)?;
+    let allow_ext = !st.db.is_project_local_only(input.project_id.as_deref());
     let embed_text = format!("{}\n{}\n{}", input.title, input.summary, input.content);
-    let vec = st.embedder.embed_text(&embed_text, &settings).await;
+    let vec = st
+        .embedder
+        .embed_text(&embed_text, &settings, Some(&st.db), allow_ext)
+        .await;
     let mem = st
         .db
         .create_memory(input, vec.as_deref())
@@ -280,8 +329,13 @@ async fn api_update_memory(
     match updated {
         Some(m) => {
             if needs_reembed {
+                let allow_ext = !st.db.is_project_local_only(m.project_id.as_deref());
                 let text = format!("{}\n{}\n{}", m.title, m.summary, m.content);
-                if let Some(vec) = st.embedder.embed_text(&text, &settings).await {
+                if let Some(vec) = st
+                    .embedder
+                    .embed_text(&text, &settings, Some(&st.db), allow_ext)
+                    .await
+                {
                     let _ = st.db.set_memory_embedding(&m.id, &vec);
                 }
             }
@@ -450,11 +504,23 @@ async fn api_ping_client(
     State(st): State<AppState>,
     AxumPath(client): AxumPath<String>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let _ = st.db.touch_client_activity(&client, false);
+    // Run an actual MCP ping RPC probe + inspect client config without faking client heartbeats.
+    let rpc = handle_rpc(
+        json!({ "jsonrpc": "2.0", "id": "ping", "method": "ping" }),
+        &st.db,
+        &st.embedder,
+        &st.events_tx,
+        None,
+    )
+    .await;
+    let mcp_ok = rpc.as_ref().and_then(|v| v.get("result")).is_some();
     let conns = st.connectors.inspect_all(&st.db).map_err(internal_err)?;
     let found = conns.into_iter().find(|c| c.client_id == client);
+    let config_connected = found.as_ref().map(|c| c.connected).unwrap_or(false);
     Ok(Json(json!({
-        "ok": true,
+        "ok": mcp_ok && config_connected,
+        "mcp_ok": mcp_ok,
+        "config_connected": config_connected,
         "mcp_url": st.connectors.mcp_url(),
         "connection": found
     })))

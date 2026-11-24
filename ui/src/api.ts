@@ -100,10 +100,13 @@ export const api = {
       { method: 'POST' },
     ),
   pingClient: (client: string) =>
-    req<{ ok: boolean; mcp_url: string; connection: ClientConnection | null }>(
-      `/api/connections/${encodeURIComponent(client)}/ping`,
-      { method: 'POST' },
-    ),
+    req<{
+      ok: boolean;
+      mcp_ok: boolean;
+      config_connected: boolean;
+      mcp_url: string;
+      connection: ClientConnection | null;
+    }>(`/api/connections/${encodeURIComponent(client)}/ping`, { method: 'POST' }),
 };
 
 /** Exact UTC timestamp (Rim rule: never a bare time without zone). */

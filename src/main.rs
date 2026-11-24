@@ -76,6 +76,8 @@ enum Commands {
         query: String,
         #[arg(long, default_value_t = 10)]
         limit: usize,
+        #[arg(long, env = "OX1_MEMORY_PORT", default_value_t = DEFAULT_PORT)]
+        port: u16,
     },
 }
 
@@ -155,7 +157,7 @@ async fn async_main(cmd: Commands) -> Result<()> {
         } => run_setup(paths, &client, port, yes, disconnect),
         Commands::Status { port } => run_status(paths, port).await,
         Commands::McpStdio { port } => run_mcp_stdio(paths, port).await,
-        Commands::Search { query, limit } => run_search(paths, &query, limit),
+        Commands::Search { query, limit, port } => run_search(paths, &query, limit, port).await,
         Commands::Hook { .. } => unreachable!(),
     }
 }
@@ -258,11 +260,29 @@ fn run_setup(
         return Ok(());
     }
 
-    println!("=== 0x1-ai-memory Setup Wizard ===\n");
+    println!(
+        "=== 0x1-ai-memory {} ===\n",
+        if disconnect {
+            "Disconnect Wizard"
+        } else {
+            "Setup Wizard"
+        }
+    );
     for cid in &targets {
         if let Ok(preview) = mgr.preview_connect(cid) {
-            println!("[{}] {}", preview.display_name, preview.summary);
-            println!("{}\n", preview.diff_preview);
+            if disconnect {
+                println!(
+                    "[{}] Will remove 0x1-memory MCP/hooks entries (leaving all other settings intact):",
+                    preview.display_name
+                );
+                for f in &preview.target_files {
+                    println!("  - {f}");
+                }
+                println!();
+            } else {
+                println!("[{}] {}", preview.display_name, preview.summary);
+                println!("{}\n", preview.diff_preview);
+            }
         }
     }
 
@@ -391,7 +411,41 @@ async fn run_mcp_stdio(paths: AppPaths, port: u16) -> Result<()> {
     Ok(())
 }
 
-fn run_search(paths: AppPaths, query: &str, limit: usize) -> Result<()> {
+async fn run_search(paths: AppPaths, query: &str, limit: usize, port: u16) -> Result<()> {
+    // Prefer running daemon for instant hybrid FTS5 + ONNX vector search; fallback to direct SQLite FTS5.
+    let http = reqwest::Client::builder()
+        .connect_timeout(Duration::from_millis(250))
+        .timeout(Duration::from_secs(3))
+        .build()
+        .ok();
+    if let Some(client) = http
+        && let Ok(resp) = client
+            .get(format!("http://127.0.0.1:{port}/api/memories"))
+            .query(&[("query", query), ("limit", &limit.to_string())])
+            .send()
+            .await
+        && resp.status().is_success()
+        && let Ok(val) = resp.json::<Value>().await
+        && let Some(arr) = val.get("memories").and_then(|v| v.as_array())
+    {
+        if arr.is_empty() {
+            println!("No matching memories.");
+            return Ok(());
+        }
+        for h in arr {
+            println!(
+                "[{}|{}|{}] {} — {} ({})",
+                h["source_client"].as_str().unwrap_or("?"),
+                h["memory_type"].as_str().unwrap_or("?"),
+                h["status"].as_str().unwrap_or("?"),
+                h["title"].as_str().unwrap_or(""),
+                h["summary"].as_str().unwrap_or(""),
+                h["id"].as_str().unwrap_or(""),
+            );
+        }
+        return Ok(());
+    }
+
     let db = MemoryDb::open(&paths.db_path)?;
     let hits = db.search_memories(
         &SearchFilter {

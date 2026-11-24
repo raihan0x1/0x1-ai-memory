@@ -71,7 +71,8 @@ fn poll_t3_once(t3_path: &Path, db: &MemoryDb, distill: &DistillHandle) {
             m.updated_at,
             COALESCE(t.default_provider, 't3-code'),
             COALESCE(p.workspace_root, ''),
-            COALESCE(pt.provider_session_id, pt.provider_thread_id, '')
+            COALESCE(pt.provider_session_id, ''),
+            COALESCE(pt.provider_thread_id, '')
         FROM orchestration_v2_projection_messages m
         JOIN orchestration_v2_projection_threads t ON t.thread_id = m.thread_id
         LEFT JOIN projection_projects p ON p.project_id = t.project_id
@@ -96,6 +97,7 @@ fn poll_t3_once(t3_path: &Path, db: &MemoryDb, distill: &DistillHandle) {
             r.get::<_, String>(5)?,
             r.get::<_, String>(6)?,
             r.get::<_, String>(7)?,
+            r.get::<_, String>(8)?,
         ))
     }) {
         Ok(rows) => rows.filter_map(Result::ok).collect::<Vec<_>>(),
@@ -112,6 +114,7 @@ fn poll_t3_once(t3_path: &Path, db: &MemoryDb, distill: &DistillHandle) {
         provider,
         workspace_root,
         provider_session_id,
+        provider_thread_id,
     ) in rows
     {
         newest_ts = updated_at;
@@ -119,12 +122,16 @@ fn poll_t3_once(t3_path: &Path, db: &MemoryDb, distill: &DistillHandle) {
         if trimmed.is_empty() {
             continue;
         }
-        // Deduplicate against native Claude Code / Codex hooks via provider_session_id
-        if !provider_session_id.is_empty()
+        // Deduplicate against native Claude Code / Codex hooks checking BOTH provider IDs
+        let already_captured = (!provider_session_id.is_empty()
             && db
                 .has_external_session(&provider_session_id)
-                .unwrap_or(false)
-        {
+                .unwrap_or(false))
+            || (!provider_thread_id.is_empty()
+                && db
+                    .has_external_session(&provider_thread_id)
+                    .unwrap_or(false));
+        if already_captured {
             continue;
         }
         // Skip Claude/Codex in T3 when they already pass through native hooks; prioritize Antigravity & other isolated providers

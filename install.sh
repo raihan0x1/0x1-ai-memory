@@ -7,46 +7,44 @@ INSTALL_DIR="${OX1_INSTALL_DIR:-$HOME/.local/bin}"
 OS="$(uname -s)"
 ARCH="$(uname -m)"
 
-case "$OS" in
-  Darwin) OS_KEY="darwin" ;;
-  Linux) OS_KEY="linux" ;;
+case "$OS:$ARCH" in
+  Darwin:arm64|Darwin:aarch64) ASSET="0x1-memory-darwin-arm64.tar.gz" ;;
+  Darwin:x86_64)               ASSET="0x1-memory-darwin-x64.tar.gz" ;;
+  Linux:x86_64|Linux:amd64)    ASSET="0x1-memory-linux-x64.tar.gz" ;;
   *)
-    echo "Unsupported OS: $OS (build from source with cargo build --release)" >&2
+    echo "No prebuilt binary for ${OS}/${ARCH} yet. Build from source:" >&2
+    echo "  git clone https://github.com/${REPO}.git && cd 0x1-ai-memory && (cd ui && pnpm install && pnpm build) && cargo build --release" >&2
     exit 1
     ;;
 esac
 
-case "$ARCH" in
-  arm64|aarch64) ARCH_KEY="arm64" ;;
-  x86_64|amd64) ARCH_KEY="x64" ;;
-  *)
-    echo "Unsupported architecture: $ARCH" >&2
-    exit 1
-    ;;
-esac
-
-ASSET="0x1-memory-${OS_KEY}-${ARCH_KEY}.tar.gz"
 BASE_URL="https://github.com/${REPO}/releases/latest/download"
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
 echo "Downloading ${ASSET} from ${REPO}..."
 curl -fsSL "${BASE_URL}/${ASSET}" -o "${TMP_DIR}/${ASSET}"
-curl -fsSL "${BASE_URL}/SHA256SUMS.txt" -o "${TMP_DIR}/SHA256SUMS.txt"
 
-EXPECTED="$(grep " ${ASSET}\$" "${TMP_DIR}/SHA256SUMS.txt" | awk '{print $1}')"
-if [ -n "$EXPECTED" ]; then
+if [ "${OX1_SKIP_CHECKSUM:-0}" != "1" ]; then
+  curl -fsSL "${BASE_URL}/SHA256SUMS.txt" -o "${TMP_DIR}/SHA256SUMS.txt"
+  EXPECTED="$(awk -v file="$ASSET" '$2 == file || $2 == ("*" file) { print $1; exit }' "${TMP_DIR}/SHA256SUMS.txt")"
+  if [ -z "$EXPECTED" ]; then
+    echo "Checksum entry missing for ${ASSET} in SHA256SUMS.txt (aborting)." >&2
+    exit 1
+  fi
   if command -v shasum >/dev/null 2>&1; then
     ACTUAL="$(shasum -a 256 "${TMP_DIR}/${ASSET}" | awk '{print $1}')"
   elif command -v sha256sum >/dev/null 2>&1; then
     ACTUAL="$(sha256sum "${TMP_DIR}/${ASSET}" | awk '{print $1}')"
   else
-    ACTUAL=""
-  fi
-  if [ -n "$ACTUAL" ] && [ "$ACTUAL" != "$EXPECTED" ]; then
-    echo "Checksum mismatch for ${ASSET}!" >&2
+    echo "Neither shasum nor sha256sum found; set OX1_SKIP_CHECKSUM=1 to bypass." >&2
     exit 1
   fi
+  if [ "$ACTUAL" != "$EXPECTED" ]; then
+    echo "Checksum mismatch for ${ASSET}! Expected ${EXPECTED}, got ${ACTUAL}." >&2
+    exit 1
+  fi
+  echo "Verified SHA-256 checksum."
 fi
 
 mkdir -p "$INSTALL_DIR"

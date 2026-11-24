@@ -125,7 +125,7 @@ pub async fn handle_hook(
             // Ultra-fast targeted recall (FTS5 + local ONNX if already loaded; never blocks)
             if prompt.trim().len() >= 12 {
                 let q_vec = if settings.embedding_mode == "local_onnx" {
-                    embedder.embed_text(prompt, &settings).await
+                    embedder.embed_text(prompt, &settings, None, false).await
                 } else {
                     None
                 };

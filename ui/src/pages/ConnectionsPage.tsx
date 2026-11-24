@@ -72,7 +72,11 @@ export function ConnectionsPage() {
     setBusyId(clientId);
     try {
       const res = await api.pingClient(clientId);
-      setFeedback(`Verified MCP endpoint at ${res.mcp_url} for ${clientId}.`);
+      setFeedback(
+        res.ok
+          ? `MCP ping OK at ${res.mcp_url} and ${clientId} config is active.`
+          : `MCP ping: ${res.mcp_ok ? 'OK' : 'failed'}, ${clientId} config: ${res.config_connected ? 'active' : 'not connected'}.`,
+      );
       await load();
     } finally {
       setBusyId(null);

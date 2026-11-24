@@ -347,6 +347,13 @@ impl MemoryDb {
         Ok(rows > 0)
     }
 
+    pub fn is_project_local_only(&self, project_id: Option<&str>) -> bool {
+        project_id
+            .and_then(|pid| self.get_project(pid).ok().flatten())
+            .map(|p| p.privacy_mode == "local_only")
+            .unwrap_or(false)
+    }
+
     pub fn upsert_session(
         &self,
         project_id: &str,
@@ -881,6 +888,11 @@ impl MemoryDb {
             if hit.status == "pinned" {
                 hit.score += 0.015;
             }
+            if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&hit.updated_at) {
+                let age_days =
+                    (Utc::now() - ts.with_timezone(&Utc)).num_hours().max(0) as f64 / 24.0;
+                hit.score += 0.005 * (-age_days / 30.0).exp();
+            }
             hits.push(hit);
         }
 
@@ -919,11 +931,23 @@ impl MemoryDb {
         let mut older =
             query_timeline_side(&conn, project_id.as_deref(), &anchor_time, true, before)?;
         older.reverse();
-        let current = self.get_memories_by_ids(&[anchor_id.to_string()])?;
+        // Query anchor directly on the already-locked connection (never re-lock self.conn!).
+        let anchor_mem = conn
+            .query_row(
+                "SELECT m.id, m.scope, m.project_id, p.name, m.session_id, m.source_client,
+                        m.memory_type, m.title, m.summary, m.content, m.files_json, m.tags_json,
+                        m.status, m.superseded_by, m.created_at, m.updated_at
+                 FROM memories m
+                 LEFT JOIN projects p ON p.id = m.project_id
+                 WHERE m.id = ?1",
+                params![anchor_id],
+                row_to_memory,
+            )
+            .optional()?;
         let newer = query_timeline_side(&conn, project_id.as_deref(), &anchor_time, false, after)?;
 
         let mut out = older;
-        for m in current {
+        if let Some(m) = anchor_mem {
             out.push(MemoryHit {
                 id: m.id,
                 scope: m.scope,
@@ -1079,10 +1103,13 @@ impl MemoryDb {
         Ok((buf.trim().to_string(), count))
     }
 
-    pub fn memories_missing_embeddings(&self, limit: usize) -> Result<Vec<(String, String)>> {
+    pub fn memories_missing_embeddings(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(String, Option<String>, String)>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT m.id, m.title || '\n' || m.summary || '\n' || m.content
+            "SELECT m.id, m.project_id, m.title || '\n' || m.summary || '\n' || m.content
              FROM memories m
              LEFT JOIN memories_vec v ON v.memory_rowid = m.rowid
              WHERE v.memory_rowid IS NULL AND m.status IN ('active', 'pinned')
@@ -1090,7 +1117,11 @@ impl MemoryDb {
              LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit as i64], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, String>(2)?,
+            ))
         })?;
         Ok(rows.filter_map(Result::ok).collect())
     }
@@ -1587,5 +1618,9 @@ mod tests {
         assert_eq!(count, 1);
         assert!(briefing.contains("httpOnly cookies"));
         assert!(briefing.contains(&m2.id));
+
+        // Regression test: memory_timeline must not deadlock on self.conn Mutex
+        let timeline = db.memory_timeline(&m2.id, 3, 3).unwrap();
+        assert!(timeline.iter().any(|h| h.id == m2.id));
     }
 }

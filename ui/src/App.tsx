@@ -10,6 +10,8 @@ import type { MemoryHit, Project, UsageSummary } from './types';
 export type Tab = 'stream' | 'memories' | 'connections' | 'engine';
 
 function readTabFromUrl(): Tab {
+  const path = window.location.pathname.replace(/^\/+|\/+$/g, '');
+  if (path === 'memories' || path === 'connections' || path === 'engine') return path;
   const param = new URLSearchParams(window.location.search).get('tab');
   if (param === 'memories' || param === 'connections' || param === 'engine') return param;
   return 'stream';
@@ -27,7 +29,8 @@ export function App() {
   const setTab = useCallback((next: Tab) => {
     setTabState(next);
     const url = new URL(window.location.href);
-    url.searchParams.set('tab', next);
+    url.pathname = next === 'stream' ? '/' : `/${next}`;
+    url.searchParams.delete('tab');
     window.history.pushState({}, '', url);
   }, []);
 
