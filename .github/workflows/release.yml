@@ -1,0 +1,108 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-ui:
+    name: Build Embedded UI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - working-directory: ui
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ui-dist
+          path: ui/dist
+          retention-days: 1
+
+  build-binary:
+    name: Build (${{ matrix.asset }})
+    needs: build-ui
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+            asset: 0x1-memory-darwin-arm64
+            ext: tar.gz
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            asset: 0x1-memory-darwin-x64
+            ext: tar.gz
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            asset: 0x1-memory-linux-x64
+            ext: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: 0x1-memory-windows-x64
+            ext: zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ui-dist
+          path: ui/dist
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Package Unix archive
+        if: matrix.ext == 'tar.gz'
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/0x1-memory" dist/0x1-memory
+          chmod +x dist/0x1-memory
+          tar -czf "dist/${{ matrix.asset }}.tar.gz" -C dist 0x1-memory
+      - name: Package Windows archive
+        if: matrix.ext == 'zip'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/0x1-memory.exe" dist/0x1-memory.exe
+          Compress-Archive -Path dist/0x1-memory.exe -DestinationPath "dist/${{ matrix.asset }}.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}.${{ matrix.ext }}
+
+  publish:
+    name: Publish GitHub Release
+    needs: build-binary
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Generate SHA-256 checksums
+        working-directory: artifacts
+        run: sha256sum 0x1-memory-* > SHA256SUMS.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            artifacts/0x1-memory-*
+            artifacts/SHA256SUMS.txt

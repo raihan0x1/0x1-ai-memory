@@ -1,0 +1,40 @@
+[package]
+name = "ox1-memory"
+version = "0.1.0"
+edition = "2024"
+description = "Local-first, anti-drain cross-agent AI memory engine (single Rust binary + embedded Web UI)"
+license = "MIT"
+
+[[bin]]
+name = "0x1-memory"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8", features = ["json", "macros"] }
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+dirs = "6"
+fastembed = { version = "7.8", default-features = false, features = ["onnx", "ort-download-binaries-rustls-tls", "hf-hub-rustls-tls", "fancy-regex"] }
+futures-util = "0.3"
+mime_guess = "2"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
+rusqlite = { version = "0.38", features = ["bundled", "load_extension"] }
+rust-embed = "8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sqlite-vec = "0.1.6"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "process", "fs", "io-util"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+toml_edit = "0.25"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v7", "v4", "serde"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }

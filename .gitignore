@@ -1,0 +1,10 @@
+/target
+/ui/node_modules
+/ui/dist
+/.hallmark
+.DS_Store
+*.db
+*.db-wal
+*.db-shm
+.env
+.env.*

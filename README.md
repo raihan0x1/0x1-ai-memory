@@ -1,0 +1,70 @@
+# 0x1-ai-memory
+
+[![CI](https://github.com/raihan0x1/0x1-ai-memory/actions/workflows/ci.yml/badge.svg)](https://github.com/raihan0x1/0x1-ai-memory/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-orange.svg)](LICENSE)
+
+Local-first, anti-drain, cross-agent persistent memory engine shipped as a **single Rust binary (`0x1-memory`)** with an embedded localhost Web UI.
+
+Built to connect **Claude Code**, **Codex CLI & App**, **Antigravity**, **T3 Code**, and any MCP client to one unified memory store — without burning coding subscriptions or requiring Python/Node/Bun/Chroma sidecars.
+
+## Why `0x1-ai-memory`?
+
+Inspired by (and engineered to fix the root causes audited in [`docs/research/claude-mem-analysis.md`](docs/research/claude-mem-analysis.md)):
+
+- **Anti-drain by design (Hybrid Per-Turn):** Hooks capture raw events locally at **0 LLM tokens** (<10ms). Stateless distillation runs **once per turn (`Stop` / idle / `PreCompact`)** instead of per-`Read`/`Grep` $O(N^2)$ conversation replay.
+- **Zero silent fallback:** Never dumps traffic onto your Claude/Codex/Antigravity coding subscription when an API fails. Hard daily token & USD caps + transparent `usage_ledger`.
+- **Decoupled Memory Engine:** Default to **OpenRouter**, **Gemini**, **Ollama (local)**, **OpenAI-compatible**, or **Zero-LLM safe mode ($0)**. CLI subscription passthrough (`claude -p`, `codex exec`, `agy -p`) is strictly opt-in with `OX1_MEMORY_INTERNAL=1` recursion protection.
+- **Single Rust binary (~9ms hooks, 0 external runtimes):** SQLite WAL + FTS5 (BM25) + `sqlite-vec` + lazy local ONNX (`fastembed`) + Streamable HTTP MCP + embedded React Web UI (`rust-embed`).
+- **Ultra-lean recall:** ~300–500 token `SessionStart` briefing + **5 compact MCP tools** (`memory_search`, `memory_get`, `memory_timeline`, `memory_save`, `memory_update`).
+- **Cross-agent out of the box:** Unified by normalized Git remote/repo across worktrees and all 4 clients, with per-project privacy controls (`full` | `local_only` | `paused`) and deterministic secret scrubbing.
+
+## Install
+
+### Prebuilt Binary (macOS / Linux)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/raihan0x1/0x1-ai-memory/main/install.sh | sh
+```
+
+### Build from Source
+
+```bash
+git clone https://github.com/raihan0x1/0x1-ai-memory.git
+cd 0x1-ai-memory
+
+# 1. Build embedded Web UI
+cd ui && pnpm install && pnpm build && cd ..
+
+# 2. Build single Rust binary
+cargo build --release
+```
+
+## Quick Start
+
+```bash
+# Start local daemon + open localhost Web UI (http://127.0.0.1:41777)
+0x1-memory serve --open
+
+# Auto-detect and connect Claude Code, Codex, Antigravity, & T3 Code (dry-run preview + backup)
+0x1-memory setup
+
+# Check daemon health, connected clients, and today's spend
+0x1-memory status
+```
+
+## CLI Commands
+
+| Command | Description |
+| :--- | :--- |
+| `0x1-memory serve [--port 41777] [--open]` | Start local daemon (HTTP API + `/mcp` + SSE + embedded Web UI + async distillation + T3 watcher) |
+| `0x1-memory setup [--client all\|claude-code\|codex\|antigravity\|t3-code] [--yes] [--disconnect]` | Guided auto-detect setup wizard with diff preview & automatic backups in `~/.0x1-memory/backups/` |
+| `0x1-memory status` | Show daemon health, connected clients, memory totals, and today's token/USD usage |
+| `0x1-memory hook <claude\|codex\|antigravity> [event]` | Ultra-fast (<10ms) lifecycle hook shim (fails open if daemon is stopped) |
+| `0x1-memory mcp-stdio` | Optional stdio JSON-RPC MCP fallback for clients without Streamable HTTP |
+| `0x1-memory search <query>` | Terminal hybrid search |
+
+## Documentation
+
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — full architecture, SQLite schema, and 4-client wiring blueprint.
+- [`docs/research/claude-mem-analysis.md`](docs/research/claude-mem-analysis.md) — primary-source audit of `thedotmack/claude-mem`.
+- [`docs/research/client-integrations.md`](docs/research/client-integrations.md) — primary-source hooks/MCP & T3 Code (`app.asar`) reverse engineering.
