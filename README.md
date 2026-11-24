@@ -63,6 +63,17 @@ cargo build --release
 | `0x1-memory mcp-stdio` | Optional stdio JSON-RPC MCP fallback for clients without Streamable HTTP |
 | `0x1-memory search <query>` | Terminal hybrid search |
 
+## Development & Releases
+
+```bash
+# Run all local guardrails (shell, asset parity, UI build, fmt, clippy, offline tests)
+./scripts/check.sh
+
+# Bump version, verify, tag vX.Y.Z, and push to trigger GitHub Release automatically
+./scripts/release.sh            # interactive (current / patch / minor / major / custom)
+./scripts/release.sh patch      # or: current | minor | major | 0.2.0 [--dry-run]
+```
+
 ## Documentation
 
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — full architecture, SQLite schema, and 4-client wiring blueprint.

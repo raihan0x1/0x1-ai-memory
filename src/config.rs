@@ -1,3 +1,5 @@
+#![deny(clippy::string_slice)]
+
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -87,6 +89,14 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// Offline-safe settings for unit and integration tests (never downloads ONNX models).
+    pub fn for_testing() -> Self {
+        Self {
+            embedding_mode: "fts_only".into(),
+            ..Self::default()
+        }
+    }
+
     pub fn from_map(map: &HashMap<String, String>) -> Self {
         let mut s = Self::default();
         if let Some(v) = map.get("provider") {

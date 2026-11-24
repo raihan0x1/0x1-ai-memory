@@ -1,3 +1,5 @@
+#![deny(clippy::string_slice)]
+
 use regex::Regex;
 use serde_json::Value;
 use std::sync::OnceLock;

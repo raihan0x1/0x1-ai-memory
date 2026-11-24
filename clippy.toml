@@ -1,0 +1,3 @@
+disallowed-types = [
+  { path = "tower_http::cors::Any", reason = "Restrict CORS to localhost origins; never allow wildcard CORS" },
+]

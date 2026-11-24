@@ -11,10 +11,31 @@ concurrency:
 
 jobs:
   ui:
-    name: UI Typecheck & Build
+    name: UI, Shell & Guardrails
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Shell syntax & ShellCheck
+        run: |
+          sh -n install.sh
+          bash -n scripts/*.sh
+          shellcheck install.sh scripts/*.sh
+      - name: Check install.sh and release.yml asset parity
+        run: |
+          while IFS= read -r asset; do
+            stem="${asset%.tar.gz}"
+            stem="${stem%.zip}"
+            grep -Fq "asset: ${stem}" .github/workflows/release.yml || {
+              echo "Missing asset '${stem}' in .github/workflows/release.yml" >&2
+              exit 1
+            }
+          done < <(sed -n 's/.*ASSET="\([^"]*\)".*/\1/p' install.sh)
+      - name: Enforce RimSelect in UI pages
+        run: |
+          if grep -rnE '<select([[:space:]]|>)' ui/src/pages/; then
+            echo "Use <RimSelect /> instead of native <select> in ui/src/pages/" >&2
+            exit 1
+          fi
       - uses: pnpm/action-setup@v4
         with:
           version: 12
@@ -57,4 +78,6 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --all-targets -- -D warnings
       - name: Run Tests
+        env:
+          OX1_MEMORY_DISABLE_ONNX: "1"
         run: cargo test --all-targets

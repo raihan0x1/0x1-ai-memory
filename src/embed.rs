@@ -39,6 +39,13 @@ impl Embedder {
 
     /// Triggers background download/load of the quantized 384-dim ONNX model without blocking startup.
     pub fn warm_local_async(&self) {
+        if cfg!(test) || std::env::var_os("OX1_MEMORY_DISABLE_ONNX").is_some() {
+            let mut state = self.local_state.lock().unwrap();
+            if matches!(*state, LocalModelState::Idle) {
+                *state = LocalModelState::Failed("disabled (offline/test mode)".into());
+            }
+            return;
+        }
         let should_start = {
             let mut state = self.local_state.lock().unwrap();
             match *state {
@@ -304,4 +311,20 @@ fn fit_to_dim(raw: &[f32], dim: usize) -> Vec<f32> {
 
 fn truncate_err(s: &str) -> String {
     s.chars().take(60).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn warm_local_async_stays_offline_in_tests() {
+        let tmp = tempfile::tempdir().unwrap();
+        let embedder = Embedder::new(tmp.path().join("models"));
+        embedder.warm_local_async();
+        assert!(matches!(
+            *embedder.local_state.lock().unwrap(),
+            LocalModelState::Failed(_)
+        ));
+    }
 }

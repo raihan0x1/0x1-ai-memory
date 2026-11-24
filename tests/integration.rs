@@ -17,9 +17,8 @@ use tower::ServiceExt;
 
 fn test_state(tmp: &std::path::Path) -> AppState {
     let db = MemoryDb::open(&tmp.join("memory.db")).unwrap();
-    let mut s = db.get_settings().unwrap();
-    s.embedding_mode = "fts_only".into();
-    db.save_settings(&s).unwrap();
+    db.save_settings(&ox1_memory::config::Settings::for_testing())
+        .unwrap();
     let embedder = Embedder::new(tmp.join("models"));
     let llm = MemoryLlmClient::new();
     let (events_tx, _) = broadcast::channel::<StreamEvent>(32);
