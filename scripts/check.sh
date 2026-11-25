@@ -15,24 +15,44 @@ for arg in "$@"; do
   esac
 done
 
-echo "==> Checking shell scripts"
+echo "==> Checking shell scripts and npm launcher"
 sh -n install.sh
 bash -n scripts/*.sh
+node --check npm/bin/0x1-memory.mjs
 if command -v shellcheck >/dev/null 2>&1; then
   shellcheck install.sh scripts/*.sh
 else
   echo "  (shellcheck not installed locally; syntax verified with sh/bash -n)"
 fi
 
-echo "==> Checking install.sh <-> release.yml asset parity"
+echo "==> Checking install.sh & npm launcher <-> release.yml asset parity"
 while IFS= read -r asset; do
   stem="${asset%.tar.gz}"
   stem="${stem%.zip}"
   if ! grep -Fq "asset: ${stem}" .github/workflows/release.yml; then
-    echo "ERROR: install.sh references '${asset}' but release.yml has no 'asset: ${stem}'" >&2
+    echo "ERROR: installer references '${asset}' but release.yml has no 'asset: ${stem}'" >&2
     exit 1
   fi
-done < <(sed -n 's/.*ASSET="\([^"]*\)".*/\1/p' install.sh)
+done < <(
+  {
+    sed -n 's/.*ASSET="\([^"]*\)".*/\1/p' install.sh
+    sed -n "s/.*'\(0x1-memory-[^']*\)'.*/\1/p" npm/bin/0x1-memory.mjs
+  } | sort -u
+)
+
+echo "==> Checking version parity (Cargo.toml, ui/package.json, npm/package.json)"
+python3 - <<'PY'
+import json, pathlib, re
+cargo_m = re.search(r'(?ms)^\[package\].*?^version\s*=\s*"([^"]+)"', pathlib.Path("Cargo.toml").read_text())
+assert cargo_m, "Missing version in Cargo.toml"
+versions = {
+    "Cargo.toml": cargo_m.group(1),
+    "ui/package.json": json.loads(pathlib.Path("ui/package.json").read_text())["version"],
+    "npm/package.json": json.loads(pathlib.Path("npm/package.json").read_text())["version"],
+}
+if len(set(versions.values())) != 1:
+    raise SystemExit(f"Version mismatch across manifests: {versions}")
+PY
 
 echo "==> Checking Rim UI guardrails (no raw <select in pages)"
 if grep -rnE '<select([[:space:]]|>)' ui/src/pages/; then

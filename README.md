@@ -18,12 +18,26 @@ Inspired by (and engineered to fix the root causes audited in [`docs/research/cl
 - **Ultra-lean recall:** ~300–500 token `SessionStart` briefing + **5 compact MCP tools** (`memory_search`, `memory_get`, `memory_timeline`, `memory_save`, `memory_update`).
 - **Cross-agent out of the box:** Unified by normalized Git remote/repo across worktrees and all 4 clients, with per-project privacy controls (`full` | `local_only` | `paused`) and deterministic secret scrubbing.
 
-## Install
+## Quick Start
 
-### Prebuilt Binary (macOS / Linux)
+### Instant Try via `npx` (recommended — downloads native Rust binary, 0 runtime deps)
+
+```bash
+npx 0x1-ai-memory
+```
+
+Starts the local daemon (`http://127.0.0.1:41777`) and automatically opens the **Setup Wizard** in your browser. On first run, the thin launcher downloads and SHA-256 verifies the prebuilt Rust binary into `~/.0x1-memory/bin/` so all hooks and the daemon run natively in Rust (~9ms hooks).
+
+```bash
+npx 0x1-ai-memory setup    # terminal setup wizard (auto-detect & connect all clients)
+npx 0x1-ai-memory status   # daemon health, connected clients, and today's spend
+```
+
+### Native Binary Installer (no Node required — macOS Apple Silicon / Linux x64)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/raihan0x1/0x1-ai-memory/main/install.sh | sh
+0x1-memory
 ```
 
 ### Build from Source
@@ -39,23 +53,11 @@ cd ui && pnpm install && pnpm build && cd ..
 cargo build --release
 ```
 
-## Quick Start
-
-```bash
-# Start local daemon + open localhost Web UI (http://127.0.0.1:41777)
-0x1-memory serve --open
-
-# Auto-detect and connect Claude Code, Codex, Antigravity, & T3 Code (dry-run preview + backup)
-0x1-memory setup
-
-# Check daemon health, connected clients, and today's spend
-0x1-memory status
-```
-
 ## CLI Commands
 
 | Command | Description |
 | :--- | :--- |
+| `0x1-memory` | Default 1-command start (`serve --open`): starts daemon and opens Setup Wizard (first run) or Live Stream |
 | `0x1-memory serve [--port 41777] [--open]` | Start local daemon (HTTP API + `/mcp` + SSE + embedded Web UI + async distillation + T3 watcher) |
 | `0x1-memory setup [--client all\|claude-code\|codex\|antigravity\|t3-code] [--yes] [--disconnect]` | Guided auto-detect setup wizard with diff preview & automatic backups in `~/.0x1-memory/backups/` |
 | `0x1-memory status` | Show daemon health, connected clients, memory totals, and today's token/USD usage |

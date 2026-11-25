@@ -20,7 +20,7 @@ jobs:
           sh -n install.sh
           bash -n scripts/*.sh
           shellcheck install.sh scripts/*.sh
-      - name: Check install.sh and release.yml asset parity
+      - name: Check installer & npm launcher asset parity
         run: |
           while IFS= read -r asset; do
             stem="${asset%.tar.gz}"
@@ -29,7 +29,26 @@ jobs:
               echo "Missing asset '${stem}' in .github/workflows/release.yml" >&2
               exit 1
             }
-          done < <(sed -n 's/.*ASSET="\([^"]*\)".*/\1/p' install.sh)
+          done < <(
+            {
+              sed -n 's/.*ASSET="\([^"]*\)".*/\1/p' install.sh
+              sed -n "s/.*'\(0x1-memory-[^']*\)'.*/\1/p" npm/bin/0x1-memory.mjs
+            } | sort -u
+          )
+      - name: Check manifest version parity
+        run: |
+          python3 - <<'PY'
+          import json, pathlib, re
+          cargo_m = re.search(r'(?ms)^\[package\].*?^version\s*=\s*"([^"]+)"', pathlib.Path("Cargo.toml").read_text())
+          assert cargo_m, "Missing version in Cargo.toml"
+          versions = {
+              "Cargo.toml": cargo_m.group(1),
+              "ui/package.json": json.loads(pathlib.Path("ui/package.json").read_text())["version"],
+              "npm/package.json": json.loads(pathlib.Path("npm/package.json").read_text())["version"],
+          }
+          if len(set(versions.values())) != 1:
+              raise SystemExit(f"Version mismatch across manifests: {versions}")
+          PY
       - name: Enforce RimSelect in UI pages
         run: |
           if grep -rnE '<select([[:space:]]|>)' ui/src/pages/; then
@@ -44,6 +63,8 @@ jobs:
           node-version: 22
           cache: pnpm
           cache-dependency-path: ui/pnpm-lock.yaml
+      - name: Check npm launcher syntax
+        run: node --check npm/bin/0x1-memory.mjs
       - name: Install & Build UI
         working-directory: ui
         run: |

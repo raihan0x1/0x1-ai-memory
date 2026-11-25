@@ -25,7 +25,7 @@ use tokio::sync::broadcast;
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
@@ -89,13 +89,17 @@ fn main() -> Result<()> {
     }
 
     let cli = Cli::parse();
+    let command = cli.command.unwrap_or(Commands::Serve {
+        port: DEFAULT_PORT,
+        open: true,
+    });
 
     // Fast path for `hook`: zero tokio runtime overhead, pure blocking HTTP POST (<5ms)!
     if let Commands::Hook {
         client,
         event,
         port,
-    } = cli.command
+    } = command
     {
         return run_hook_fast(&client, event.as_deref(), port);
     }
@@ -103,7 +107,7 @@ fn main() -> Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    rt.block_on(async_main(cli.command))
+    rt.block_on(async_main(command))
 }
 
 /// Ultra-fast synchronous hook shim: reads stdin JSON, posts to local daemon with 1.5s timeout.
@@ -186,7 +190,8 @@ async fn run_serve(paths: AppPaths, port: u16, open_browser: bool) -> Result<()>
     let home = dirs::home_dir().context("Home directory unavailable")?;
     let bin_path = std::env::current_exe().unwrap_or_else(|_| "0x1-memory".into());
     let connectors = ConnectorManager::new(home, paths.backups_dir.clone(), bin_path, port);
-    let _ = connectors.inspect_all(&db);
+    let inspected = connectors.inspect_all(&db).unwrap_or_default();
+    let any_connected = inspected.iter().any(|c| c.connected);
 
     let state = AppState {
         db,
@@ -201,23 +206,37 @@ async fn run_serve(paths: AppPaths, port: u16, open_browser: bool) -> Result<()>
 
     let app = build_router(state);
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let base_url = format!("http://127.0.0.1:{port}");
+    let open_url = if any_connected {
+        base_url.clone()
+    } else {
+        format!("{base_url}/connections")
+    };
+
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(bind_err) => {
+            if daemon_is_healthy(port).await {
+                println!("0x1-ai-memory daemon is already running on {base_url}");
+                if open_browser {
+                    open_in_browser(&open_url);
+                }
+                return Ok(());
+            }
+            return Err(bind_err).with_context(|| {
+                format!("Failed to bind {addr} (port {port} is in use by another process)")
+            });
+        }
+    };
     let _ = std::fs::write(&paths.pid_path, std::process::id().to_string());
 
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("Failed to bind {addr} (is another 0x1-memory running?)"))?;
-
-    let url = format!("http://127.0.0.1:{port}");
-    println!("0x1-ai-memory daemon listening on {url}");
-    println!("  Web UI : {url}");
-    println!("  MCP    : {url}/mcp");
+    println!("0x1-ai-memory daemon listening on {base_url}");
+    println!("  Web UI : {open_url}");
+    println!("  MCP    : {base_url}/mcp");
     println!("  DB     : {}", paths.db_path.display());
 
     if open_browser {
-        #[cfg(target_os = "macos")]
-        let _ = std::process::Command::new("open").arg(&url).spawn();
-        #[cfg(target_os = "linux")]
-        let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+        open_in_browser(&open_url);
     }
 
     axum::serve(listener, app)
@@ -229,6 +248,32 @@ async fn run_serve(paths: AppPaths, port: u16, open_browser: bool) -> Result<()>
 
     let _ = std::fs::remove_file(&paths.pid_path);
     Ok(())
+}
+
+async fn daemon_is_healthy(port: u16) -> bool {
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(Duration::from_millis(400))
+        .build()
+    else {
+        return false;
+    };
+    client
+        .get(format!("http://127.0.0.1:{port}/health"))
+        .send()
+        .await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false)
+}
+
+fn open_in_browser(url: &str) {
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(url).spawn();
+    #[cfg(target_os = "linux")]
+    let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+    #[cfg(target_os = "windows")]
+    let _ = std::process::Command::new("cmd")
+        .args(["/C", "start", "", url])
+        .spawn();
 }
 
 fn run_setup(
@@ -466,4 +511,15 @@ async fn run_search(paths: AppPaths, query: &str, limit: usize, port: u16) -> Re
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_subcommand_defaults_to_none_for_one_command_serve_open() {
+        let cli = Cli::try_parse_from(["0x1-memory"]).unwrap();
+        assert!(cli.command.is_none());
+    }
 }

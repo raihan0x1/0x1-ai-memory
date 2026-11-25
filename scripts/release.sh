@@ -14,9 +14,10 @@ usage() {
   cat <<'EOF'
 Usage: ./scripts/release.sh [current|patch|minor|major|X.Y.Z] [options]
 
-Interactive if no version argument is passed. Bumps Cargo.toml, Cargo.lock, and
-ui/package.json, runs ./scripts/check.sh, commits, tags vX.Y.Z, and pushes to
-origin so .github/workflows/release.yml automatically builds & publishes.
+Interactive if no version argument is passed. Bumps Cargo.toml, Cargo.lock,
+ui/package.json, and npm/package.json, runs ./scripts/check.sh, commits, tags
+vX.Y.Z, and pushes to origin so .github/workflows/release.yml automatically
+builds & publishes (GitHub Release + npm when NPM_TOKEN is configured).
 
 Options:
   --dry-run         Preview actions without modifying files, tags, or remote
@@ -186,7 +187,7 @@ echo "  Branch  : ${BRANCH}"
 echo "  Version : ${CURRENT_VER} -> ${NEXT_VER}"
 echo "  Tag     : ${TAG}"
 if [ "$NEEDS_BUMP" -eq 1 ]; then
-  echo "  Files   : Cargo.toml, Cargo.lock, ui/package.json"
+  echo "  Files   : Cargo.toml, Cargo.lock, ui/package.json, npm/package.json"
   echo "  Commit  : chore(release): ${TAG}"
 else
   echo "  Files   : unchanged (tagging current version)"
@@ -231,11 +232,11 @@ if count != 1:
     raise SystemExit("Failed to update [package] version in Cargo.toml")
 cargo_path.write_text(new_cargo)
 
-pkg_path = pathlib.Path("ui/package.json")
-pkg_text = pkg_path.read_text()
-pkg_data = json.loads(pkg_text)
-pkg_data["version"] = ver
-pkg_path.write_text(json.dumps(pkg_data, indent=2) + "\n")
+for rel_path in ("ui/package.json", "npm/package.json"):
+    pkg_path = pathlib.Path(rel_path)
+    pkg_data = json.loads(pkg_path.read_text())
+    pkg_data["version"] = ver
+    pkg_path.write_text(json.dumps(pkg_data, indent=2) + "\n")
 PY
   cargo update --workspace --offline
 fi
@@ -245,7 +246,7 @@ if [ "$SKIP_CHECKS" -eq 0 ]; then
 fi
 
 if [ "$NEEDS_BUMP" -eq 1 ]; then
-  git add Cargo.toml Cargo.lock ui/package.json
+  git add Cargo.toml Cargo.lock ui/package.json npm/package.json
   if [ "$SKIP_CHECKS" -eq 0 ]; then
     git commit --no-verify -m "chore(release): ${TAG}"
   else

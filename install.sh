@@ -2,7 +2,21 @@
 set -eu
 
 REPO="raihan0x1/0x1-ai-memory"
-INSTALL_DIR="${OX1_INSTALL_DIR:-$HOME/.local/bin}"
+
+if [ -n "${OX1_INSTALL_DIR:-}" ]; then
+  INSTALL_DIR="$OX1_INSTALL_DIR"
+else
+  case ":${PATH:-}:" in
+    *":$HOME/.local/bin:"*) INSTALL_DIR="$HOME/.local/bin" ;;
+    *)
+      if [ -d "/usr/local/bin" ] && [ -w "/usr/local/bin" ]; then
+        INSTALL_DIR="/usr/local/bin"
+      else
+        INSTALL_DIR="$HOME/.local/bin"
+      fi
+      ;;
+  esac
+fi
 
 OS="$(uname -s)"
 ARCH="$(uname -m)"
@@ -53,6 +67,23 @@ chmod +x "${INSTALL_DIR}/0x1-memory"
 
 echo ""
 echo "Installed 0x1-memory to ${INSTALL_DIR}/0x1-memory"
-echo "Make sure ${INSTALL_DIR} is in your PATH, then run:"
-echo "  0x1-memory serve --open"
-echo "  0x1-memory setup"
+
+case ":${PATH:-}:" in
+  *":${INSTALL_DIR}:"*)
+    echo "Run to start daemon & open Setup Wizard:"
+    echo "  0x1-memory"
+    ;;
+  *)
+    SHELL_RC="$HOME/.profile"
+    case "${SHELL:-}" in
+      */zsh)  SHELL_RC="$HOME/.zshrc" ;;
+      */bash) SHELL_RC="$HOME/.bashrc" ;;
+    esac
+    echo ""
+    echo "${INSTALL_DIR} is not in your PATH yet. Add it once:"
+    echo "  echo 'export PATH=\"${INSTALL_DIR}:\$PATH\"' >> ${SHELL_RC} && source ${SHELL_RC}"
+    echo ""
+    echo "Or start right now:"
+    echo "  ${INSTALL_DIR}/0x1-memory"
+    ;;
+esac
