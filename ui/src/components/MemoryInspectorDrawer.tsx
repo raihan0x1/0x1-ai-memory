@@ -9,7 +9,8 @@ import {
   IconTag,
   IconTimeline,
 } from './Icons';
-import type { MemoryContextResponse, NeighborLink } from '../types';
+import { RimSelect } from './RimSelect';
+import type { MemoryContextResponse, MemoryHit, NeighborLink } from '../types';
 
 interface MemoryInspectorDrawerProps {
   memoryId: string | null;
@@ -230,6 +231,9 @@ export function MemoryInspectorDrawer({
   const [saving, setSaving] = useState(false);
   const [saveNotice, setSaveNotice] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [supersedeOpen, setSupersedeOpen] = useState(false);
+  const [supersedeCandidates, setSupersedeCandidates] = useState<MemoryHit[]>([]);
+  const [supersedeTarget, setSupersedeTarget] = useState('');
 
   useEffect(() => {
     if (!memoryId) return;
@@ -238,6 +242,8 @@ export function MemoryInspectorDrawer({
     setError(null);
     setSaveNotice(null);
     setConfirmDelete(false);
+    setSupersedeOpen(false);
+    setSupersedeTarget('');
 
     api
       .memoryContext(memoryId)
@@ -309,17 +315,41 @@ export function MemoryInspectorDrawer({
     }
   }
 
-  async function handleStatus(nextStatus: string) {
+  async function handleStatus(nextStatus: string, supersededBy?: string) {
     if (!mem) return;
     setSaving(true);
     setError(null);
     try {
-      await api.updateMemory(mem.id, { status: nextStatus });
+      await api.updateMemory(mem.id, {
+        status: nextStatus,
+        ...(supersededBy !== undefined ? { superseded_by: supersededBy } : {}),
+      });
+      setSupersedeOpen(false);
       await Promise.all([reloadContext(), onMutated()]);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to update memory status');
     } finally {
       setSaving(false);
+    }
+  }
+
+  async function openSupersedePicker() {
+    if (!mem) return;
+    setSupersedeOpen(true);
+    setSupersedeTarget('');
+    setError(null);
+    try {
+      const res = await api.searchMemories({
+        project_id: mem.project_id || undefined,
+        limit: 40,
+      });
+      setSupersedeCandidates(
+        res.memories.filter(
+          (h) => h.id !== mem.id && h.status !== 'superseded' && h.status !== 'archived',
+        ),
+      );
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to load replacement candidates');
     }
   }
 
@@ -704,6 +734,56 @@ export function MemoryInspectorDrawer({
           ) : null}
         </div>
 
+        {mem && supersedeOpen ? (
+          <div
+            style={{
+              padding: 'var(--space-sm) var(--space-md)',
+              borderTop: 'var(--rule-hair) solid var(--color-rule)',
+              background: 'var(--color-paper-3)',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: 'var(--space-xs)',
+            }}
+          >
+            <span className="field-hint">
+              Link replacement memory (optional — builds supersession lineage &amp; graph arrow)
+            </span>
+            <RimSelect
+              ariaLabel="Superseded by memory"
+              fullWidth
+              value={supersedeTarget}
+              options={[
+                { value: '', label: 'Status only (no replacement link)' },
+                ...supersedeCandidates.map((c) => ({
+                  value: c.id,
+                  label: c.title,
+                  meta: c.memory_type,
+                })),
+              ]}
+              onChange={setSupersedeTarget}
+            />
+            <div className="head-actions" style={{ justifyContent: 'flex-end' }}>
+              <button
+                type="button"
+                className="btn"
+                disabled={saving}
+                onClick={() => setSupersedeOpen(false)}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="btn btn-primary"
+                disabled={saving}
+                aria-busy={saving}
+                onClick={() => void handleStatus('superseded', supersedeTarget)}
+              >
+                {saving ? 'Updating...' : 'Confirm supersede'}
+              </button>
+            </div>
+          </div>
+        ) : null}
+
         {mem ? (
           <div className="inspector-foot">
             <div className="head-actions">
@@ -722,9 +802,13 @@ export function MemoryInspectorDrawer({
                 type="button"
                 className="btn"
                 disabled={saving}
-                onClick={() =>
-                  void handleStatus(mem.status === 'superseded' ? 'active' : 'superseded')
-                }
+                onClick={() => {
+                  if (mem.status === 'superseded') {
+                    void handleStatus('active', '');
+                  } else {
+                    void openSupersedePicker();
+                  }
+                }}
               >
                 {mem.status === 'superseded' ? 'Restore active' : 'Mark superseded'}
               </button>
