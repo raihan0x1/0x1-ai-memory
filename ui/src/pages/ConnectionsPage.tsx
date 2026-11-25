@@ -1,9 +1,17 @@
 import { useEffect, useState } from 'react';
-import { api, formatUtcTime } from '../api';
+import { api, DEFAULT_DAEMON_PORT, formatUtcTime } from '../api';
 import { ModalDialog } from '../components/ModalDialog';
 import type { ClientConnection, ConnectionPreview, UniversalMcpSnippets } from '../types';
 
-export function ConnectionsPage() {
+interface ConnectionsPageProps {
+  activePort?: number;
+  onRunOnboarding?: () => void;
+}
+
+export function ConnectionsPage({
+  activePort = DEFAULT_DAEMON_PORT,
+  onRunOnboarding,
+}: ConnectionsPageProps) {
   const [connections, setConnections] = useState<ClientConnection[]>([]);
   const [universal, setUniversal] = useState<UniversalMcpSnippets | null>(null);
   const [loading, setLoading] = useState(true);
@@ -105,9 +113,16 @@ export function ConnectionsPage() {
             connecting.
           </p>
         </div>
-        <button type="button" className="btn" onClick={() => void load()}>
-          Re-scan machine
-        </button>
+        <div className="head-actions">
+          {onRunOnboarding ? (
+            <button type="button" className="btn" onClick={onRunOnboarding}>
+              Run onboarding
+            </button>
+          ) : null}
+          <button type="button" className="btn" onClick={() => void load()}>
+            Re-scan machine
+          </button>
+        </div>
       </div>
 
       {error ? (
@@ -141,8 +156,24 @@ export function ConnectionsPage() {
                   <h2 className="panel-title">{c.display_name}</h2>
                   <span className={`tag ${c.client_id}`}>{c.client_id}</span>
                 </div>
-                <span className={`tag ${c.connected ? 'ok' : c.detected ? 'warn' : ''}`}>
-                  {c.connected ? 'Connected' : c.detected ? 'Detected' : 'Not found'}
+                <span
+                  className={`tag ${
+                    c.connected
+                      ? 'ok'
+                      : c.port_mismatch
+                        ? 'danger'
+                        : c.detected
+                          ? 'warn'
+                          : ''
+                  }`}
+                >
+                  {c.connected
+                    ? 'Connected'
+                    : c.port_mismatch
+                      ? `Port mismatch (:${c.configured_port ?? '?'})`
+                      : c.detected
+                        ? 'Detected'
+                        : 'Not found'}
                 </span>
               </div>
 
@@ -173,7 +204,9 @@ export function ConnectionsPage() {
                       aria-busy={busyId === c.client_id}
                       onClick={() => void openPreview(c.client_id)}
                     >
-                      Preview and connect
+                      {c.port_mismatch
+                        ? `Reconnect to :${activePort}`
+                        : 'Preview and connect'}
                     </button>
                   ) : (
                     <>

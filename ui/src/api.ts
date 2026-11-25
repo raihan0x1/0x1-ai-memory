@@ -1,8 +1,10 @@
 import type {
+  AutoStartStatus,
   ClientConnection,
   ConnectionPreview,
   ConnectionTestResult,
   ContextPreviewResponse,
+  DaemonInfo,
   MemoryDetail,
   MemoryHit,
   Project,
@@ -11,6 +13,8 @@ import type {
   UsageEntry,
   UsageSummary,
 } from './types';
+
+export const DEFAULT_DAEMON_PORT = 10101;
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, {
@@ -107,6 +111,13 @@ export const api = {
       mcp_url: string;
       connection: ClientConnection | null;
     }>(`/api/connections/${encodeURIComponent(client)}/ping`, { method: 'POST' }),
+  daemon: () => req<DaemonInfo>('/api/daemon'),
+  stopDaemon: () => req<{ stopping: boolean }>('/api/daemon/stop', { method: 'POST' }),
+  setAutostart: (enabled: boolean) =>
+    req<AutoStartStatus>('/api/daemon/autostart', {
+      method: 'POST',
+      body: JSON.stringify({ enabled }),
+    }),
 };
 
 /** Exact UTC timestamp (Rim rule: never a bare time without zone). */

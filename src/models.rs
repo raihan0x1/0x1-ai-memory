@@ -152,6 +152,10 @@ pub struct ClientConnection {
     pub display_name: String,
     pub detected: bool,
     pub connected: bool,
+    #[serde(default)]
+    pub configured_port: Option<u16>,
+    #[serde(default)]
+    pub port_mismatch: bool,
     pub needs_manual_step: bool,
     pub manual_step_hint: Option<String>,
     pub config_paths: Vec<String>,

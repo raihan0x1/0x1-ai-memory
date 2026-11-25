@@ -28,7 +28,15 @@ fn test_state(tmp: &std::path::Path) -> AppState {
         tmp.join("home"),
         tmp.join("backups"),
         PathBuf::from("/usr/local/bin/0x1-memory"),
-        41777,
+        10101,
+    );
+    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let autostart = ox1_memory::daemon::AutoStartManager::for_testing(
+        tmp.join("home"),
+        PathBuf::from("/usr/local/bin/0x1-memory"),
+        tmp.join("daemon.log"),
+        10101,
+        ox1_memory::daemon::AutoStartPlatform::MacOs,
     );
     AppState {
         db,
@@ -36,9 +44,13 @@ fn test_state(tmp: &std::path::Path) -> AppState {
         llm,
         distill,
         connectors,
+        autostart,
         events_tx,
+        shutdown_tx,
         hook_state: HookState::default(),
-        port: 41777,
+        port: 10101,
+        data_dir: tmp.to_path_buf(),
+        log_path: tmp.join("daemon.log"),
     }
 }
 
@@ -274,7 +286,7 @@ async fn end_to_end_cross_client_mcp_hooks_ui_and_budget_guard() {
         .oneshot(
             Request::builder()
                 .uri("/api/memories")
-                .header("host", "evil.example:41777")
+                .header("host", "evil.example:10101")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -287,8 +299,8 @@ async fn end_to_end_cross_client_mcp_hooks_ui_and_budget_guard() {
         .oneshot(
             Request::builder()
                 .uri("/api/memories")
-                .header("host", "127.0.0.1:41777")
-                .header("origin", "http://127.0.0.1:41777")
+                .header("host", "127.0.0.1:10101")
+                .header("origin", "http://127.0.0.1:10101")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -326,4 +338,91 @@ async fn end_to_end_cross_client_mcp_hooks_ui_and_budget_guard() {
     )
     .await;
     assert_eq!(state.db.recent_usage(20).unwrap().len(), usage_before);
+}
+
+#[tokio::test]
+async fn daemon_stop_closes_open_sse_and_exits_cleanly_plus_autostart_api() {
+    let tmp = tempdir().unwrap();
+    let state = test_state(tmp.path());
+    let mut shutdown_rx = state.shutdown_tx.subscribe();
+    let app = build_router(state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base = format!("http://{addr}");
+
+    let server_task = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                while !*shutdown_rx.borrow() {
+                    if shutdown_rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+    });
+
+    let client = reqwest::Client::new();
+
+    // 1. Daemon metadata & opt-in Auto-Start toggle work over HTTP
+    let info: Value = client
+        .get(format!("{base}/api/daemon"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(info["running"], true);
+    assert_eq!(info["autostart"]["supported"], true);
+    assert_eq!(info["autostart"]["enabled"], false);
+
+    let enabled: Value = client
+        .post(format!("{base}/api/daemon/autostart"))
+        .json(&json!({ "enabled": true }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(enabled["enabled"], true);
+    let plist_path = tmp
+        .path()
+        .join("home/Library/LaunchAgents/com.0x1.memory.plist");
+    assert!(plist_path.exists());
+
+    // 2. Cross-origin POST /api/daemon/stop is blocked by localhost_guard
+    let evil_stop = client
+        .post(format!("{base}/api/daemon/stop"))
+        .header("origin", "https://evil.example")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(evil_stop.status(), reqwest::StatusCode::FORBIDDEN);
+
+    // 3. Keep an active SSE connection open (exact repro of Ctrl-C hang!)
+    let sse_resp = client
+        .get(format!("{base}/api/stream"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(sse_resp.status(), reqwest::StatusCode::OK);
+
+    // 4. Localhost stop immediately tears down SSE and completes graceful shutdown (< 2s)
+    let stop_resp = client
+        .post(format!("{base}/api/daemon/stop"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stop_resp.status(), reqwest::StatusCode::OK);
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), server_task)
+        .await
+        .expect("Daemon hung on graceful shutdown with open SSE connection")
+        .unwrap();
+
+    drop(sse_resp);
 }

@@ -6,9 +6,9 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      '/api': 'http://127.0.0.1:41777',
-      '/health': 'http://127.0.0.1:41777',
-      '/mcp': 'http://127.0.0.1:41777',
+      '/api': 'http://127.0.0.1:10101',
+      '/health': 'http://127.0.0.1:10101',
+      '/mcp': 'http://127.0.0.1:10101',
     },
   },
   build: {

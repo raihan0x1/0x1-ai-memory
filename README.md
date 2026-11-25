@@ -26,11 +26,13 @@ Inspired by (and engineered to fix the root causes audited in [`docs/research/cl
 npx 0x1-ai-memory
 ```
 
-Starts the local daemon (`http://127.0.0.1:41777`) and automatically opens the **Setup Wizard** in your browser. On first run, the thin launcher downloads and SHA-256 verifies the prebuilt Rust binary into `~/.0x1-memory/bin/` so all hooks and the daemon run natively in Rust (~9ms hooks).
+Starts the local **Daemon** in the background (`http://127.0.0.1:10101`), automatically opens **Onboarding** (first run) or the dashboard in your browser, and returns your terminal prompt right away. On first run, the thin launcher downloads and SHA-256 verifies the prebuilt Rust binary into `~/.0x1-memory/bin/` so all hooks and the Daemon run natively in Rust (~9ms hooks).
 
 ```bash
-npx 0x1-ai-memory setup    # terminal setup wizard (auto-detect & connect all clients)
-npx 0x1-ai-memory status   # daemon health, connected clients, and today's spend
+npx 0x1-ai-memory setup    # CLI Setup (auto-detect & connect all clients in terminal)
+npx 0x1-ai-memory status   # Daemon health, Auto-Start, connected clients & today's spend
+npx 0x1-ai-memory stop     # stop the background Daemon cleanly
+npx 0x1-ai-memory logs     # view ~/.0x1-memory/daemon.log
 ```
 
 ### Native Binary Installer (no Node required — macOS Apple Silicon / Linux x64)
@@ -57,10 +59,15 @@ cargo build --release
 
 | Command | Description |
 | :--- | :--- |
-| `0x1-memory` | Default 1-command start (`serve --open`): starts daemon and opens Setup Wizard (first run) or Live Stream |
-| `0x1-memory serve [--port 41777] [--open]` | Start local daemon (HTTP API + `/mcp` + SSE + embedded Web UI + async distillation + T3 watcher) |
-| `0x1-memory setup [--client all\|claude-code\|codex\|antigravity\|t3-code] [--yes] [--disconnect]` | Guided auto-detect setup wizard with diff preview & automatic backups in `~/.0x1-memory/backups/` |
-| `0x1-memory status` | Show daemon health, connected clients, memory totals, and today's token/USD usage |
+| `0x1-memory` | Default 1-command start: spawns background Daemon on `:10101`, opens Onboarding (first run) or Live Stream, and returns your shell |
+| `0x1-memory start [--port 10101] [--open]` | Start background Daemon (idempotent if already running) |
+| `0x1-memory stop [--port 10101]` | Stop background Daemon cleanly (closes active SSE streams immediately) |
+| `0x1-memory restart [--port 10101] [--open]` | Restart background Daemon |
+| `0x1-memory logs [-n 50]` | Print recent lines from `~/.0x1-memory/daemon.log` |
+| `0x1-memory autostart <enable\|disable\|status>` | Opt-in login Auto-Start (`launchd` on macOS, `systemd --user` on Linux) |
+| `0x1-memory serve [--port 10101] [--open] [--foreground]` | Run Daemon in foreground (debugging, `launchd`, or `systemd`) |
+| `0x1-memory setup [--client all\|claude-code\|codex\|antigravity\|t3-code] [--yes] [--disconnect]` | CLI Setup: auto-detect & connect clients with diff preview and backups in `~/.0x1-memory/backups/` |
+| `0x1-memory status` | Show Daemon health, Auto-Start, connected/mismatched clients, memory totals, and today's usage |
 | `0x1-memory hook <claude\|codex\|antigravity> [event]` | Ultra-fast (<10ms) lifecycle hook shim (fails open if daemon is stopped) |
 | `0x1-memory mcp-stdio` | Optional stdio JSON-RPC MCP fallback for clients without Streamable HTTP |
 | `0x1-memory search <query>` | Terminal hybrid search |

@@ -1,5 +1,6 @@
 pub mod config;
 pub mod connectors;
+pub mod daemon;
 pub mod db;
 pub mod distill;
 pub mod embed;

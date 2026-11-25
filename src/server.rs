@@ -1,5 +1,6 @@
 use crate::config::{SettingsPatch, is_localhost_url};
 use crate::connectors::ConnectorManager;
+use crate::daemon::AutoStartManager;
 use crate::db::MemoryDb;
 use crate::distill::DistillHandle;
 use crate::embed::Embedder;
@@ -24,9 +25,9 @@ use rust_embed::Embed;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::convert::Infallible;
+use std::path::PathBuf;
 use std::time::Duration;
-use tokio::sync::broadcast;
-use tokio_stream::{StreamExt, wrappers::BroadcastStream};
+use tokio::sync::{broadcast, watch};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 #[derive(Embed)]
@@ -40,9 +41,13 @@ pub struct AppState {
     pub llm: MemoryLlmClient,
     pub distill: DistillHandle,
     pub connectors: ConnectorManager,
+    pub autostart: AutoStartManager,
     pub events_tx: broadcast::Sender<StreamEvent>,
+    pub shutdown_tx: watch::Sender<bool>,
     pub hook_state: HookState,
     pub port: u16,
+    pub data_dir: PathBuf,
+    pub log_path: PathBuf,
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -108,6 +113,10 @@ pub fn build_router(state: AppState) -> Router {
             post(api_disconnect_client),
         )
         .route("/api/connections/{client}/ping", post(api_ping_client))
+        // Daemon status, opt-in Auto-Start, and clean stop (all localhost-guarded)
+        .route("/api/daemon", get(api_daemon_info))
+        .route("/api/daemon/stop", post(api_daemon_stop))
+        .route("/api/daemon/autostart", post(api_daemon_autostart))
         // Embedded React SPA fallback
         .fallback(static_ui_handler)
         .layer(middleware::from_fn(localhost_guard))
@@ -209,12 +218,32 @@ async fn sse_stream(
     State(st): State<AppState>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let rx = st.events_tx.subscribe();
-    let stream = BroadcastStream::new(rx).filter_map(|msg| match msg {
-        Ok(ev) => {
-            let data = serde_json::to_string(&ev).unwrap_or_else(|_| "{}".into());
-            Some(Ok(Event::default().event(ev.kind).data(data)))
+    let shutdown_rx = st.shutdown_tx.subscribe();
+    // Terminate SSE immediately on shutdown so graceful server exit never hangs with open browser tabs.
+    let stream = futures_util::stream::unfold((rx, shutdown_rx), |(mut rx, mut stop)| async move {
+        if *stop.borrow() {
+            return None;
         }
-        Err(_) => None,
+        loop {
+            tokio::select! {
+                biased;
+                changed = stop.changed() => {
+                    if changed.is_err() || *stop.borrow() {
+                        return None;
+                    }
+                }
+                msg = rx.recv() => {
+                    match msg {
+                        Ok(ev) => {
+                            let data = serde_json::to_string(&ev).unwrap_or_else(|_| "{}".into());
+                            return Some((Ok(Event::default().event(ev.kind).data(data)), (rx, stop)));
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => return None,
+                    }
+                }
+            }
+        }
     });
     Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
 }
@@ -524,6 +553,46 @@ async fn api_ping_client(
         "mcp_url": st.connectors.mcp_url(),
         "connection": found
     })))
+}
+
+async fn api_daemon_info(State(st): State<AppState>) -> Json<Value> {
+    let autostart = st.autostart.status();
+    Json(json!({
+        "running": true,
+        "pid": std::process::id(),
+        "port": st.port,
+        "version": env!("CARGO_PKG_VERSION"),
+        "mcp_url": st.connectors.mcp_url(),
+        "data_dir": st.data_dir.display().to_string(),
+        "log_path": st.log_path.display().to_string(),
+        "autostart": autostart,
+    }))
+}
+
+async fn api_daemon_stop(State(st): State<AppState>) -> Json<Value> {
+    let tx = st.shutdown_tx.clone();
+    tokio::spawn(async move {
+        // Brief delay lets the HTTP 200 JSON response flush before tearing down listeners and SSE.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let _ = tx.send(true);
+    });
+    Json(json!({ "stopping": true }))
+}
+
+#[derive(Deserialize)]
+struct AutoStartBody {
+    enabled: bool,
+}
+
+async fn api_daemon_autostart(
+    State(st): State<AppState>,
+    Json(body): Json<AutoStartBody>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let status = st
+        .autostart
+        .set_enabled(body.enabled)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    Ok(Json(serde_json::to_value(status).unwrap_or_default()))
 }
 
 async fn static_ui_handler(uri: Uri) -> Response {

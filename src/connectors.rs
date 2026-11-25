@@ -1,4 +1,4 @@
-use crate::config::ensure_parent_dir;
+use crate::config::write_atomic_file;
 use crate::db::{ClientHeartbeatMap, MemoryDb};
 use crate::models::ClientConnection;
 use anyhow::{Context, Result, bail};
@@ -95,6 +95,19 @@ impl ConnectorManager {
             let _ = db.save_client_connection(c);
         }
         Ok(out)
+    }
+
+    /// Read-only check whether any actively wired client (Claude Code, Codex, Antigravity)
+    /// already has a `0x1-memory` entry on disk (ignores passive T3 watcher defaults).
+    pub fn has_explicit_client_config(&self) -> bool {
+        let empty = ClientHeartbeatMap::new();
+        [
+            self.inspect_claude(&empty),
+            self.inspect_codex(&empty),
+            self.inspect_antigravity(&empty),
+        ]
+        .iter()
+        .any(|c| c.connected || c.configured_port.is_some())
     }
 
     pub fn preview_connect(&self, client_id: &str) -> Result<ConnectionPreview> {
@@ -228,13 +241,23 @@ impl ConnectorManager {
         let settings_json = self.home_dir.join(".claude/settings.json");
         let detected = self.home_dir.join(".claude").exists() || claude_json.exists();
 
-        let mcp_ok = read_json(&claude_json)
+        let mcp_entry = read_json(&claude_json)
             .ok()
-            .and_then(|v| v.get("mcpServers")?.get("0x1-memory").cloned())
-            .is_some();
-        let hooks_ok = std::fs::read_to_string(&settings_json)
-            .map(|s| s.contains("hook claude"))
-            .unwrap_or(false);
+            .and_then(|v| v.get("mcpServers")?.get("0x1-memory").cloned());
+        let mcp_ok = mcp_entry.is_some();
+        let mcp_port = mcp_entry
+            .as_ref()
+            .and_then(|v| v.get("url")?.as_str())
+            .and_then(extract_url_port);
+        let settings_raw = std::fs::read_to_string(&settings_json).unwrap_or_default();
+        let hooks_ok = settings_raw.contains("hook claude");
+        let hook_port = extract_hook_port(&settings_raw, "hook claude");
+
+        let present = mcp_ok && hooks_ok;
+        let port_status = evaluate_port_status(self.port, mcp_port, hook_port);
+        let configured_port = port_status.configured_port;
+        let port_mismatch = port_status.mismatch;
+        let connected = present && !port_mismatch;
 
         let (last_hb, last_ev, backup) =
             hb.get("claude-code").cloned().unwrap_or((None, None, None));
@@ -243,7 +266,9 @@ impl ConnectorManager {
             client_id: "claude-code".into(),
             display_name: "Claude Code".into(),
             detected,
-            connected: mcp_ok && hooks_ok,
+            connected,
+            configured_port,
+            port_mismatch,
             needs_manual_step: false,
             manual_step_hint: None,
             config_paths: vec![
@@ -253,7 +278,9 @@ impl ConnectorManager {
             config_backup_path: backup,
             last_heartbeat_at: last_hb,
             last_event_at: last_ev,
-            status_note: if mcp_ok && hooks_ok {
+            status_note: if port_mismatch {
+                port_mismatch_note(configured_port, self.port)
+            } else if connected {
                 "Streamable HTTP MCP + 6 lifecycle hooks active (also inherited by T3 Code)".into()
             } else if detected {
                 "Detected locally — ready to connect with 1 click".into()
@@ -376,19 +403,39 @@ impl ConnectorManager {
 
         let toml_text = std::fs::read_to_string(&config_toml).unwrap_or_default();
         let mcp_ok = toml_text.contains("[mcp_servers.0x1_memory]");
-        let hooks_ok = std::fs::read_to_string(&hooks_json)
-            .map(|s| s.contains("hook codex"))
-            .unwrap_or(false);
+        let mcp_port = toml_text
+            .parse::<DocumentMut>()
+            .ok()
+            .and_then(|doc| {
+                doc.get("mcp_servers")?
+                    .get("0x1_memory")?
+                    .get("url")?
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .as_deref()
+            .and_then(extract_url_port);
+        let hooks_raw = std::fs::read_to_string(&hooks_json).unwrap_or_default();
+        let hooks_ok = hooks_raw.contains("hook codex");
+        let hook_port = extract_hook_port(&hooks_raw, "hook codex");
+
+        let present = mcp_ok && hooks_ok;
+        let port_status = evaluate_port_status(self.port, mcp_port, hook_port);
+        let configured_port = port_status.configured_port;
+        let port_mismatch = port_status.mismatch;
+        let connected = present && !port_mismatch;
         let (last_hb, last_ev, backup) = hb.get("codex").cloned().unwrap_or((None, None, None));
 
         // Codex requires 1-time /hooks trust approval unless we've already observed live heartbeats
-        let needs_manual = mcp_ok && hooks_ok && last_ev.is_none();
+        let needs_manual = connected && last_ev.is_none();
 
         ClientConnection {
             client_id: "codex".into(),
             display_name: "Codex CLI & App".into(),
             detected,
-            connected: mcp_ok && hooks_ok,
+            connected,
+            configured_port,
+            port_mismatch,
             needs_manual_step: needs_manual,
             manual_step_hint: if needs_manual {
                 Some("Run `/hooks` once inside Codex CLI/App to trust the static 0x1-memory hook command (SHA-256 trust gate).".into())
@@ -402,7 +449,9 @@ impl ConnectorManager {
             config_backup_path: backup,
             last_heartbeat_at: last_hb,
             last_event_at: last_ev,
-            status_note: if mcp_ok && hooks_ok {
+            status_note: if port_mismatch {
+                port_mismatch_note(configured_port, self.port)
+            } else if connected {
                 if needs_manual {
                     "Configured! Waiting for one-time `/hooks` approval in Codex.".into()
                 } else {
@@ -550,9 +599,28 @@ impl ConnectorManager {
         let plugin_dir = self.home_dir.join(".gemini/config/plugins/0x1-memory");
         let detected = self.home_dir.join(".gemini").exists()
             || Path::new("/Applications/Antigravity.app").exists();
-        let connected = plugin_dir.join("plugin.json").exists()
+        let present = plugin_dir.join("plugin.json").exists()
             && plugin_dir.join("hooks.json").exists()
             && plugin_dir.join("mcp_config.json").exists();
+        let mcp_port = read_json(&plugin_dir.join("mcp_config.json"))
+            .ok()
+            .and_then(|v| {
+                v.get("mcpServers")?
+                    .get("0x1-memory")?
+                    .get("url")?
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .as_deref()
+            .and_then(extract_url_port);
+        let hooks_raw = std::fs::read_to_string(plugin_dir.join("hooks.json")).unwrap_or_default();
+        let hook_port = extract_hook_port(&hooks_raw, "hook antigravity");
+
+        let (configured_port, port_mismatch) = {
+            let status = evaluate_port_status(self.port, mcp_port, hook_port);
+            (status.configured_port, status.mismatch)
+        };
+        let connected = present && !port_mismatch;
         let (last_hb, last_ev, backup) =
             hb.get("antigravity").cloned().unwrap_or((None, None, None));
 
@@ -561,13 +629,17 @@ impl ConnectorManager {
             display_name: "Antigravity".into(),
             detected,
             connected,
+            configured_port,
+            port_mismatch,
             needs_manual_step: false,
             manual_step_hint: None,
             config_paths: vec![plugin_dir.display().to_string()],
             config_backup_path: backup,
             last_heartbeat_at: last_hb,
             last_event_at: last_ev,
-            status_note: if connected {
+            status_note: if port_mismatch {
+                port_mismatch_note(configured_port, self.port)
+            } else if connected {
                 "Atomic plugin installed (Streamable HTTP MCP + root hooks.json + rules/AGENTS.md)"
                     .into()
             } else if detected {
@@ -665,6 +737,8 @@ impl ConnectorManager {
             display_name: "T3 Code".into(),
             detected,
             connected: detected && watcher_enabled,
+            configured_port: None,
+            port_mismatch: false,
             needs_manual_step: false,
             manual_step_hint: None,
             config_paths: vec![t3_db.display().to_string()],
@@ -720,11 +794,7 @@ fn read_json_or_empty(path: &Path) -> Result<Value> {
 }
 
 fn write_atomic(path: &Path, content: &str) -> Result<()> {
-    ensure_parent_dir(path)?;
-    let tmp = path.with_extension("ox1-tmp");
-    std::fs::write(&tmp, content)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    write_atomic_file(path, content)
 }
 
 fn write_json(path: &Path, val: &Value) -> Result<()> {
@@ -735,6 +805,66 @@ fn write_json(path: &Path, val: &Value) -> Result<()> {
 fn ensure_object(val: &mut Value) {
     if !val.is_object() {
         *val = json!({});
+    }
+}
+
+struct PortStatus {
+    configured_port: Option<u16>,
+    mismatch: bool,
+}
+
+fn parse_leading_port(s: &str) -> Option<u16> {
+    let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse().ok()
+    }
+}
+
+fn extract_url_port(url: &str) -> Option<u16> {
+    let lower = url.to_ascii_lowercase();
+    for host in ["127.0.0.1:", "localhost:", "[::1]:"] {
+        if let Some((_, rest)) = lower.split_once(host) {
+            return parse_leading_port(rest);
+        }
+    }
+    None
+}
+
+fn extract_hook_port(raw: &str, marker: &str) -> Option<u16> {
+    let (_, after_marker) = raw.split_once(marker)?;
+    let (_, after_flag) = after_marker.split_once("--port ")?;
+    parse_leading_port(after_flag.trim_start())
+}
+
+fn evaluate_port_status(
+    expected: u16,
+    mcp_port: Option<u16>,
+    hook_port: Option<u16>,
+) -> PortStatus {
+    for port in [mcp_port, hook_port].into_iter().flatten() {
+        if port != expected {
+            return PortStatus {
+                configured_port: Some(port),
+                mismatch: true,
+            };
+        }
+    }
+    PortStatus {
+        configured_port: mcp_port.or(hook_port),
+        mismatch: false,
+    }
+}
+
+fn port_mismatch_note(configured_port: Option<u16>, active_port: u16) -> String {
+    match configured_port {
+        Some(p) => format!(
+            "Port mismatch: configured for :{p}, Daemon running on :{active_port} — reconnect to update."
+        ),
+        None => format!(
+            "Port mismatch: configured port differs from Daemon :{active_port} — reconnect to update."
+        ),
     }
 }
 
@@ -761,7 +891,7 @@ mod tests {
             home.clone(),
             tmp.path().join("backups"),
             PathBuf::from("/usr/local/bin/0x1-memory"),
-            41777,
+            10101,
         );
 
         // Connect Claude Code twice (idempotent, no duplicate hooks)
@@ -808,5 +938,92 @@ mod tests {
             std::fs::read_to_string(home.join(".codex/config.toml")).unwrap(),
             "[broken ="
         );
+    }
+
+    #[test]
+    fn detects_port_mismatch_and_clears_it_after_reconnect() {
+        let tmp = tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        std::fs::create_dir_all(home.join(".gemini/config")).unwrap();
+
+        let db = MemoryDb::open_in_memory().unwrap();
+        let old_mgr = ConnectorManager::new(
+            home.clone(),
+            tmp.path().join("backups"),
+            PathBuf::from("/usr/local/bin/0x1-memory"),
+            41777,
+        );
+        for cid in ["claude-code", "codex", "antigravity"] {
+            assert!(old_mgr.connect(cid, &db).unwrap().connected);
+        }
+
+        let new_mgr = ConnectorManager::new(
+            home,
+            tmp.path().join("backups"),
+            PathBuf::from("/usr/local/bin/0x1-memory"),
+            10101,
+        );
+        let inspected = new_mgr.inspect_all(&db).unwrap();
+        for cid in ["claude-code", "codex", "antigravity"] {
+            let conn = inspected.iter().find(|c| c.client_id == cid).unwrap();
+            assert!(
+                !conn.connected,
+                "{cid} should not appear connected on wrong port"
+            );
+            assert!(conn.port_mismatch, "{cid} should flag port_mismatch");
+            assert_eq!(conn.configured_port, Some(41777));
+            assert!(conn.status_note.contains("41777"));
+            assert!(conn.status_note.contains("10101"));
+        }
+
+        for cid in ["claude-code", "codex", "antigravity"] {
+            let fixed = new_mgr.connect(cid, &db).unwrap();
+            assert!(fixed.connected);
+            assert!(!fixed.port_mismatch);
+            assert_eq!(fixed.configured_port, Some(10101));
+        }
+    }
+
+    #[test]
+    fn flags_half_configured_port_mismatch_and_ignores_passive_t3_for_fresh_onboarding() {
+        let tmp = tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(home.join(".t3/userdata")).unwrap();
+        std::fs::write(home.join(".t3/userdata/statev2.sqlite"), "").unwrap();
+
+        let db = MemoryDb::open_in_memory().unwrap();
+        let mgr = ConnectorManager::new(
+            home.clone(),
+            tmp.path().join("backups"),
+            PathBuf::from("/usr/local/bin/0x1-memory"),
+            10101,
+        );
+
+        // Fresh machine with only T3 Code present must NOT skip Onboarding
+        assert!(!mgr.has_explicit_client_config());
+        assert!(
+            !db.seed_onboarding_if_existing(mgr.has_explicit_client_config())
+                .unwrap()
+        );
+
+        // Half-configured Claude Code (only MCP entry on old port, no hooks) still flags Port Mismatch
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::write(
+            home.join(".claude.json"),
+            r#"{"mcpServers":{"0x1-memory":{"type":"http","url":"http://127.0.0.1:41777/mcp"}}}"#,
+        )
+        .unwrap();
+        let claude = mgr
+            .inspect_all(&db)
+            .unwrap()
+            .into_iter()
+            .find(|c| c.client_id == "claude-code")
+            .unwrap();
+        assert!(!claude.connected);
+        assert!(claude.port_mismatch);
+        assert_eq!(claude.configured_port, Some(41777));
+        assert!(mgr.has_explicit_client_config());
     }
 }

@@ -70,7 +70,7 @@ echo "Installed 0x1-memory to ${INSTALL_DIR}/0x1-memory"
 
 case ":${PATH:-}:" in
   *":${INSTALL_DIR}:"*)
-    echo "Run to start daemon & open Setup Wizard:"
+    echo "Run to start Daemon in the background & open Onboarding:"
     echo "  0x1-memory"
     ;;
   *)

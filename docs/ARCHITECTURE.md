@@ -42,7 +42,7 @@ Primary research backing every integration detail:
    │hooks │MCP          │hooks │MCP         │hooks │MCP       RO SQLite watch
    ▼      │             ▼      │            ▼      │         (dedup by thread)
  ┌─────────────────────────────────────────────────────────────────────────┐
- │              `0x1-memory` Single Rust Binary (127.0.0.1:41777)          │
+ │              `0x1-memory` Single Rust Binary (127.0.0.1:10101)          │
  │                                                                         │
  │  CLI Hook Shim (<5ms) ──► POST /v1/hooks/{claude|codex|antigravity}     │
  │  Streamable HTTP MCP  ──► POST /mcp (5 tools, JSON-RPC 2.0)             │
@@ -59,8 +59,8 @@ Primary research backing every integration detail:
  └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-- **Default data directory:** `~/.0x1-memory/` (`memory.db`, `config.json`, `backups/`, `models/`, `daemon.pid`).
-- **Default bind:** `127.0.0.1:41777` (configurable via `port` setting or `OX1_MEMORY_PORT`). Localhost-only; never exposed on `0.0.0.0`.
+- **Default data directory:** `~/.0x1-memory/` (`memory.db`, `backups/`, `models/`, `daemon.pid`, `daemon.log`).
+- **Default bind:** `127.0.0.1:10101` (configurable via `--port` or `OX1_MEMORY_PORT`). Localhost-only; never exposed on `0.0.0.0`.
 
 ---
 
@@ -90,20 +90,21 @@ Designed to stay clean and cloud-sync-ready (UUIDv7/ULID-friendly string IDs, ex
    - `raw_event_retention_days` (default `14`)
    - `t3_watcher_enabled` (`true|false`)
    - `distill_idle_seconds` (default `120`)
+   - `onboarding_completed` (`true|false`, auto-seeded `true` once for upgraded installs with existing data or client configs)
 
 ---
 
-## 4. Client Integrations & Setup Wizard
+## 4. Client Integrations & CLI Setup
 
 Every connect operation generates a dry-run diff preview, writes timestamped backups to `~/.0x1-memory/backups/`, and supports clean 1-click disconnect/rollback.
 
 | Client | MCP Wiring | Hook Wiring | Special Handling |
 | :--- | :--- | :--- | :--- |
-| **Claude Code** | `~/.claude.json` → `mcpServers["0x1-memory"] = { "type": "http", "url": "http://127.0.0.1:41777/mcp" }` | `~/.claude/settings.json` → `SessionStart`, `UserPromptSubmit`, `PostToolUse` (`Edit\|Write\|MultiEdit\|Bash`), `PreCompact`, `Stop`, `SessionEnd` | Auto-inherited inside T3 Code. Outputs `hookSpecificOutput.additionalContext`. |
-| **Codex CLI / App** | `~/.codex/config.toml` (`toml_edit`) → `[mcp_servers.0x1_memory]` with `url` & per-tool `approval_mode = "approve"` for read tools | `~/.codex/hooks.json` (`[features] hooks = true`) with static command `<abs-bin> hook codex` | Auto-inherited inside T3 Code. **Never** emits top-level `systemMessage`. Wizard guides user to run `/hooks` once for SHA-256 trust. |
+| **Claude Code** | `~/.claude.json` → `mcpServers["0x1-memory"] = { "type": "http", "url": "http://127.0.0.1:10101/mcp" }` | `~/.claude/settings.json` → `SessionStart`, `UserPromptSubmit`, `PostToolUse` (`Edit\|Write\|MultiEdit\|Bash`), `PreCompact`, `Stop`, `SessionEnd` | Auto-inherited inside T3 Code. Outputs `hookSpecificOutput.additionalContext`. |
+| **Codex CLI / App** | `~/.codex/config.toml` (`toml_edit`) → `[mcp_servers.0x1_memory]` with `url` & per-tool `approval_mode = "approve"` for read tools | `~/.codex/hooks.json` (`[features] hooks = true`) with static command `<abs-bin> hook codex` | Auto-inherited inside T3 Code. **Never** emits top-level `systemMessage`. Onboarding guides user to run `/hooks` once for SHA-256 trust. |
 | **Antigravity** | Atomic plugin `~/.gemini/config/plugins/0x1-memory/` (`plugin.json`, `mcp_config.json`, root `hooks.json`, `rules/AGENTS.md`) | `SessionStart`, `PreInvocation`, `PostToolUse` (`run_command\|write_file\|edit_file`), `Stop` | Outputs camelCase `injectSteps[{systemMessage:{systemMessage, metadata:{user_markdown}}}]`. Deduplicates `PreInvocation` by `(conversationId, lastUserInput)`. |
 | **T3 Code** | Inherited for Claude & Codex | Optional read-only watcher on `~/.t3/userdata/statev2.sqlite` (`mode=ro`, `busy_timeout=2000`) | Closes T3's `GEMINI_HOME` isolation for Antigravity-in-T3; deduplicates via `orchestration_v2_projection_provider_threads.provider_thread_id`. |
-| **Universal MCP** | Copy-paste JSON/TOML for Streamable HTTP (`http://127.0.0.1:41777/mcp`) + `0x1-memory mcp-stdio` fallback | N/A | Works with Cursor, Windsurf, OpenCode, Zed, Cline, etc. |
+| **Universal MCP** | Copy-paste JSON/TOML for Streamable HTTP (`http://127.0.0.1:10101/mcp`) + `0x1-memory mcp-stdio` fallback | N/A | Works with Cursor, Windsurf, OpenCode, Zed, Cline, etc. |
 
 ---
 
@@ -119,20 +120,26 @@ Total tool definition footprint kept under ~550 tokens:
 
 ---
 
-## 6. Embedded Web UI (1 SPA, 4 Focused Pages)
+## 6. Embedded Web UI (1 SPA, Onboarding + 4 Dashboard Pages)
 
+0. **Onboarding (`/onboarding`)**: Distraction-free 4-step first-run flow (Welcome → AI Clients with combined diff preview → Memory Engine → Ready with opt-in Auto-Start toggle). Auto-skipped once for upgraded users; re-runnable anytime.
 1. **Live Stream (`/`)**: Real-time SSE cross-agent memory feed (color-coded badges: Claude / Codex / Antigravity / T3) + project filter + **Live Token & Cost Meter** showing today's spend vs daily budget cap.
 2. **Memories (`/memories`)**: True backend hybrid search (FTS5 + vector), inline edit/pin/supersede/delete, and a live **Context Preview** drawer showing the exact ~300–500 token briefing that will be injected into the next coding session.
-3. **Connections (`/connections`)**: Auto-detected client cards with live heartbeat status, dry-run diff preview before connect, 1-click Connect/Disconnect/Test Ping, Codex `/hooks` 1-step callout, T3 watcher toggle, and Universal MCP snippet.
-4. **Engine & Budget (`/engine`)**: Clean ~12-setting form for provider selection (OpenRouter / Gemini / Ollama / OpenAI-compatible / Zero-LLM / Opt-in CLI), API key & model config, Test Connection button, strict zero-silent-fallback status, and hard daily token/USD caps.
+3. **Connections (`/connections`)**: Auto-detected client cards with live heartbeat status, Port Mismatch detection & 1-click Reconnect, dry-run diff preview before connect, 1-click Connect/Disconnect/Test Ping, Codex `/hooks` 1-step callout, T3 watcher toggle, and Universal MCP snippet.
+4. **Engine & Budget (`/engine`)**: Clean ~12-setting form for provider selection (OpenRouter / Gemini / Ollama / OpenAI-compatible / Zero-LLM / Opt-in CLI), API key & model config, Test Connection button, strict zero-silent-fallback status, hard daily token/USD caps, plus Local Daemon status, opt-in Auto-Start toggle, and confirmed Stop Daemon control.
 
 ---
 
 ## 7. CLI Commands
 
-- `0x1-memory serve [--port 41777] [--open]` — Start local daemon (HTTP API + MCP + SSE + embedded Web UI + background distillation worker + T3 watcher).
-- `0x1-memory setup [--client all|claude-code|codex|antigravity|t3-code] [--yes]` — Interactive/automated guided setup wizard with diff preview & backup.
-- `0x1-memory status` — Show daemon health, connected clients, memory count, and today's token/cost usage.
+- `0x1-memory` / `0x1-memory start [--port 10101] [--open]` — Start detached background Daemon (`~/.0x1-memory/daemon.pid` + `daemon.log`), idempotent if already running, and optionally open Onboarding/Web UI.
+- `0x1-memory stop [--port 10101]` — Stop the background Daemon cleanly (tears down active SSE streams immediately).
+- `0x1-memory restart [--port 10101] [--open]` — Restart the background Daemon.
+- `0x1-memory logs [-n 50]` — Print recent lines from `~/.0x1-memory/daemon.log`.
+- `0x1-memory autostart <enable|disable|status>` — Opt-in login Auto-Start (`launchd` on macOS, `systemd --user` on Linux).
+- `0x1-memory serve [--port 10101] [--open] [--foreground]` — Run Daemon in foreground (HTTP API + MCP + SSE + embedded Web UI + background distillation worker + T3 watcher).
+- `0x1-memory setup [--client all|claude-code|codex|antigravity|t3-code] [--yes]` — CLI Setup with diff preview & backup.
+- `0x1-memory status` — Show Daemon health, Auto-Start, connected/mismatched clients, memory count, and today's token/cost usage.
 - `0x1-memory hook <claude|codex|antigravity> [event]` — Ultra-fast (<5ms) stdin→HTTP→stdout hook shim with `OX1_MEMORY_INTERNAL=1` recursion guard.
-- `0x1-memory mcp-stdio` — Optional stdio MCP bridge forwarding JSON-RPC to the local daemon (or direct SQLite fallback).
+- `0x1-memory mcp-stdio` — Optional stdio MCP bridge forwarding JSON-RPC to the local Daemon (or direct SQLite fallback).
 - `0x1-memory search <query>` — Quick terminal hybrid search.

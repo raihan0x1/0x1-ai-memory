@@ -1,7 +1,11 @@
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use ox1_memory::config::{AppPaths, DEFAULT_PORT};
 use ox1_memory::connectors::ConnectorManager;
+use ox1_memory::daemon::{
+    AutoStartManager, daemon_is_healthy, fetch_onboarding_completed, format_pid_entry,
+    read_log_tail, spawn_background, stop_daemon,
+};
 use ox1_memory::db::MemoryDb;
 use ox1_memory::distill::spawn_distill_worker;
 use ox1_memory::embed::Embedder;
@@ -15,7 +19,7 @@ use serde_json::{Value, json};
 use std::io::{self, BufRead, Read, Write};
 use std::net::SocketAddr;
 use std::time::Duration;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 
 #[derive(Parser)]
 #[command(
@@ -28,17 +32,60 @@ struct Cli {
     command: Option<Commands>,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum AutoStartAction {
+    Enable,
+    Disable,
+    Status,
+}
+
 #[derive(Subcommand)]
 enum Commands {
-    /// Start the local daemon (HTTP API + Streamable HTTP MCP + SSE + embedded Web UI)
+    /// Start the Daemon in the background (default when run with no subcommand)
+    Start {
+        #[arg(long, env = "OX1_MEMORY_PORT", default_value_t = DEFAULT_PORT)]
+        port: u16,
+        /// Open the localhost Web UI in the default browser once healthy
+        #[arg(long)]
+        open: bool,
+    },
+    /// Stop the running background Daemon cleanly
+    Stop {
+        #[arg(long, env = "OX1_MEMORY_PORT", default_value_t = DEFAULT_PORT)]
+        port: u16,
+    },
+    /// Restart the background Daemon
+    Restart {
+        #[arg(long, env = "OX1_MEMORY_PORT", default_value_t = DEFAULT_PORT)]
+        port: u16,
+        /// Open the localhost Web UI in the default browser after restart
+        #[arg(long)]
+        open: bool,
+    },
+    /// Show recent Daemon log output from ~/.0x1-memory/daemon.log
+    Logs {
+        #[arg(long, short = 'n', default_value_t = 50)]
+        lines: usize,
+    },
+    /// Manage opt-in OS login Auto-Start (macOS launchd / Linux systemd --user)
+    Autostart {
+        #[arg(value_enum)]
+        action: AutoStartAction,
+        #[arg(long, env = "OX1_MEMORY_PORT", default_value_t = DEFAULT_PORT)]
+        port: u16,
+    },
+    /// Run the Daemon in the foreground (for debugging, launchd, or systemd)
     Serve {
         #[arg(long, env = "OX1_MEMORY_PORT", default_value_t = DEFAULT_PORT)]
         port: u16,
         /// Open the localhost Web UI in the default browser on startup
         #[arg(long)]
         open: bool,
+        /// Explicit foreground flag (default behavior of `serve`)
+        #[arg(long, default_value_t = true)]
+        foreground: bool,
     },
-    /// Guided setup wizard: auto-detect and connect Claude Code, Codex, Antigravity, & T3 Code
+    /// CLI Setup: auto-detect and connect Claude Code, Codex, Antigravity, & T3 Code from terminal
     Setup {
         /// Target client (all, claude-code, codex, antigravity, t3-code)
         #[arg(long, default_value = "all")]
@@ -52,7 +99,7 @@ enum Commands {
         #[arg(long)]
         disconnect: bool,
     },
-    /// Show daemon status, connected AI clients, memory count, and today's token/cost usage
+    /// Show Daemon status, Auto-Start, connected AI clients, memory count, and today's usage
     Status {
         #[arg(long, env = "OX1_MEMORY_PORT", default_value_t = DEFAULT_PORT)]
         port: u16,
@@ -89,8 +136,12 @@ fn main() -> Result<()> {
     }
 
     let cli = Cli::parse();
-    let command = cli.command.unwrap_or(Commands::Serve {
-        port: DEFAULT_PORT,
+    let default_port = std::env::var("OX1_MEMORY_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_PORT);
+    let command = cli.command.unwrap_or(Commands::Start {
+        port: default_port,
         open: true,
     });
 
@@ -152,7 +203,19 @@ async fn async_main(cmd: Commands) -> Result<()> {
     paths.ensure_dirs()?;
 
     match cmd {
-        Commands::Serve { port, open } => run_serve(paths, port, open).await,
+        Commands::Start { port, open } => run_start(paths, port, open).await,
+        Commands::Stop { port } => run_stop(paths, port).await,
+        Commands::Restart { port, open } => {
+            let _ = stop_daemon(&paths, port).await?;
+            run_start(paths, port, open).await
+        }
+        Commands::Logs { lines } => run_logs(paths, lines),
+        Commands::Autostart { action, port } => run_autostart(paths, action, port),
+        Commands::Serve {
+            port,
+            open,
+            foreground: _,
+        } => run_serve(paths, port, open).await,
         Commands::Setup {
             client,
             port,
@@ -164,6 +227,90 @@ async fn async_main(cmd: Commands) -> Result<()> {
         Commands::Search { query, limit, port } => run_search(paths, &query, limit, port).await,
         Commands::Hook { .. } => unreachable!(),
     }
+}
+
+fn web_ui_url(base_url: &str, onboarding_done: bool) -> String {
+    if onboarding_done {
+        base_url.to_string()
+    } else {
+        format!("{base_url}/onboarding")
+    }
+}
+
+async fn run_start(paths: AppPaths, port: u16, open_browser: bool) -> Result<()> {
+    let base_url = format!("http://127.0.0.1:{port}");
+    if daemon_is_healthy(port).await {
+        let onboarding_done = fetch_onboarding_completed(port).await.unwrap_or(true);
+        let open_url = web_ui_url(&base_url, onboarding_done);
+        println!("0x1-ai-memory Daemon is already running on {base_url}");
+        println!("  Web UI : {open_url}");
+        if open_browser {
+            open_in_browser(&open_url);
+        }
+        return Ok(());
+    }
+
+    let bin_path =
+        std::env::current_exe().context("Could not resolve 0x1-memory executable path")?;
+    let pid = spawn_background(&paths, &bin_path, port).await?;
+    let onboarding_done = fetch_onboarding_completed(port).await.unwrap_or(false);
+    let open_url = web_ui_url(&base_url, onboarding_done);
+
+    println!("0x1-ai-memory Daemon running in background (pid {pid})");
+    println!("  Web UI : {open_url}");
+    println!("  MCP    : {base_url}/mcp");
+    println!("  DB     : {}", paths.db_path.display());
+    println!("  Logs   : {}", paths.log_path.display());
+    println!("  Stop   : 0x1-memory stop");
+
+    if open_browser {
+        open_in_browser(&open_url);
+    }
+    Ok(())
+}
+
+async fn run_stop(paths: AppPaths, port: u16) -> Result<()> {
+    if stop_daemon(&paths, port).await? {
+        println!("0x1-ai-memory Daemon stopped (port {port}).");
+    } else {
+        println!("0x1-ai-memory Daemon is not running on port {port}.");
+    }
+    Ok(())
+}
+
+fn run_logs(paths: AppPaths, lines: usize) -> Result<()> {
+    let tail = read_log_tail(&paths.log_path, lines)?;
+    if tail.is_empty() {
+        println!("No Daemon logs found at {}.", paths.log_path.display());
+    } else {
+        println!("{tail}");
+    }
+    Ok(())
+}
+
+fn run_autostart(paths: AppPaths, action: AutoStartAction, port: u16) -> Result<()> {
+    let home = dirs::home_dir().context("Home directory unavailable")?;
+    let bin_path = std::env::current_exe().unwrap_or_else(|_| "0x1-memory".into());
+    let mgr = AutoStartManager::for_current_os(home, bin_path, paths.log_path, port);
+    let status = match action {
+        AutoStartAction::Enable => mgr.enable()?,
+        AutoStartAction::Disable => mgr.disable()?,
+        AutoStartAction::Status => mgr.status(),
+    };
+    println!(
+        "Auto-Start : {} (supported={})",
+        if status.enabled {
+            "ENABLED"
+        } else {
+            "DISABLED"
+        },
+        status.supported
+    );
+    if let Some(p) = status.service_path {
+        println!("Service    : {p}");
+    }
+    println!("Note       : {}", status.note);
+    Ok(())
 }
 
 async fn run_serve(paths: AppPaths, port: u16, open_browser: bool) -> Result<()> {
@@ -183,15 +330,26 @@ async fn run_serve(paths: AppPaths, port: u16, open_browser: bool) -> Result<()>
 
     let llm = MemoryLlmClient::new();
     let (events_tx, _) = broadcast::channel::<StreamEvent>(256);
+    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     let distill =
         spawn_distill_worker(db.clone(), embedder.clone(), llm.clone(), events_tx.clone());
     spawn_t3_watcher(db.clone(), distill.clone());
 
     let home = dirs::home_dir().context("Home directory unavailable")?;
     let bin_path = std::env::current_exe().unwrap_or_else(|_| "0x1-memory".into());
-    let connectors = ConnectorManager::new(home, paths.backups_dir.clone(), bin_path, port);
-    let inspected = connectors.inspect_all(&db).unwrap_or_default();
-    let any_connected = inspected.iter().any(|c| c.connected);
+    let connectors = ConnectorManager::new(
+        home.clone(),
+        paths.backups_dir.clone(),
+        bin_path.clone(),
+        port,
+    );
+    let autostart = AutoStartManager::for_current_os(home, bin_path, paths.log_path.clone(), port);
+
+    // Seed onboarding BEFORE inspect_all saves client_connections so fresh T3 installs aren't misread as upgrades.
+    let onboarding_done = db
+        .seed_onboarding_if_existing(connectors.has_explicit_client_config())
+        .unwrap_or(false);
+    let _ = connectors.inspect_all(&db);
 
     let state = AppState {
         db,
@@ -199,25 +357,25 @@ async fn run_serve(paths: AppPaths, port: u16, open_browser: bool) -> Result<()>
         llm,
         distill,
         connectors,
+        autostart,
         events_tx,
+        shutdown_tx: shutdown_tx.clone(),
         hook_state: HookState::default(),
         port,
+        data_dir: paths.data_dir.clone(),
+        log_path: paths.log_path.clone(),
     };
 
     let app = build_router(state);
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let base_url = format!("http://127.0.0.1:{port}");
-    let open_url = if any_connected {
-        base_url.clone()
-    } else {
-        format!("{base_url}/connections")
-    };
+    let open_url = web_ui_url(&base_url, onboarding_done);
 
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => l,
         Err(bind_err) => {
             if daemon_is_healthy(port).await {
-                println!("0x1-ai-memory daemon is already running on {base_url}");
+                println!("0x1-ai-memory Daemon is already running on {base_url}");
                 if open_browser {
                     open_in_browser(&open_url);
                 }
@@ -228,9 +386,9 @@ async fn run_serve(paths: AppPaths, port: u16, open_browser: bool) -> Result<()>
             });
         }
     };
-    let _ = std::fs::write(&paths.pid_path, std::process::id().to_string());
+    let _ = std::fs::write(&paths.pid_path, format_pid_entry(std::process::id(), port));
 
-    println!("0x1-ai-memory daemon listening on {base_url}");
+    println!("0x1-ai-memory Daemon listening on {base_url}");
     println!("  Web UI : {open_url}");
     println!("  MCP    : {base_url}/mcp");
     println!("  DB     : {}", paths.db_path.display());
@@ -239,10 +397,20 @@ async fn run_serve(paths: AppPaths, port: u16, open_browser: bool) -> Result<()>
         open_in_browser(&open_url);
     }
 
+    let sig_tx = shutdown_tx.clone();
+    tokio::spawn(async move {
+        wait_for_shutdown_signal().await;
+        tracing::info!("Shutting down 0x1-ai-memory cleanly...");
+        let _ = sig_tx.send(true);
+    });
+
     axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-            tracing::info!("Shutting down 0x1-ai-memory cleanly...");
+        .with_graceful_shutdown(async move {
+            while !*shutdown_rx.borrow() {
+                if shutdown_rx.changed().await.is_err() {
+                    break;
+                }
+            }
         })
         .await?;
 
@@ -250,19 +418,26 @@ async fn run_serve(paths: AppPaths, port: u16, open_browser: bool) -> Result<()>
     Ok(())
 }
 
-async fn daemon_is_healthy(port: u16) -> bool {
-    let Ok(client) = reqwest::Client::builder()
-        .timeout(Duration::from_millis(400))
-        .build()
-    else {
-        return false;
-    };
-    client
-        .get(format!("http://127.0.0.1:{port}/health"))
-        .send()
-        .await
-        .map(|r| r.status().is_success())
-        .unwrap_or(false)
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sigterm = signal(SignalKind::terminate()).ok();
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = async {
+                if let Some(ref mut s) = sigterm {
+                    s.recv().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 fn open_in_browser(url: &str) {
@@ -308,9 +483,9 @@ fn run_setup(
     println!(
         "=== 0x1-ai-memory {} ===\n",
         if disconnect {
-            "Disconnect Wizard"
+            "CLI Disconnect"
         } else {
-            "Setup Wizard"
+            "CLI Setup"
         }
     );
     for cid in &targets {
@@ -371,31 +546,25 @@ async fn run_status(paths: AppPaths, port: u16) -> Result<()> {
     let summary = db.usage_summary(&settings, settings.embedding_mode.clone())?;
     let home = dirs::home_dir().context("Home directory unavailable")?;
     let bin_path = std::env::current_exe().unwrap_or_else(|_| "0x1-memory".into());
-    let mgr = ConnectorManager::new(home, paths.backups_dir, bin_path, port);
+    let mgr = ConnectorManager::new(home.clone(), paths.backups_dir, bin_path.clone(), port);
+    let autostart = AutoStartManager::for_current_os(home, bin_path, paths.log_path, port).status();
     let conns = mgr.inspect_all(&db)?;
 
-    let daemon_up = reqwest::Client::builder()
-        .timeout(Duration::from_millis(400))
-        .build()
-        .ok()
-        .map(|c| {
-            let url = format!("http://127.0.0.1:{port}/health");
-            (c, url)
-        });
-
-    let live = match daemon_up {
-        Some((c, url)) => c
-            .get(&url)
-            .send()
-            .await
-            .map(|r| r.status().is_success())
-            .unwrap_or(false),
-        None => false,
-    };
+    let live = daemon_is_healthy(port).await;
 
     println!(
         "Daemon     : {} (http://127.0.0.1:{port})",
         if live { "RUNNING" } else { "STOPPED" }
+    );
+    println!(
+        "Auto-Start : {}",
+        if autostart.enabled {
+            "ENABLED"
+        } else if autostart.supported {
+            "DISABLED (run `0x1-memory autostart enable`)"
+        } else {
+            "MANUAL"
+        }
     );
     println!(
         "Engine     : {} / {} (Zero silent fallback: ON)",
@@ -413,10 +582,27 @@ async fn run_status(paths: AppPaths, port: u16) -> Result<()> {
         summary.daily_cost_cap_usd
     );
     println!("\nClients:");
+    let mut has_mismatch = false;
     for c in conns {
+        if c.port_mismatch {
+            has_mismatch = true;
+        }
         println!(
-            "  - {:<16} detected={:<5} connected={:<5} | {}",
-            c.display_name, c.detected, c.connected, c.status_note
+            "  - {:<16} detected={:<5} connected={:<5}{} | {}",
+            c.display_name,
+            c.detected,
+            c.connected,
+            if c.port_mismatch {
+                " [PORT MISMATCH]"
+            } else {
+                ""
+            },
+            c.status_note
+        );
+    }
+    if has_mismatch {
+        println!(
+            "\nAction needed: run `0x1-memory setup` or open http://127.0.0.1:{port}/connections to reconnect mismatched clients."
         );
     }
     Ok(())
@@ -518,8 +704,59 @@ mod tests {
     use super::*;
 
     #[test]
-    fn no_subcommand_defaults_to_none_for_one_command_serve_open() {
+    fn no_subcommand_defaults_to_none_for_one_command_background_start() {
         let cli = Cli::try_parse_from(["0x1-memory"]).unwrap();
         assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn parses_daemon_lifecycle_and_autostart_subcommands_with_port_10101() {
+        assert!(matches!(
+            Cli::try_parse_from(["0x1-memory", "start"])
+                .unwrap()
+                .command,
+            Some(Commands::Start {
+                port: 10101,
+                open: false
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["0x1-memory", "stop"]).unwrap().command,
+            Some(Commands::Stop { port: 10101 })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["0x1-memory", "restart", "--open"])
+                .unwrap()
+                .command,
+            Some(Commands::Restart {
+                port: 10101,
+                open: true
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["0x1-memory", "logs", "-n", "25"])
+                .unwrap()
+                .command,
+            Some(Commands::Logs { lines: 25 })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["0x1-memory", "serve", "--foreground"])
+                .unwrap()
+                .command,
+            Some(Commands::Serve {
+                port: 10101,
+                open: false,
+                foreground: true
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["0x1-memory", "autostart", "enable"])
+                .unwrap()
+                .command,
+            Some(Commands::Autostart {
+                action: AutoStartAction::Enable,
+                port: 10101
+            })
+        ));
     }
 }

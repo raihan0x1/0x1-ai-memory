@@ -217,6 +217,39 @@ impl MemoryDb {
         Ok(())
     }
 
+    /// Auto-skip Onboarding once for users upgrading from versions before `onboarding_completed` existed.
+    pub fn seed_onboarding_if_existing(&self, has_configured_clients: bool) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'onboarding_completed'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(val) = existing {
+            return Ok(val == "true" || val == "1");
+        }
+        let has_memories: bool =
+            conn.query_row("SELECT EXISTS(SELECT 1 FROM memories LIMIT 1)", [], |r| {
+                r.get::<_, i64>(0)
+            })? != 0;
+        let has_prior_conn: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM client_connections WHERE connected = 1 LIMIT 1)",
+            [],
+            |r| r.get::<_, i64>(0),
+        )? != 0;
+        if has_memories || has_prior_conn || has_configured_clients {
+            conn.execute(
+                "INSERT INTO settings(key, value) VALUES ('onboarding_completed', 'true')
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [],
+            )?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     pub fn get_meta(&self, key: &str) -> Result<Option<String>> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
@@ -1622,5 +1655,49 @@ mod tests {
         // Regression test: memory_timeline must not deadlock on self.conn Mutex
         let timeline = db.memory_timeline(&m2.id, 3, 3).unwrap();
         assert!(timeline.iter().any(|h| h.id == m2.id));
+    }
+
+    #[test]
+    fn onboarding_seed_auto_skips_upgrading_users_without_overwriting_explicit_false() {
+        // Fresh user stays incomplete
+        let fresh = MemoryDb::open_in_memory().unwrap();
+        assert!(!fresh.seed_onboarding_if_existing(false).unwrap());
+        assert!(!fresh.get_settings().unwrap().onboarding_completed);
+
+        // Upgrading user with detected client config (even on mismatched port) auto-skips
+        let upgraded_client = MemoryDb::open_in_memory().unwrap();
+        assert!(upgraded_client.seed_onboarding_if_existing(true).unwrap());
+        assert!(upgraded_client.get_settings().unwrap().onboarding_completed);
+
+        // Upgrading user with existing memory auto-skips
+        let upgraded_mem = MemoryDb::open_in_memory().unwrap();
+        upgraded_mem
+            .create_memory(
+                NewMemoryInput {
+                    scope: Some("global".into()),
+                    project_id: None,
+                    session_id: None,
+                    source_client: Some("ui".into()),
+                    memory_type: "pattern".into(),
+                    title: "Existing".into(),
+                    summary: "Prior v0.1.2 memory".into(),
+                    content: "Stored before onboarding existed".into(),
+                    files: None,
+                    tags: None,
+                    status: None,
+                    supersedes_id: None,
+                },
+                None,
+            )
+            .unwrap();
+        assert!(upgraded_mem.seed_onboarding_if_existing(false).unwrap());
+        assert!(upgraded_mem.get_settings().unwrap().onboarding_completed);
+
+        // Explicit onboarding_completed=false is preserved
+        let mut s = upgraded_mem.get_settings().unwrap();
+        s.onboarding_completed = false;
+        upgraded_mem.save_settings(&s).unwrap();
+        assert!(!upgraded_mem.seed_onboarding_if_existing(true).unwrap());
+        assert!(!upgraded_mem.get_settings().unwrap().onboarding_completed);
     }
 }

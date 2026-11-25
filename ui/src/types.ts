@@ -68,6 +68,8 @@ export interface ClientConnection {
   display_name: string;
   detected: boolean;
   connected: boolean;
+  configured_port: number | null;
+  port_mismatch: boolean;
   needs_manual_step: boolean;
   manual_step_hint: string | null;
   config_paths: string[];
@@ -107,7 +109,27 @@ export interface SettingsView {
   raw_event_retention_days: number;
   t3_watcher_enabled: boolean;
   distill_idle_seconds: number;
+  onboarding_completed: boolean;
   zero_silent_fallback: boolean;
+}
+
+export interface AutoStartStatus {
+  supported: boolean;
+  enabled: boolean;
+  platform: 'macos' | 'linux' | 'windows' | 'unsupported';
+  service_path: string | null;
+  note: string;
+}
+
+export interface DaemonInfo {
+  running: boolean;
+  pid: number;
+  port: number;
+  version: string;
+  mcp_url: string;
+  data_dir: string;
+  log_path: string;
+  autostart: AutoStartStatus;
 }
 
 export interface ConnectionTestResult {

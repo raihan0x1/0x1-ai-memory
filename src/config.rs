@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-pub const DEFAULT_PORT: u16 = 41777;
+pub const DEFAULT_PORT: u16 = 10101;
 pub const EMBEDDING_DIM: usize = 384;
 
 #[derive(Debug, Clone)]
@@ -15,6 +15,7 @@ pub struct AppPaths {
     pub backups_dir: PathBuf,
     pub models_dir: PathBuf,
     pub pid_path: PathBuf,
+    pub log_path: PathBuf,
 }
 
 impl AppPaths {
@@ -34,6 +35,7 @@ impl AppPaths {
             backups_dir: data_dir.join("backups"),
             models_dir: data_dir.join("models"),
             pid_path: data_dir.join("daemon.pid"),
+            log_path: data_dir.join("daemon.log"),
             data_dir,
         }
     }
@@ -53,6 +55,14 @@ pub fn ensure_parent_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
+pub fn write_atomic_file(path: &Path, content: &str) -> Result<()> {
+    ensure_parent_dir(path)?;
+    let tmp = path.with_extension("ox1-tmp");
+    std::fs::write(&tmp, content)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
     pub provider: String,
@@ -67,6 +77,7 @@ pub struct Settings {
     pub raw_event_retention_days: i64,
     pub t3_watcher_enabled: bool,
     pub distill_idle_seconds: i64,
+    pub onboarding_completed: bool,
 }
 
 impl Default for Settings {
@@ -84,6 +95,7 @@ impl Default for Settings {
             raw_event_retention_days: 14,
             t3_watcher_enabled: true,
             distill_idle_seconds: 120,
+            onboarding_completed: false,
         }
     }
 }
@@ -141,6 +153,9 @@ impl Settings {
         if let Some(v) = map.get("distill_idle_seconds").and_then(|x| x.parse().ok()) {
             s.distill_idle_seconds = v;
         }
+        if let Some(v) = map.get("onboarding_completed") {
+            s.onboarding_completed = v == "true" || v == "1";
+        }
         s
     }
 
@@ -177,6 +192,15 @@ impl Settings {
         m.insert(
             "distill_idle_seconds".into(),
             self.distill_idle_seconds.to_string(),
+        );
+        m.insert(
+            "onboarding_completed".into(),
+            if self.onboarding_completed {
+                "true"
+            } else {
+                "false"
+            }
+            .into(),
         );
         m
     }
@@ -278,6 +302,7 @@ impl Settings {
             raw_event_retention_days: self.raw_event_retention_days,
             t3_watcher_enabled: self.t3_watcher_enabled,
             distill_idle_seconds: self.distill_idle_seconds,
+            onboarding_completed: self.onboarding_completed,
             zero_silent_fallback: true,
         }
     }
@@ -298,6 +323,7 @@ pub struct SettingsView {
     pub raw_event_retention_days: i64,
     pub t3_watcher_enabled: bool,
     pub distill_idle_seconds: i64,
+    pub onboarding_completed: bool,
     pub zero_silent_fallback: bool,
 }
 
@@ -316,6 +342,7 @@ pub struct SettingsPatch {
     pub raw_event_retention_days: Option<i64>,
     pub t3_watcher_enabled: Option<bool>,
     pub distill_idle_seconds: Option<i64>,
+    pub onboarding_completed: Option<bool>,
 }
 
 impl Settings {
@@ -355,6 +382,9 @@ impl Settings {
         }
         if let Some(v) = patch.distill_idle_seconds {
             self.distill_idle_seconds = v.clamp(15, 3600);
+        }
+        if let Some(v) = patch.onboarding_completed {
+            self.onboarding_completed = v;
         }
     }
 }
@@ -401,5 +431,34 @@ mod tests {
         s.provider = "openai_compatible".into();
         s.base_url = "http://127.0.0.1:1234/v1".into();
         assert!(!s.is_external_destination());
+    }
+
+    #[test]
+    fn default_port_is_10101_with_log_path_and_onboarding_flag() {
+        assert_eq!(DEFAULT_PORT, 10101);
+        let paths = AppPaths::from_dir(PathBuf::from("/tmp/ox1-test"));
+        assert_eq!(paths.log_path, PathBuf::from("/tmp/ox1-test/daemon.log"));
+
+        let mut s = Settings::default();
+        assert!(!s.onboarding_completed);
+        s.apply_patch(SettingsPatch {
+            provider: None,
+            model: None,
+            base_url: None,
+            api_key: None,
+            daily_token_cap: None,
+            daily_cost_cap_usd: None,
+            session_start_token_budget: None,
+            embedding_mode: None,
+            embedding_model: None,
+            raw_event_retention_days: None,
+            t3_watcher_enabled: None,
+            distill_idle_seconds: None,
+            onboarding_completed: Some(true),
+        });
+        assert!(s.onboarding_completed);
+        let roundtrip = Settings::from_map(&s.to_map());
+        assert!(roundtrip.onboarding_completed);
+        assert!(roundtrip.redacted().onboarding_completed);
     }
 }

@@ -1,7 +1,8 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import { api, formatUtcTime } from '../api';
+import { ModalDialog } from '../components/ModalDialog';
 import { RimSelect } from '../components/RimSelect';
-import type { ConnectionTestResult, SettingsView, UsageEntry } from '../types';
+import type { ConnectionTestResult, DaemonInfo, SettingsView, UsageEntry } from '../types';
 
 const PROVIDER_PRESETS: Record<
   string,
@@ -78,10 +79,20 @@ const EMBEDDING_OPTIONS = [
 ];
 
 interface EnginePageProps {
+  daemon: DaemonInfo | null;
+  daemonLoading?: boolean;
   onSaved: () => Promise<void>;
+  onDaemonStopped: () => void;
+  onRunOnboarding: () => void;
 }
 
-export function EnginePage({ onSaved }: EnginePageProps) {
+export function EnginePage({
+  daemon,
+  daemonLoading = false,
+  onSaved,
+  onDaemonStopped,
+  onRunOnboarding,
+}: EnginePageProps) {
   const [settings, setSettings] = useState<SettingsView | null>(null);
   const [usage, setUsage] = useState<UsageEntry[]>([]);
   const [loading, setLoading] = useState(true);
@@ -103,6 +114,12 @@ export function EnginePage({ onSaved }: EnginePageProps) {
   const [testing, setTesting] = useState(false);
   const [saveNotice, setSaveNotice] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<ConnectionTestResult | null>(null);
+  const [autostartBusy, setAutostartBusy] = useState(false);
+  const [daemonNotice, setDaemonNotice] = useState<{ kind: 'ok' | 'danger'; text: string } | null>(
+    null,
+  );
+  const [confirmStopOpen, setConfirmStopOpen] = useState(false);
+  const [stopping, setStopping] = useState(false);
 
   async function load() {
     setLoading(true);
@@ -180,6 +197,45 @@ export function EnginePage({ onSaved }: EnginePageProps) {
       await Promise.all([load(), onSaved()]);
     } finally {
       setTesting(false);
+    }
+  }
+
+  async function handleAutostartToggle(enabled: boolean) {
+    setAutostartBusy(true);
+    setDaemonNotice(null);
+    try {
+      const updated = await api.setAutostart(enabled);
+      setDaemonNotice({
+        kind: 'ok',
+        text: updated.enabled
+          ? 'Auto-Start enabled for future logins.'
+          : 'Auto-Start disabled. The running Daemon stays active.',
+      });
+      await onSaved();
+    } catch (e) {
+      setDaemonNotice({
+        kind: 'danger',
+        text: e instanceof Error ? e.message : 'Failed to update Auto-Start',
+      });
+    } finally {
+      setAutostartBusy(false);
+    }
+  }
+
+  async function handleConfirmStop() {
+    setStopping(true);
+    setDaemonNotice(null);
+    try {
+      await api.stopDaemon();
+      setConfirmStopOpen(false);
+      onDaemonStopped();
+    } catch (e) {
+      setDaemonNotice({
+        kind: 'danger',
+        text: e instanceof Error ? e.message : 'Failed to stop Daemon',
+      });
+    } finally {
+      setStopping(false);
     }
   }
 
@@ -410,6 +466,86 @@ export function EnginePage({ onSaved }: EnginePageProps) {
 
       <section className="panel">
         <div className="panel-header">
+          <div>
+            <h2 className="panel-title">Local Daemon and Auto-Start</h2>
+            <p className="field-hint">
+              Manage background lifecycle, login Auto-Start, or re-run Onboarding.
+            </p>
+          </div>
+          <div className="head-actions">
+            <button type="button" className="btn" onClick={onRunOnboarding}>
+              Run onboarding
+            </button>
+            <button
+              type="button"
+              className="btn btn-danger"
+              onClick={() => setConfirmStopOpen(true)}
+            >
+              Stop daemon
+            </button>
+          </div>
+        </div>
+
+        <div className="panel-body stack">
+          {daemonNotice ? (
+            <div
+              className={`callout ${daemonNotice.kind}`}
+              role={daemonNotice.kind === 'danger' ? 'alert' : 'status'}
+            >
+              {daemonNotice.text}
+            </div>
+          ) : null}
+
+          {daemonLoading && !daemon ? (
+            <div className="skeleton-row" aria-busy="true">
+              <div className="skeleton-bar skeleton-bar--short" />
+              <div className="skeleton-bar skeleton-bar--wide" />
+            </div>
+          ) : daemon ? (
+            <>
+              <div className="daemon-meta-grid">
+                <div className="daemon-meta-item">
+                  <span className="field-hint">Endpoint and PID</span>
+                  <span className="measure">
+                    http://127.0.0.1:{daemon.port} · PID {daemon.pid}
+                  </span>
+                </div>
+                <div className="daemon-meta-item">
+                  <span className="field-hint">Log file</span>
+                  <span className="measure">{daemon.log_path}</span>
+                </div>
+              </div>
+
+              <div className="stack-sm">
+                {daemon.autostart.supported ? (
+                  <label className="rim-check-label" htmlFor="eng-autostart">
+                    <input
+                      id="eng-autostart"
+                      type="checkbox"
+                      className="rim-check"
+                      checked={daemon.autostart.enabled}
+                      disabled={autostartBusy}
+                      onChange={(e) => void handleAutostartToggle(e.target.checked)}
+                    />
+                    <span>Start Daemon automatically on login ({daemon.autostart.platform})</span>
+                  </label>
+                ) : null}
+                <p className="field-hint">{daemon.autostart.note}</p>
+                <p className="field-hint measure">
+                  Terminal controls: 0x1-memory status · 0x1-memory stop · 0x1-memory logs
+                </p>
+              </div>
+            </>
+          ) : (
+            <div className="empty-state">
+              <p>Daemon metadata is currently unavailable.</p>
+            </div>
+          )}
+        </div>
+      </section>
+
+      <section className="panel">
+        <div className="panel-header">
           <h2 className="panel-title">Usage ledger (last 50 calls)</h2>
           <span className="field-hint">Every background LLM call is logged with UTC time</span>
         </div>
@@ -467,6 +603,34 @@ export function EnginePage({ onSaved }: EnginePageProps) {
           )}
         </div>
       </section>
+
+      <ModalDialog
+        open={confirmStopOpen}
+        title="Stop background Daemon?"
+        onClose={() => setConfirmStopOpen(false)}
+        footer={
+          <>
+            <button type="button" className="btn" onClick={() => setConfirmStopOpen(false)}>
+              Cancel
+            </button>
+            <button
+              type="button"
+              className="btn btn-danger"
+              disabled={stopping}
+              aria-busy={stopping}
+              onClick={() => void handleConfirmStop()}
+            >
+              {stopping ? 'Stopping...' : 'Stop daemon'}
+            </button>
+          </>
+        }
+      >
+        <p style={{ fontSize: 'var(--text-sm)', color: 'var(--color-ink-2)' }}>
+          This Web UI, local MCP server, and AI client hooks will stop until you run{' '}
+          <code className="measure">0x1-memory</code> or{' '}
+          <code className="measure">npx 0x1-ai-memory</code> again in your terminal.
+        </p>
+      </ModalDialog>
     </div>
   );
 }
