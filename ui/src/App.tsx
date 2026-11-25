@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { api, DEFAULT_DAEMON_PORT } from './api';
-import { IconEngine, IconMemory, IconPlug, IconStream } from './components/Icons';
+import { IconClose, IconEngine, IconMemory, IconPlug, IconStream } from './components/Icons';
+import { UpdateModal, WhatsNewModal } from './components/UpdateModals';
 import { ConnectionsPage } from './pages/ConnectionsPage';
 import { EnginePage } from './pages/EnginePage';
 import { MemoriesPage } from './pages/MemoriesPage';
@@ -10,9 +11,9 @@ import type {
   ClientConnection,
   DaemonInfo,
   LiveStreamItem,
-  MemoryHit,
   Project,
   SettingsView,
+  UpdateStatusResponse,
   UsageSummary,
 } from './types';
 
@@ -149,18 +150,25 @@ export function App() {
   const [tab, setTabState] = useState<Tab>(readTabFromUrl);
   const [summary, setSummary] = useState<UsageSummary | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
-  const [memories, setMemories] = useState<MemoryHit[]>([]);
   const [connections, setConnections] = useState<ClientConnection[]>([]);
   const [settings, setSettings] = useState<SettingsView | null>(null);
   const [daemon, setDaemon] = useState<DaemonInfo | null>(null);
+  const [updateStatus, setUpdateStatus] = useState<UpdateStatusResponse | null>(null);
   const [liveEvents, setLiveEvents] = useState<LiveStreamItem[]>([]);
+  const [sseMemoryTick, setSseMemoryTick] = useState(0);
+  const [sseSessionTick, setSseSessionTick] = useState(0);
+  const [sseTailTick, setSseTailTick] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [sseConnected, setSseConnected] = useState(false);
   const [daemonStopped, setDaemonStopped] = useState(false);
   const [checkedOnboardingRedirect, setCheckedOnboardingRedirect] = useState(false);
+  const [updateModalOpen, setUpdateModalOpen] = useState(false);
+  const [whatsNewOpen, setWhatsNewOpen] = useState(false);
+  const [whatsNewAuto, setWhatsNewAuto] = useState(false);
 
   const sseSeqRef = useRef(0);
+  const whatsNewAutoHandledRef = useRef(false);
 
   const setTab = useCallback(
     (next: Tab, replace = false, queryParams?: Record<string, string>) => {
@@ -196,20 +204,20 @@ export function App() {
 
   const refresh = useCallback(async () => {
     try {
-      const [sum, proj, mem, cfg, dm, conns] = await Promise.all([
+      const [sum, proj, cfg, dm, conns, upd] = await Promise.all([
         api.summary(),
         api.projects(),
-        api.searchMemories({ limit: 80 }),
         api.settings(),
         api.daemon(),
         api.connections(),
+        api.updateStatus().catch(() => null),
       ]);
       setSummary(sum);
       setProjects(proj.projects);
-      setMemories(mem.memories);
       setSettings(cfg);
       setDaemon(dm);
       setConnections(conns.connections);
+      if (upd) setUpdateStatus(upd);
       setError(null);
       setDaemonStopped(false);
     } catch (e) {
@@ -227,6 +235,18 @@ export function App() {
       }
     }
   }, [checkedOnboardingRedirect, settings, tab, setTab]);
+
+  useEffect(() => {
+    if (
+      tab !== 'onboarding' &&
+      !whatsNewAutoHandledRef.current &&
+      updateStatus?.whats_new.should_show
+    ) {
+      whatsNewAutoHandledRef.current = true;
+      setWhatsNewAuto(true);
+      setWhatsNewOpen(true);
+    }
+  }, [tab, updateStatus]);
 
   useEffect(() => {
     void refresh();
@@ -264,15 +284,65 @@ export function App() {
             setLiveEvents((prev) => [item, ...prev.filter((p) => p.id !== item.id)].slice(0, 80));
           }
         }
+        if (kind === 'memory_created' || kind === 'memory_updated' || kind === 'memory_deleted') {
+          setSseMemoryTick((t) => t + 1);
+        }
+        if (kind === 'raw_event' || kind === 'usage_recorded' || kind === 'memory_created') {
+          setSseSessionTick((t) => t + 1);
+          setSseTailTick((t) => t + 1);
+        }
         scheduleRefresh();
       });
     }
+
+    es.addEventListener('update_status', (ev) => {
+      if (ev instanceof MessageEvent && typeof ev.data === 'string') {
+        try {
+          const outer = JSON.parse(ev.data) as { payload?: UpdateStatusResponse };
+          if (outer.payload) setUpdateStatus(outer.payload);
+        } catch {
+          // ignore malformed update status event
+        }
+      }
+    });
 
     return () => {
       if (refreshTimer !== null) window.clearTimeout(refreshTimer);
       es.close();
     };
   }, [refresh]);
+
+  const handleCloseWhatsNew = useCallback(async () => {
+    setWhatsNewOpen(false);
+    if (updateStatus?.whats_new.should_show) {
+      try {
+        const next = await api.ackWhatsNew();
+        setUpdateStatus(next);
+      } catch {
+        setUpdateStatus((prev) =>
+          prev ? { ...prev, whats_new: { ...prev.whats_new, should_show: false } } : prev,
+        );
+      }
+    }
+  }, [updateStatus]);
+
+  const handleOpenWhatsNew = useCallback(async () => {
+    setWhatsNewAuto(false);
+    setWhatsNewOpen(true);
+    if (updateStatus && !updateStatus.whats_new.body) {
+      try {
+        const next = await api.fetchWhatsNew();
+        setUpdateStatus(next);
+      } catch {
+        // Offline fallback handles missing release notes inside the modal
+      }
+    }
+  }, [updateStatus]);
+
+  const handleCheckUpdates = useCallback(async () => {
+    const next = await api.checkUpdates();
+    setUpdateStatus(next);
+  }, []);
 
   const completeOnboarding = useCallback(async () => {
     try {
@@ -286,6 +356,11 @@ export function App() {
   }, [refresh, setTab]);
 
   const mismatchedClients = connections.filter((c) => c.port_mismatch);
+  const showUpdatePill = Boolean(
+    updateStatus?.update_available &&
+      updateStatus.latest_release &&
+      updateStatus.dismissed_version !== updateStatus.latest_release.version,
+  );
 
   if (daemonStopped) {
     return (
@@ -430,10 +505,39 @@ export function App() {
             </button>
           </nav>
 
-          <div className="topbar-meta" role="status">
+          <div className="topbar-meta">
+            {showUpdatePill && updateStatus?.latest_release ? (
+              <>
+                <span className="topbar-update-pill">
+                  <button
+                    type="button"
+                    className="topbar-update-btn"
+                    onClick={() => setUpdateModalOpen(true)}
+                  >
+                    Update v{updateStatus.latest_release.version}
+                  </button>
+                  <button
+                    type="button"
+                    className="topbar-update-dismiss"
+                    aria-label={`Dismiss update v${updateStatus.latest_release.version}`}
+                    onClick={() => {
+                      const ver = updateStatus.latest_release?.version;
+                      if (!ver) return;
+                      void api
+                        .dismissUpdate(ver)
+                        .then(setUpdateStatus)
+                        .catch(() => {});
+                    }}
+                  >
+                    <IconClose size={11} />
+                  </button>
+                </span>
+                <span className="topbar-sep" aria-hidden="true" />
+              </>
+            ) : null}
             <span className="measure">${(summary?.today_cost_usd ?? 0).toFixed(4)} USD</span>
             <span className="topbar-sep" aria-hidden="true" />
-            <span className="telemetry-status">
+            <span className="telemetry-status" role="status">
               <span
                 className={`signal-square${sseConnected ? '' : ' signal-square--offline'}`}
                 aria-hidden="true"
@@ -472,8 +576,10 @@ export function App() {
           <StreamPage
             summary={summary}
             projects={projects}
-            memories={memories}
             liveEvents={liveEvents}
+            sseMemoryTick={sseMemoryTick}
+            sseSessionTick={sseSessionTick}
+            sseTailTick={sseTailTick}
             loading={loading}
             sseConnected={sseConnected}
             onRefresh={refresh}
@@ -493,6 +599,10 @@ export function App() {
           <EnginePage
             daemon={daemon}
             daemonLoading={loading}
+            updateStatus={updateStatus}
+            onCheckUpdates={handleCheckUpdates}
+            onOpenUpdateModal={() => setUpdateModalOpen(true)}
+            onOpenWhatsNew={() => void handleOpenWhatsNew()}
             onSaved={refresh}
             onDaemonStopped={() => {
               setDaemonStopped(true);
@@ -503,6 +613,25 @@ export function App() {
           />
         ) : null}
       </main>
+
+      <UpdateModal
+        open={updateModalOpen}
+        status={updateStatus}
+        daemon={daemon}
+        onClose={() => setUpdateModalOpen(false)}
+        onStatusChange={setUpdateStatus}
+      />
+
+      <WhatsNewModal
+        open={whatsNewOpen}
+        whatsNew={updateStatus?.whats_new ?? null}
+        autoTriggered={whatsNewAuto}
+        onClose={() => void handleCloseWhatsNew()}
+        onRetryFetch={async () => {
+          const next = await api.fetchWhatsNew();
+          setUpdateStatus(next);
+        }}
+      />
     </div>
   );
 }

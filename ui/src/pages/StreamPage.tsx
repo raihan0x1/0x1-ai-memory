@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, type FormEvent } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { api, formatUtcClock, formatUtcDayKey, formatUtcDayLabel, formatUtcTime } from '../api';
 import {
   IconBolt,
@@ -12,6 +12,7 @@ import {
 } from '../components/Icons';
 import { MemoryInspectorDrawer } from '../components/MemoryInspectorDrawer';
 import { ModalDialog } from '../components/ModalDialog';
+import { PaginationBar } from '../components/PaginationBar';
 import { RimSelect } from '../components/RimSelect';
 import type {
   LiveStreamItem,
@@ -26,13 +27,19 @@ import type { Tab } from '../App';
 interface StreamPageProps {
   summary: UsageSummary | null;
   projects: Project[];
-  memories: MemoryHit[];
   liveEvents: LiveStreamItem[];
+  sseMemoryTick: number;
+  sseSessionTick: number;
+  sseTailTick: number;
   loading: boolean;
   sseConnected: boolean;
   onRefresh: () => Promise<void>;
   onNavigate: (tab: Tab, queryParams?: Record<string, string>) => void;
 }
+
+const MEM_PAGE_SIZE = 10;
+const SESSIONS_PAGE_SIZE = 6;
+const TAIL_PAGE_SIZE = 20;
 
 type StreamGroupMode = 'day' | 'session' | 'flat';
 type TailFilter = 'all' | 'prompts' | 'tools' | 'distill';
@@ -95,11 +102,60 @@ function aggregateTail(items: LiveStreamItem[]): AggregatedTailRow[] {
   return out;
 }
 
+function matchesTailFilters(
+  item: LiveStreamItem,
+  projectFilter: string,
+  clientFilter: string,
+  tailFilter: TailFilter,
+): boolean {
+  if (projectFilter && item.project_id && item.project_id !== projectFilter) return false;
+  if (clientFilter && item.source_client !== 'distill' && item.source_client !== clientFilter) {
+    return false;
+  }
+  if (tailFilter === 'prompts' && item.event_type !== 'prompt') return false;
+  if (tailFilter === 'tools' && item.event_type !== 'tool_use' && item.event_type !== 'tool_error') {
+    return false;
+  }
+  if (
+    tailFilter === 'distill' &&
+    item.kind !== 'usage_recorded' &&
+    item.kind !== 'memory_created' &&
+    item.event_type !== 'turn_stop'
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function NewItemsBanner({
+  visible,
+  label,
+  buttonText,
+  onBack,
+}: {
+  visible: boolean;
+  label: string;
+  buttonText: string;
+  onBack: () => void;
+}) {
+  if (!visible) return null;
+  return (
+    <div className="stream-new-banner" role="status">
+      <span>{label}</span>
+      <button type="button" className="btn-subtle" onClick={onBack}>
+        {buttonText}
+      </button>
+    </div>
+  );
+}
+
 export function StreamPage({
   summary,
   projects,
-  memories,
   liveEvents,
+  sseMemoryTick,
+  sseSessionTick,
+  sseTailTick,
   loading,
   sseConnected,
   onRefresh,
@@ -112,15 +168,55 @@ export function StreamPage({
   const [collapsedGroups, setCollapsedGroups] = useState<Record<string, boolean>>({});
   const [selectedMemoryId, setSelectedMemoryId] = useState<string | null>(null);
 
+  const [memHits, setMemHits] = useState<MemoryHit[]>([]);
+  const [memTotal, setMemTotal] = useState(0);
+  const [memLoading, setMemLoading] = useState(true);
+  const [memError, setMemError] = useState<string | null>(null);
+
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
+  const [sessionsTotal, setSessionsTotal] = useState(0);
+  const [sessionsLoading, setSessionsLoading] = useState(true);
+  const [sessionsError, setSessionsError] = useState<string | null>(null);
+
   const [rawEvents, setRawEvents] = useState<RawEventView[]>([]);
-  const [pipelineLoading, setPipelineLoading] = useState(true);
-  const [pipelineError, setPipelineError] = useState<string | null>(null);
+  const [tailTotal, setTailTotal] = useState(0);
+  const [tailLoading, setTailLoading] = useState(true);
+  const [tailError, setTailError] = useState<string | null>(null);
+
+  const [actionError, setActionError] = useState<string | null>(null);
   const [distillingId, setDistillingId] = useState<string | null>(null);
   const [flushing, setFlushing] = useState(false);
-  const [pausedSnapshot, setPausedSnapshot] = useState<AggregatedTailRow[] | null>(null);
   const [tailFilter, setTailFilter] = useState<TailFilter>('all');
+
+  const memFilterKey = `${projectFilter}:${clientFilter}`;
+  const [memPageState, setMemPageState] = useState({ key: memFilterKey, page: 1 });
+  const memPage = memPageState.key === memFilterKey ? memPageState.page : 1;
+  const [memNewState, setMemNewState] = useState({ key: memFilterKey, value: false });
+  const memHasNew = memNewState.key === memFilterKey && memNewState.value;
+
+  const sessFilterKey = projectFilter;
+  const [sessPageState, setSessPageState] = useState({ key: sessFilterKey, page: 1 });
+  const sessionsPage = sessPageState.key === sessFilterKey ? sessPageState.page : 1;
+  const [sessNewState, setSessNewState] = useState({ key: sessFilterKey, value: false });
+  const sessionsHasNew = sessNewState.key === sessFilterKey && sessNewState.value;
+
+  const tailFilterKey = `${projectFilter}:${clientFilter}:${tailFilter}`;
+  const [tailPageState, setTailPageState] = useState({ key: tailFilterKey, page: 1 });
+  const tailPage = tailPageState.key === tailFilterKey ? tailPageState.page : 1;
+  const [tailNewState, setTailNewState] = useState({ key: tailFilterKey, value: false });
+  const tailHasNew = tailNewState.key === tailFilterKey && tailNewState.value;
+  const [pausedState, setPausedState] = useState<{
+    key: string;
+    rows: AggregatedTailRow[] | null;
+  }>({ key: tailFilterKey, rows: null });
+  const pausedSnapshot = pausedState.key === tailFilterKey ? pausedState.rows : null;
   const tailPaused = pausedSnapshot !== null;
+
+  const prevMemTickRef = useRef(sseMemoryTick);
+  const prevSessTickRef = useRef(sseSessionTick);
+  const prevTailTickRef = useRef(sseTailTick);
+  const latestEventRef = useRef<LiveStreamItem | undefined>(liveEvents[0]);
+  latestEventRef.current = liveEvents[0];
 
   const [saveOpen, setSaveOpen] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -132,33 +228,135 @@ export function StreamPage({
   const [scope, setScope] = useState<'project' | 'global'>('project');
   const [targetProject, setTargetProject] = useState('');
 
-  const loadPipeline = useCallback(async () => {
-    setPipelineError(null);
+  const loadMemories = useCallback(async () => {
+    setMemLoading(true);
+    setMemError(null);
     try {
-      const [sRes, rRes] = await Promise.all([
-        api.sessions({ project_id: projectFilter || undefined, limit: 8 }),
-        api.rawEvents({
-          project_id: projectFilter || undefined,
-          client: clientFilter || undefined,
-          limit: 50,
-        }),
-      ]);
-      setSessions(sRes.sessions);
-      setRawEvents(rRes.events);
+      const res = await api.searchMemories({
+        project_id: projectFilter || undefined,
+        source_client: clientFilter || undefined,
+        limit: MEM_PAGE_SIZE,
+        offset: (memPage - 1) * MEM_PAGE_SIZE,
+      });
+      if (res.total > 0 && (memPage - 1) * MEM_PAGE_SIZE >= res.total) {
+        setMemPageState({ key: memFilterKey, page: Math.max(1, Math.ceil(res.total / MEM_PAGE_SIZE)) });
+        return;
+      }
+      setMemHits(res.memories);
+      setMemTotal(res.total);
     } catch (err) {
-      setPipelineError(err instanceof Error ? err.message : 'Failed to load pipeline activity');
+      setMemError(err instanceof Error ? err.message : 'Failed to load memories');
     } finally {
-      setPipelineLoading(false);
+      setMemLoading(false);
     }
-  }, [projectFilter, clientFilter]);
+  }, [projectFilter, clientFilter, memPage, memFilterKey]);
 
-  const pipelineSignal = `${memories.length}:${summary?.pending_raw_events ?? 0}:${summary?.today_calls ?? 0}`;
+  const loadSessions = useCallback(async () => {
+    setSessionsLoading(true);
+    setSessionsError(null);
+    try {
+      const sRes = await api.sessions({
+        project_id: projectFilter || undefined,
+        limit: SESSIONS_PAGE_SIZE,
+        offset: (sessionsPage - 1) * SESSIONS_PAGE_SIZE,
+      });
+      if (sRes.total > 0 && (sessionsPage - 1) * SESSIONS_PAGE_SIZE >= sRes.total) {
+        setSessPageState({
+          key: sessFilterKey,
+          page: Math.max(1, Math.ceil(sRes.total / SESSIONS_PAGE_SIZE)),
+        });
+        return;
+      }
+      setSessions(sRes.sessions);
+      setSessionsTotal(sRes.total);
+    } catch (err) {
+      setSessionsError(err instanceof Error ? err.message : 'Failed to load sessions');
+    } finally {
+      setSessionsLoading(false);
+    }
+  }, [projectFilter, sessionsPage, sessFilterKey]);
+
+  const loadTail = useCallback(async () => {
+    setTailLoading(true);
+    setTailError(null);
+    try {
+      const rRes = await api.rawEvents({
+        project_id: projectFilter || undefined,
+        client: clientFilter || undefined,
+        kind: tailFilter === 'all' ? undefined : tailFilter,
+        limit: TAIL_PAGE_SIZE,
+        offset: (tailPage - 1) * TAIL_PAGE_SIZE,
+      });
+      if (rRes.total > 0 && (tailPage - 1) * TAIL_PAGE_SIZE >= rRes.total) {
+        setTailPageState({
+          key: tailFilterKey,
+          page: Math.max(1, Math.ceil(rRes.total / TAIL_PAGE_SIZE)),
+        });
+        return;
+      }
+      setRawEvents(rRes.events);
+      setTailTotal(rRes.total);
+    } catch (err) {
+      setTailError(err instanceof Error ? err.message : 'Failed to load event tail');
+    } finally {
+      setTailLoading(false);
+    }
+  }, [projectFilter, clientFilter, tailFilter, tailPage, tailFilterKey]);
 
   useEffect(() => {
-    if (pipelineSignal) {
-      void loadPipeline();
+    void loadMemories();
+  }, [loadMemories]);
+
+  useEffect(() => {
+    void loadSessions();
+  }, [loadSessions]);
+
+  useEffect(() => {
+    void loadTail();
+  }, [loadTail]);
+
+  useEffect(() => {
+    if (sseMemoryTick === prevMemTickRef.current) return;
+    prevMemTickRef.current = sseMemoryTick;
+    if (memPage === 1) {
+      void loadMemories();
+    } else {
+      const latest = latestEventRef.current;
+      const matchesMemScope =
+        !latest ||
+        ((!projectFilter || !latest.project_id || latest.project_id === projectFilter) &&
+          (!clientFilter || latest.source_client === clientFilter));
+      if (matchesMemScope) {
+        setMemNewState({ key: memFilterKey, value: true });
+      }
     }
-  }, [loadPipeline, pipelineSignal]);
+  }, [sseMemoryTick, memPage, memFilterKey, projectFilter, clientFilter, loadMemories]);
+
+  useEffect(() => {
+    if (sseSessionTick === prevSessTickRef.current) return;
+    prevSessTickRef.current = sseSessionTick;
+    if (sessionsPage === 1) {
+      void loadSessions();
+    } else {
+      const latest = latestEventRef.current;
+      if (!latest || !projectFilter || !latest.project_id || latest.project_id === projectFilter) {
+        setSessNewState({ key: sessFilterKey, value: true });
+      }
+    }
+  }, [sseSessionTick, sessionsPage, sessFilterKey, projectFilter, loadSessions]);
+
+  useEffect(() => {
+    if (sseTailTick === prevTailTickRef.current) return;
+    prevTailTickRef.current = sseTailTick;
+    if (tailPage === 1) {
+      void loadTail();
+    } else {
+      const latest = latestEventRef.current;
+      if (!latest || matchesTailFilters(latest, projectFilter, clientFilter, tailFilter)) {
+        setTailNewState({ key: tailFilterKey, value: true });
+      }
+    }
+  }, [sseTailTick, tailPage, tailFilterKey, projectFilter, clientFilter, tailFilter, loadTail]);
 
   const tokenPct =
     summary && summary.daily_token_cap > 0
@@ -171,15 +369,7 @@ export function StreamPage({
   const budgetPct = Math.max(tokenPct, costPct);
   const meterClass = budgetPct >= 90 ? 'danger' : budgetPct >= 70 ? 'warn' : '';
 
-  const filtered = useMemo(
-    () =>
-      memories.filter((m) => {
-        if (projectFilter && m.project_id !== projectFilter && m.scope !== 'global') return false;
-        if (clientFilter && m.source_client !== clientFilter) return false;
-        return true;
-      }),
-    [memories, projectFilter, clientFilter],
-  );
+  const filtered = memHits;
 
   const sessionMap = useMemo(() => {
     const map = new Map<string, SessionSummary>();
@@ -227,43 +417,28 @@ export function StreamPage({
       tool_name: ev.tool_name,
       preview: ev.preview,
     }));
-    const combined = [...liveEvents, ...base];
-    const seen = new Set<string>();
-    const deduped: LiveStreamItem[] = [];
-    for (const item of combined) {
-      if (seen.has(item.id)) continue;
-      seen.add(item.id);
-      if (projectFilter && item.project_id && item.project_id !== projectFilter) continue;
-      if (
-        clientFilter &&
-        item.source_client !== 'distill' &&
-        item.source_client !== clientFilter
-      ) {
-        continue;
-      }
-      if (tailFilter === 'prompts' && item.event_type !== 'prompt') continue;
-      if (
-        tailFilter === 'tools' &&
-        item.event_type !== 'tool_use' &&
-        item.event_type !== 'tool_error'
-      ) {
-        continue;
-      }
-      if (
-        tailFilter === 'distill' &&
-        item.kind !== 'usage_recorded' &&
-        item.kind !== 'memory_created' &&
-        item.event_type !== 'turn_stop'
-      ) {
-        continue;
-      }
-      deduped.push(item);
-      if (deduped.length >= 60) break;
-    }
-    return aggregateTail(deduped);
-  }, [rawEvents, liveEvents, projectFilter, clientFilter, tailFilter]);
 
-  const displayedTail = pausedSnapshot ?? liveTail;
+    const matchedBase = base.filter((item) =>
+      matchesTailFilters(item, projectFilter, clientFilter, tailFilter),
+    );
+    if (tailPage > 1) {
+      return aggregateTail(matchedBase);
+    }
+
+    const baseIds = new Set(matchedBase.map((item) => item.id));
+    const liveExtras: LiveStreamItem[] = [];
+    const seenExtras = new Set<string>();
+    for (const item of liveEvents) {
+      if (baseIds.has(item.id) || seenExtras.has(item.id)) continue;
+      if (!matchesTailFilters(item, projectFilter, clientFilter, tailFilter)) continue;
+      seenExtras.add(item.id);
+      liveExtras.push(item);
+      if (liveExtras.length >= 10) break;
+    }
+    return aggregateTail([...liveExtras, ...matchedBase]);
+  }, [rawEvents, liveEvents, tailPage, projectFilter, clientFilter, tailFilter]);
+
+  const displayedTail = tailPage === 1 && pausedSnapshot ? pausedSnapshot : liveTail;
 
   const activeProjectObj = projects.find((p) => p.id === projectFilter);
   const projectFilterOptions = [
@@ -271,12 +446,10 @@ export function StreamPage({
     ...projects.map((p) => ({ value: p.id, label: p.name, meta: p.privacy_mode })),
   ];
   const projectTargetOptions = projects.map((p) => ({ value: p.id, label: p.name }));
-  const totalRecalls = useMemo(
-    () => memories.reduce((acc, m) => acc + (m.recall_count || 0), 0),
-    [memories],
-  );
-  const activeSessionsCount = sessions.filter((s) => s.status === 'active').length;
-  const hasAnyPending = sessions.some((s) => s.pending_events > 0);
+  const totalRecalls = summary?.total_recalls ?? 0;
+  const activeSessionsCount = summary?.active_sessions ?? 0;
+  const hasAnyPending =
+    (summary?.pending_raw_events ?? 0) > 0 || sessions.some((s) => s.pending_events > 0);
   const isZeroLlm = !summary || summary.active_provider === 'none';
 
   async function handleSave(e: FormEvent) {
@@ -299,6 +472,8 @@ export function StreamPage({
       setContent('');
       setSaveOpen(false);
       await onRefresh();
+      if (memPage === 1) await loadMemories();
+      else setMemNewState({ key: memFilterKey, value: true });
     } catch (err) {
       setSaveError(err instanceof Error ? err.message : 'Failed to save memory');
     } finally {
@@ -312,18 +487,21 @@ export function StreamPage({
   }
 
   async function handleTogglePin(m: MemoryHit) {
-    await api.updateMemory(m.id, { status: m.status === 'pinned' ? 'active' : 'pinned' });
+    const nextStatus = m.status === 'pinned' ? 'active' : 'pinned';
+    await api.updateMemory(m.id, { status: nextStatus });
+    setMemHits((prev) => prev.map((hit) => (hit.id === m.id ? { ...hit, status: nextStatus } : hit)));
     await onRefresh();
+    if (memPage === 1) await loadMemories();
   }
 
   async function handleDistillSession(sid: string) {
     setDistillingId(sid);
-    setPipelineError(null);
+    setActionError(null);
     try {
       await api.distillSession(sid);
-      await Promise.all([onRefresh(), loadPipeline()]);
+      await Promise.all([onRefresh(), loadSessions(), loadTail()]);
     } catch (err) {
-      setPipelineError(err instanceof Error ? err.message : 'Failed to queue distillation');
+      setActionError(err instanceof Error ? err.message : 'Failed to queue distillation');
     } finally {
       setDistillingId(null);
     }
@@ -331,12 +509,12 @@ export function StreamPage({
 
   async function handleFlushPending() {
     setFlushing(true);
-    setPipelineError(null);
+    setActionError(null);
     try {
       await api.distillFlush();
-      await Promise.all([onRefresh(), loadPipeline()]);
+      await Promise.all([onRefresh(), loadSessions(), loadTail()]);
     } catch (err) {
-      setPipelineError(err instanceof Error ? err.message : 'Failed to flush pending events');
+      setActionError(err instanceof Error ? err.message : 'Failed to flush pending events');
     } finally {
       setFlushing(false);
     }
@@ -505,13 +683,32 @@ export function StreamPage({
       <div className={railVisible ? 'stream-layout' : ''}>
         <section className="panel" aria-label="Recent cross-agent memories">
           <div className="panel-header">
-            <h2 className="panel-title">Recent memories ({filtered.length})</h2>
+            <h2 className="panel-title">Recent memories ({memTotal})</h2>
             <button type="button" className="btn btn-ghost" onClick={() => onNavigate('memories')}>
               Search &amp; graph
             </button>
           </div>
 
-          {loading ? (
+          <NewItemsBanner
+            visible={memHasNew && memPage > 1}
+            label={`New memories arrived while reading page ${memPage}.`}
+            buttonText="New memories — back to page 1"
+            onBack={() => {
+              setMemNewState({ key: memFilterKey, value: false });
+              setMemPageState({ key: memFilterKey, page: 1 });
+            }}
+          />
+
+          {memError ? (
+            <div className="callout danger" style={{ margin: 'var(--space-sm)' }}>
+              <span>{memError}</span>
+              <button type="button" className="btn btn-danger" onClick={() => void loadMemories()}>
+                Retry
+              </button>
+            </div>
+          ) : null}
+
+          {(loading || memLoading) && filtered.length === 0 ? (
             <div aria-busy="true">
               <span className="visually-hidden">Loading memories</span>
               {[0, 1, 2].map((i) => (
@@ -679,22 +876,33 @@ export function StreamPage({
               })}
             </div>
           )}
+
+          <PaginationBar
+            label="Recent memories pages"
+            page={memPage}
+            pageSize={MEM_PAGE_SIZE}
+            total={memTotal}
+            onPageChange={(nextPage) => {
+              setMemNewState({ key: memFilterKey, value: false });
+              setMemPageState({ key: memFilterKey, page: nextPage });
+            }}
+          />
         </section>
 
         {railVisible ? (
           <aside className="stream-rail" aria-label="Live capture and distillation pipeline">
-            {pipelineError ? (
-              <div className="callout danger">
-                <span>{pipelineError}</span>
-                <button type="button" className="btn btn-danger" onClick={() => void loadPipeline()}>
-                  Retry
+            {actionError ? (
+              <div className="callout danger" role="alert">
+                <span>{actionError}</span>
+                <button type="button" className="btn-subtle" onClick={() => setActionError(null)}>
+                  Dismiss
                 </button>
               </div>
             ) : null}
 
             <section className="panel">
               <div className="panel-header">
-                <h2 className="panel-title">Sessions &amp; queue</h2>
+                <h2 className="panel-title">Sessions &amp; queue ({sessionsTotal})</h2>
                 {hasAnyPending && !isZeroLlm ? (
                   <button
                     type="button"
@@ -708,6 +916,29 @@ export function StreamPage({
                 ) : null}
               </div>
 
+              <NewItemsBanner
+                visible={sessionsHasNew && sessionsPage > 1}
+                label={`New activity while on page ${sessionsPage}.`}
+                buttonText="New activity — back to page 1"
+                onBack={() => {
+                  setSessNewState({ key: sessFilterKey, value: false });
+                  setSessPageState({ key: sessFilterKey, page: 1 });
+                }}
+              />
+
+              {sessionsError ? (
+                <div className="callout danger" style={{ margin: 'var(--space-sm)' }} role="alert">
+                  <span>{sessionsError}</span>
+                  <button
+                    type="button"
+                    className="btn btn-danger"
+                    onClick={() => void loadSessions()}
+                  >
+                    Retry
+                  </button>
+                </div>
+              ) : null}
+
               {isZeroLlm && (summary?.pending_raw_events ?? 0) > 0 ? (
                 <div className="callout warn" style={{ margin: 'var(--space-sm)' }}>
                   <span>
@@ -717,7 +948,7 @@ export function StreamPage({
                 </div>
               ) : null}
 
-              {pipelineLoading ? (
+              {sessionsLoading && sessions.length === 0 ? (
                 <div className="skeleton-row">
                   <div className="skeleton-bar skeleton-bar--wide" />
                 </div>
@@ -727,7 +958,7 @@ export function StreamPage({
                 </div>
               ) : (
                 <ul className="session-list">
-                  {sessions.slice(0, 6).map((s) => (
+                  {sessions.map((s) => (
                     <li key={s.id} className="session-row">
                       <div className="session-row-top">
                         <div className="tag-row">
@@ -763,21 +994,61 @@ export function StreamPage({
                   ))}
                 </ul>
               )}
+
+              <PaginationBar
+                label="Sessions pages"
+                page={sessionsPage}
+                pageSize={SESSIONS_PAGE_SIZE}
+                total={sessionsTotal}
+                onPageChange={(nextPage) => {
+                  setSessNewState({ key: sessFilterKey, value: false });
+                  setSessPageState({ key: sessFilterKey, page: nextPage });
+                }}
+              />
             </section>
 
             <section className="panel">
               <div className="panel-header">
-                <h2 className="panel-title">Live event tail</h2>
-                <button
-                  type="button"
-                  className="btn-subtle"
-                  aria-pressed={tailPaused}
-                  onClick={() => setPausedSnapshot((prev) => (prev === null ? liveTail : null))}
-                >
-                  {tailPaused ? <IconPlay size={12} /> : <IconPause size={12} />}
-                  {tailPaused ? 'Resume' : 'Pause'}
-                </button>
+                <h2 className="panel-title">Live event tail ({tailTotal})</h2>
+                {tailPage === 1 ? (
+                  <button
+                    type="button"
+                    className="btn-subtle"
+                    aria-pressed={tailPaused}
+                    onClick={() =>
+                      setPausedState((prev) => ({
+                        key: tailFilterKey,
+                        rows: prev.key === tailFilterKey && prev.rows !== null ? null : liveTail,
+                      }))
+                    }
+                  >
+                    {tailPaused ? <IconPlay size={12} /> : <IconPause size={12} />}
+                    {tailPaused ? 'Resume' : 'Pause'}
+                  </button>
+                ) : (
+                  <span className="field-hint measure">Page {tailPage}</span>
+                )}
               </div>
+
+              <NewItemsBanner
+                visible={tailHasNew && tailPage > 1}
+                label={`New events arrived while on page ${tailPage}.`}
+                buttonText="New events — back to page 1"
+                onBack={() => {
+                  setTailNewState({ key: tailFilterKey, value: false });
+                  setPausedState({ key: tailFilterKey, rows: null });
+                  setTailPageState({ key: tailFilterKey, page: 1 });
+                }}
+              />
+
+              {tailError ? (
+                <div className="callout danger" style={{ margin: 'var(--space-sm)' }} role="alert">
+                  <span>{tailError}</span>
+                  <button type="button" className="btn btn-danger" onClick={() => void loadTail()}>
+                    Retry
+                  </button>
+                </div>
+              ) : null}
 
               <div
                 className="panel-header"
@@ -809,7 +1080,7 @@ export function StreamPage({
                 </fieldset>
               </div>
 
-              {pipelineLoading && displayedTail.length === 0 ? (
+              {tailLoading && displayedTail.length === 0 ? (
                 <div className="skeleton-row" aria-busy="true">
                   <div className="skeleton-bar skeleton-bar--short" />
                   <div className="skeleton-bar skeleton-bar--wide" />
@@ -854,6 +1125,18 @@ export function StreamPage({
                   })}
                 </ul>
               )}
+
+              <PaginationBar
+                label="Live event tail pages"
+                page={tailPage}
+                pageSize={TAIL_PAGE_SIZE}
+                total={tailTotal}
+                onPageChange={(nextPage) => {
+                  setTailNewState({ key: tailFilterKey, value: false });
+                  setPausedState({ key: tailFilterKey, rows: null });
+                  setTailPageState({ key: tailFilterKey, page: nextPage });
+                }}
+              />
             </section>
           </aside>
         ) : null}
@@ -871,7 +1154,10 @@ export function StreamPage({
           setSelectedMemoryId(null);
           onNavigate('memories', { file: f });
         }}
-        onMutated={onRefresh}
+        onMutated={async () => {
+          await onRefresh();
+          if (memPage === 1) await loadMemories();
+        }}
       />
 
       <ModalDialog

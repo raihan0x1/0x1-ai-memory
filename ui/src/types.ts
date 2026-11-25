@@ -149,6 +149,8 @@ export interface UsageSummary {
   total_memories: number;
   total_projects: number;
   pending_raw_events: number;
+  total_recalls?: number;
+  active_sessions?: number;
   daily_token_cap: number;
   daily_cost_cap_usd: number;
   budget_exhausted: boolean;
@@ -218,7 +220,63 @@ export interface SettingsView {
   t3_watcher_enabled: boolean;
   distill_idle_seconds: number;
   onboarding_completed: boolean;
+  auto_update_check: boolean;
   zero_silent_fallback: boolean;
+}
+
+export interface ReleaseInfo {
+  tag_name: string;
+  version: string;
+  name: string;
+  body: string;
+  html_url: string;
+  published_at: string | null;
+}
+
+export interface SelfUpdateCapability {
+  supported: boolean;
+  reason: string | null;
+  install_kind: 'npx' | 'binary' | 'dev_build' | 'unsupported_platform';
+  manual_command: string;
+  asset_name: string | null;
+}
+
+export interface UpdateRuntimeState {
+  in_progress: boolean;
+  stage:
+    | 'idle'
+    | 'downloading'
+    | 'verifying'
+    | 'extracting'
+    | 'smoke_testing'
+    | 'replacing'
+    | 'restarting'
+    | 'error';
+  target_version: string | null;
+  error: string | null;
+}
+
+export interface WhatsNewInfo {
+  should_show: boolean;
+  version: string;
+  previous_version: string | null;
+  title: string;
+  body: string | null;
+  html_url: string;
+  compare_url: string | null;
+}
+
+export interface UpdateStatusResponse {
+  current_version: string;
+  auto_check_enabled: boolean;
+  last_checked_at: string | null;
+  check_error: string | null;
+  update_available: boolean;
+  dismissed_version: string | null;
+  latest_release: ReleaseInfo | null;
+  capability: SelfUpdateCapability;
+  runtime: UpdateRuntimeState;
+  whats_new: WhatsNewInfo;
 }
 
 export interface AutoStartStatus {

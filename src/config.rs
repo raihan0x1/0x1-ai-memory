@@ -78,6 +78,7 @@ pub struct Settings {
     pub t3_watcher_enabled: bool,
     pub distill_idle_seconds: i64,
     pub onboarding_completed: bool,
+    pub auto_update_check: bool,
 }
 
 impl Default for Settings {
@@ -96,6 +97,7 @@ impl Default for Settings {
             t3_watcher_enabled: true,
             distill_idle_seconds: 120,
             onboarding_completed: false,
+            auto_update_check: true,
         }
     }
 }
@@ -156,6 +158,9 @@ impl Settings {
         if let Some(v) = map.get("onboarding_completed") {
             s.onboarding_completed = v == "true" || v == "1";
         }
+        if let Some(v) = map.get("auto_update_check") {
+            s.auto_update_check = v == "true" || v == "1";
+        }
         s
     }
 
@@ -196,6 +201,15 @@ impl Settings {
         m.insert(
             "onboarding_completed".into(),
             if self.onboarding_completed {
+                "true"
+            } else {
+                "false"
+            }
+            .into(),
+        );
+        m.insert(
+            "auto_update_check".into(),
+            if self.auto_update_check {
                 "true"
             } else {
                 "false"
@@ -303,6 +317,7 @@ impl Settings {
             t3_watcher_enabled: self.t3_watcher_enabled,
             distill_idle_seconds: self.distill_idle_seconds,
             onboarding_completed: self.onboarding_completed,
+            auto_update_check: self.auto_update_check,
             zero_silent_fallback: true,
         }
     }
@@ -324,6 +339,7 @@ pub struct SettingsView {
     pub t3_watcher_enabled: bool,
     pub distill_idle_seconds: i64,
     pub onboarding_completed: bool,
+    pub auto_update_check: bool,
     pub zero_silent_fallback: bool,
 }
 
@@ -343,6 +359,7 @@ pub struct SettingsPatch {
     pub t3_watcher_enabled: Option<bool>,
     pub distill_idle_seconds: Option<i64>,
     pub onboarding_completed: Option<bool>,
+    pub auto_update_check: Option<bool>,
 }
 
 impl Settings {
@@ -385,6 +402,9 @@ impl Settings {
         }
         if let Some(v) = patch.onboarding_completed {
             self.onboarding_completed = v;
+        }
+        if let Some(v) = patch.auto_update_check {
+            self.auto_update_check = v;
         }
     }
 }
@@ -455,10 +475,14 @@ mod tests {
             t3_watcher_enabled: None,
             distill_idle_seconds: None,
             onboarding_completed: Some(true),
+            auto_update_check: Some(false),
         });
         assert!(s.onboarding_completed);
+        assert!(!s.auto_update_check);
         let roundtrip = Settings::from_map(&s.to_map());
         assert!(roundtrip.onboarding_completed);
         assert!(roundtrip.redacted().onboarding_completed);
+        assert!(!roundtrip.auto_update_check);
+        assert!(!roundtrip.redacted().auto_update_check);
     }
 }

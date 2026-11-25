@@ -4,7 +4,8 @@ use ox1_memory::config::{AppPaths, DEFAULT_PORT};
 use ox1_memory::connectors::ConnectorManager;
 use ox1_memory::daemon::{
     AutoStartManager, daemon_is_healthy, daemon_needs_upgrade, fetch_daemon_health,
-    fetch_onboarding_completed, format_pid_entry, read_log_tail, spawn_background, stop_daemon,
+    fetch_onboarding_completed, format_pid_entry, parse_pid_entry, read_log_tail, spawn_background,
+    stop_daemon,
 };
 use ox1_memory::db::MemoryDb;
 use ox1_memory::distill::spawn_distill_worker;
@@ -15,9 +16,11 @@ use ox1_memory::mcp::handle_rpc;
 use ox1_memory::models::{SearchFilter, StreamEvent};
 use ox1_memory::server::{AppState, build_router};
 use ox1_memory::t3_watcher::spawn_t3_watcher;
+use ox1_memory::updater::UpdateManager;
 use serde_json::{Value, json};
 use std::io::{self, BufRead, Read, Write};
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, watch};
 
@@ -84,6 +87,9 @@ enum Commands {
         /// Explicit foreground flag (default behavior of `serve`)
         #[arg(long, default_value_t = true)]
         foreground: bool,
+        /// Hidden handoff wait window (ms) while an older Daemon releases the port
+        #[arg(long, hide = true, default_value_t = 0)]
+        wait_port_ms: u64,
     },
     /// CLI Setup: auto-detect and connect Claude Code, Codex, Antigravity, & T3 Code from terminal
     Setup {
@@ -215,7 +221,8 @@ async fn async_main(cmd: Commands) -> Result<()> {
             port,
             open,
             foreground: _,
-        } => run_serve(paths, port, open).await,
+            wait_port_ms,
+        } => run_serve(paths, port, open, wait_port_ms).await,
         Commands::Setup {
             client,
             port,
@@ -324,7 +331,12 @@ fn run_autostart(paths: AppPaths, action: AutoStartAction, port: u16) -> Result<
     Ok(())
 }
 
-async fn run_serve(paths: AppPaths, port: u16, open_browser: bool) -> Result<()> {
+async fn run_serve(
+    paths: AppPaths,
+    port: u16,
+    open_browser: bool,
+    wait_port_ms: u64,
+) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -354,12 +366,22 @@ async fn run_serve(paths: AppPaths, port: u16, open_browser: bool) -> Result<()>
         bin_path.clone(),
         port,
     );
-    let autostart = AutoStartManager::for_current_os(home, bin_path, paths.log_path.clone(), port);
+    let autostart =
+        AutoStartManager::for_current_os(home, bin_path.clone(), paths.log_path.clone(), port);
+    let updater = Arc::new(UpdateManager::new(
+        db.clone(),
+        bin_path,
+        paths.data_dir.clone(),
+        paths.log_path.clone(),
+        port,
+        shutdown_tx.clone(),
+        events_tx.clone(),
+    ));
 
-    // Seed onboarding BEFORE inspect_all saves client_connections so fresh T3 installs aren't misread as upgrades.
-    let onboarding_done = db
-        .seed_onboarding_if_existing(connectors.has_explicit_client_config())
-        .unwrap_or(false);
+    // Seed onboarding and version state BEFORE inspect_all saves client_connections so fresh T3 installs aren't misread as upgrades.
+    let has_clients = connectors.has_explicit_client_config();
+    let onboarding_done = db.seed_onboarding_if_existing(has_clients).unwrap_or(false);
+    let _ = updater.seed_version_state_on_startup(has_clients);
     let _ = connectors.inspect_all(&db);
 
     let state = AppState {
@@ -369,6 +391,7 @@ async fn run_serve(paths: AppPaths, port: u16, open_browser: bool) -> Result<()>
         distill,
         connectors,
         autostart,
+        updater: updater.clone(),
         events_tx,
         shutdown_tx: shutdown_tx.clone(),
         hook_state: HookState::default(),
@@ -382,29 +405,14 @@ async fn run_serve(paths: AppPaths, port: u16, open_browser: bool) -> Result<()>
     let base_url = format!("http://127.0.0.1:{port}");
     let open_url = web_ui_url(&base_url, onboarding_done);
 
-    let listener = match tokio::net::TcpListener::bind(addr).await {
-        Ok(l) => l,
-        Err(bind_err) => {
-            if let Some(health) = fetch_daemon_health(port).await {
-                if daemon_needs_upgrade(health.version.as_deref(), env!("CARGO_PKG_VERSION")) {
-                    let old_ver = health.version.as_deref().unwrap_or("unknown");
-                    anyhow::bail!(
-                        "Another 0x1-ai-memory Daemon (v{old_ver}) is already listening on {base_url} while this binary is v{}. Run `0x1-memory restart` to reload.",
-                        env!("CARGO_PKG_VERSION")
-                    );
-                }
-                println!("0x1-ai-memory Daemon is already running on {base_url}");
-                if open_browser {
-                    open_in_browser(&open_url);
-                }
-                return Ok(());
-            }
-            return Err(bind_err).with_context(|| {
-                format!("Failed to bind {addr} (port {port} is in use by another process)")
-            });
-        }
+    let listener =
+        bind_with_handoff(addr, port, &base_url, open_browser, &open_url, wait_port_ms).await?;
+    let Some(listener) = listener else {
+        return Ok(());
     };
-    let _ = tokio::fs::write(&paths.pid_path, format_pid_entry(std::process::id(), port)).await;
+    let my_pid = std::process::id();
+    let _ = tokio::fs::write(&paths.pid_path, format_pid_entry(my_pid, port)).await;
+    updater.spawn_background_checker(shutdown_tx.subscribe());
 
     println!("0x1-ai-memory Daemon listening on {base_url}");
     println!("  Web UI : {open_url}");
@@ -432,8 +440,55 @@ async fn run_serve(paths: AppPaths, port: u16, open_browser: bool) -> Result<()>
         })
         .await?;
 
-    let _ = tokio::fs::remove_file(&paths.pid_path).await;
+    // Only remove daemon.pid if it still belongs to this process (avoid racing a newly spawned Daemon during self-update).
+    if let Ok(raw) = tokio::fs::read_to_string(&paths.pid_path).await
+        && parse_pid_entry(&raw).is_some_and(|(pid, _)| pid == my_pid)
+    {
+        let _ = tokio::fs::remove_file(&paths.pid_path).await;
+    }
     Ok(())
+}
+
+async fn bind_with_handoff(
+    addr: SocketAddr,
+    port: u16,
+    base_url: &str,
+    open_browser: bool,
+    open_url: &str,
+    wait_port_ms: u64,
+) -> Result<Option<tokio::net::TcpListener>> {
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(wait_port_ms);
+    loop {
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(l) => return Ok(Some(l)),
+            Err(bind_err)
+                if bind_err.kind() == std::io::ErrorKind::AddrInUse
+                    && wait_port_ms > 0
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(bind_err) => {
+                if let Some(health) = fetch_daemon_health(port).await {
+                    if daemon_needs_upgrade(health.version.as_deref(), env!("CARGO_PKG_VERSION")) {
+                        let old_ver = health.version.as_deref().unwrap_or("unknown");
+                        anyhow::bail!(
+                            "Another 0x1-ai-memory Daemon (v{old_ver}) is already listening on {base_url} while this binary is v{}. Run `0x1-memory restart` to reload.",
+                            env!("CARGO_PKG_VERSION")
+                        );
+                    }
+                    println!("0x1-ai-memory Daemon is already running on {base_url}");
+                    if open_browser {
+                        open_in_browser(open_url);
+                    }
+                    return Ok(None);
+                }
+                return Err(bind_err).with_context(|| {
+                    format!("Failed to bind {addr} (port {port} is in use by another process)")
+                });
+            }
+        }
+    }
 }
 
 async fn wait_for_shutdown_signal() {
@@ -772,7 +827,8 @@ mod tests {
             Some(Commands::Serve {
                 port: 10101,
                 open: false,
-                foreground: true
+                foreground: true,
+                wait_port_ms: 0
             })
         ));
         assert!(matches!(

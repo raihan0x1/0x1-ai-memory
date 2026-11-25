@@ -8,6 +8,7 @@ use crate::hooks::{HookState, handle_hook};
 use crate::llm::MemoryLlmClient;
 use crate::mcp::handle_rpc;
 use crate::models::{NewMemoryInput, SearchFilter, StreamEvent, UpdateMemoryInput};
+use crate::updater::UpdateManager;
 use axum::{
     Json, Router,
     body::Bytes,
@@ -27,6 +28,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::convert::Infallible;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, watch};
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -43,6 +45,7 @@ pub struct AppState {
     pub distill: DistillHandle,
     pub connectors: ConnectorManager,
     pub autostart: AutoStartManager,
+    pub updater: Arc<UpdateManager>,
     pub events_tx: broadcast::Sender<StreamEvent>,
     pub shutdown_tx: watch::Sender<bool>,
     pub hook_state: HookState,
@@ -124,6 +127,19 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/daemon", get(api_daemon_info))
         .route("/api/daemon/stop", post(api_daemon_stop))
         .route("/api/daemon/autostart", post(api_daemon_autostart))
+        // Daemon self-update and post-update "What's new" (all localhost-guarded)
+        .route("/api/updates/status", get(api_updates_status))
+        .route("/api/updates/check", post(api_updates_check))
+        .route("/api/updates/apply", post(api_updates_apply))
+        .route("/api/updates/dismiss", post(api_updates_dismiss))
+        .route(
+            "/api/updates/ack-whats-new",
+            post(api_updates_ack_whats_new),
+        )
+        .route(
+            "/api/updates/fetch-whats-new",
+            post(api_updates_fetch_whats_new),
+        )
         // Embedded React SPA fallback
         .fallback(static_ui_handler)
         .layer(middleware::from_fn(localhost_guard))
@@ -303,11 +319,19 @@ async fn api_search_memories(
         }
         _ => None,
     };
-    let hits = st
+    let limit = filter.limit.unwrap_or(20).clamp(1, 250);
+    let offset = filter.offset.unwrap_or(0);
+    let (hits, total) = st
         .db
-        .search_memories(&filter, q_vec.as_deref())
+        .search_memories_paged(&filter, q_vec.as_deref())
         .map_err(internal_err)?;
-    Ok(Json(json!({ "count": hits.len(), "memories": hits })))
+    Ok(Json(json!({
+        "count": hits.len(),
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "memories": hits,
+    })))
 }
 
 async fn api_create_memory(
@@ -435,42 +459,62 @@ async fn api_memory_graph(
 struct SessionsQuery {
     project_id: Option<String>,
     limit: Option<usize>,
+    offset: Option<usize>,
 }
 
 async fn api_list_sessions(
     State(st): State<AppState>,
     Query(q): Query<SessionsQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let sessions = st
+    let limit = q.limit.unwrap_or(12).clamp(1, 100);
+    let offset = q.offset.unwrap_or(0);
+    let (sessions, total) = st
         .db
-        .list_sessions(
+        .list_sessions_paged(
             q.project_id.as_deref().filter(|s| !s.is_empty()),
-            q.limit.unwrap_or(12),
+            limit,
+            offset,
         )
         .map_err(internal_err)?;
-    Ok(Json(json!({ "sessions": sessions })))
+    Ok(Json(json!({
+        "sessions": sessions,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    })))
 }
 
 #[derive(Deserialize)]
 struct RawEventsQuery {
     project_id: Option<String>,
     client: Option<String>,
+    kind: Option<String>,
     limit: Option<usize>,
+    offset: Option<usize>,
 }
 
 async fn api_list_raw_events(
     State(st): State<AppState>,
     Query(q): Query<RawEventsQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let events = st
+    let limit = q.limit.unwrap_or(50).clamp(1, 200);
+    let offset = q.offset.unwrap_or(0);
+    let (events, total) = st
         .db
-        .recent_raw_events(
+        .recent_raw_events_paged(
             q.project_id.as_deref().filter(|s| !s.is_empty()),
             q.client.as_deref().filter(|s| !s.is_empty()),
-            q.limit.unwrap_or(50),
+            q.kind.as_deref().filter(|s| !s.is_empty()),
+            limit,
+            offset,
         )
         .map_err(internal_err)?;
-    Ok(Json(json!({ "events": events })))
+    Ok(Json(json!({
+        "events": events,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    })))
 }
 
 async fn api_distill_session(
@@ -517,11 +561,28 @@ async fn api_context_preview(
     Ok(Json(serde_json::to_value(detail).unwrap_or_default()))
 }
 
+#[derive(Deserialize)]
+struct UsageQuery {
+    limit: Option<usize>,
+    offset: Option<usize>,
+}
+
 async fn api_usage_history(
     State(st): State<AppState>,
+    Query(q): Query<UsageQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let entries = st.db.recent_usage(50).map_err(internal_err)?;
-    Ok(Json(json!({ "usage": entries })))
+    let limit = q.limit.unwrap_or(50).clamp(1, 200);
+    let offset = q.offset.unwrap_or(0);
+    let (entries, total) = st
+        .db
+        .recent_usage_paged(limit, offset)
+        .map_err(internal_err)?;
+    Ok(Json(json!({
+        "usage": entries,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    })))
 }
 
 async fn api_get_settings(State(st): State<AppState>) -> Result<Json<Value>, (StatusCode, String)> {
@@ -696,6 +757,58 @@ async fn api_daemon_autostart(
         .autostart
         .set_enabled(body.enabled)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    Ok(Json(serde_json::to_value(status).unwrap_or_default()))
+}
+
+async fn api_updates_status(State(st): State<AppState>) -> Json<Value> {
+    let status = st.updater.status().await;
+    Json(serde_json::to_value(status).unwrap_or_default())
+}
+
+async fn api_updates_check(State(st): State<AppState>) -> Json<Value> {
+    let status = st.updater.check_for_updates(true).await;
+    Json(serde_json::to_value(status).unwrap_or_default())
+}
+
+async fn api_updates_apply(
+    State(st): State<AppState>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let status = st.updater.start_self_update().await?;
+    Ok(Json(serde_json::to_value(status).unwrap_or_default()))
+}
+
+#[derive(Deserialize)]
+struct DismissUpdateBody {
+    version: String,
+}
+
+async fn api_updates_dismiss(
+    State(st): State<AppState>,
+    Json(body): Json<DismissUpdateBody>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let status = st
+        .updater
+        .dismiss_version(&body.version)
+        .await
+        .map_err(internal_err)?;
+    Ok(Json(serde_json::to_value(status).unwrap_or_default()))
+}
+
+async fn api_updates_ack_whats_new(
+    State(st): State<AppState>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let status = st.updater.ack_whats_new().await.map_err(internal_err)?;
+    Ok(Json(serde_json::to_value(status).unwrap_or_default()))
+}
+
+async fn api_updates_fetch_whats_new(
+    State(st): State<AppState>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let status = st
+        .updater
+        .fetch_whats_new_for_current()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
     Ok(Json(serde_json::to_value(status).unwrap_or_default()))
 }
 

@@ -4,18 +4,26 @@ interface ModalDialogProps {
   open: boolean;
   title: string;
   onClose: () => void;
+  preventClose?: boolean;
   children: ReactNode;
   footer?: ReactNode;
 }
 
 /**
- * Native <dialog closedby="any"> modal following modern-web-guidance:
+ * Native <dialog closedby="any"|"none"> modal following modern-web-guidance:
  * - Opened via showModal() for top-layer, inert backdrop, Esc & focus return
  * - No redundant role="dialog" / aria-modal
  * - Pointer-coordinate light-dismiss fallback for browsers without closedBy (Safari)
  * - Resets dialog.returnValue on close
  */
-export function ModalDialog({ open, title, onClose, children, footer }: ModalDialogProps) {
+export function ModalDialog({
+  open,
+  title,
+  onClose,
+  preventClose = false,
+  children,
+  footer,
+}: ModalDialogProps) {
   const ref = useRef<HTMLDialogElement>(null);
   const titleId = useId();
 
@@ -37,7 +45,13 @@ export function ModalDialog({ open, title, onClose, children, footer }: ModalDia
       dialog.returnValue = '';
       onClose();
     };
+    const handleCancel = (e: Event) => {
+      if (preventClose) {
+        e.preventDefault();
+      }
+    };
     dialog.addEventListener('close', handleClose);
+    dialog.addEventListener('cancel', handleCancel);
 
     // Fallback light-dismiss when native `closedby="any"` is unsupported (Safari)
     let cleanupFallback = () => {};
@@ -51,7 +65,7 @@ export function ModalDialog({ open, title, onClose, children, footer }: ModalDia
         pressedOutside = outside(e);
       };
       const onUp = (e: PointerEvent) => {
-        if (pressedOutside && outside(e)) {
+        if (!preventClose && pressedOutside && outside(e)) {
           dialog.close();
         }
       };
@@ -65,23 +79,26 @@ export function ModalDialog({ open, title, onClose, children, footer }: ModalDia
 
     return () => {
       dialog.removeEventListener('close', handleClose);
+      dialog.removeEventListener('cancel', handleCancel);
       cleanupFallback();
     };
-  }, [onClose]);
+  }, [onClose, preventClose]);
 
   return (
     <dialog
       ref={ref}
       aria-labelledby={titleId}
-      {...({ closedby: 'any' } as Record<string, string>)}
+      {...({ closedby: preventClose ? 'none' : 'any' } as Record<string, string>)}
     >
       <div className="dialog-head">
         <h2 id={titleId} className="dialog-title">
           {title}
         </h2>
-        <button type="button" className="btn btn-ghost" onClick={onClose} aria-label="Close dialog">
-          Close
-        </button>
+        {!preventClose ? (
+          <button type="button" className="btn btn-ghost" onClick={onClose} aria-label="Close dialog">
+            Close
+          </button>
+        ) : null}
       </div>
       <div className="dialog-body">{children}</div>
       {footer ? <div className="dialog-foot">{footer}</div> : null}

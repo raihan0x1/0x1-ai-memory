@@ -1,8 +1,15 @@
 import { useCallback, useEffect, useState, type FormEvent } from 'react';
 import { api, formatUtcTime } from '../api';
 import { ModalDialog } from '../components/ModalDialog';
+import { PaginationBar } from '../components/PaginationBar';
 import { RimSelect } from '../components/RimSelect';
-import type { ConnectionTestResult, DaemonInfo, SettingsView, UsageEntry } from '../types';
+import type {
+  ConnectionTestResult,
+  DaemonInfo,
+  SettingsView,
+  UpdateStatusResponse,
+  UsageEntry,
+} from '../types';
 
 const PROVIDER_PRESETS: Record<
   string,
@@ -81,6 +88,10 @@ const EMBEDDING_OPTIONS = [
 interface EnginePageProps {
   daemon: DaemonInfo | null;
   daemonLoading?: boolean;
+  updateStatus: UpdateStatusResponse | null;
+  onCheckUpdates: () => Promise<void>;
+  onOpenUpdateModal: () => void;
+  onOpenWhatsNew: () => void;
   onSaved: () => Promise<void>;
   onDaemonStopped: () => void;
   onRunOnboarding: () => void;
@@ -89,12 +100,21 @@ interface EnginePageProps {
 export function EnginePage({
   daemon,
   daemonLoading = false,
+  updateStatus,
+  onCheckUpdates,
+  onOpenUpdateModal,
+  onOpenWhatsNew,
   onSaved,
   onDaemonStopped,
   onRunOnboarding,
 }: EnginePageProps) {
   const [settings, setSettings] = useState<SettingsView | null>(null);
   const [usage, setUsage] = useState<UsageEntry[]>([]);
+  const [usageTotal, setUsageTotal] = useState(0);
+  const [usagePage, setUsagePage] = useState(1);
+  const [usagePageSize, setUsagePageSize] = useState(20);
+  const [usageLoading, setUsageLoading] = useState(true);
+  const [usageError, setUsageError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -115,6 +135,8 @@ export function EnginePage({
   const [saveNotice, setSaveNotice] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<ConnectionTestResult | null>(null);
   const [autostartBusy, setAutostartBusy] = useState(false);
+  const [checkingUpdates, setCheckingUpdates] = useState(false);
+  const [autoCheckBusy, setAutoCheckBusy] = useState(false);
   const [daemonNotice, setDaemonNotice] = useState<{ kind: 'ok' | 'danger'; text: string } | null>(
     null,
   );
@@ -134,13 +156,12 @@ export function EnginePage({
     setIdleSeconds(String(s.distill_idle_seconds));
   }, []);
 
-  const load = useCallback(async () => {
+  const loadSettings = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
-      const [s, u] = await Promise.all([api.settings(), api.usageHistory()]);
+      const s = await api.settings();
       setSettings(s);
-      setUsage(u.usage);
       syncFormFromSettings(s);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to load settings');
@@ -149,9 +170,38 @@ export function EnginePage({
     }
   }, [syncFormFromSettings]);
 
+  const loadUsage = useCallback(async () => {
+    setUsageLoading(true);
+    setUsageError(null);
+    try {
+      const u = await api.usageHistory({
+        limit: usagePageSize,
+        offset: (usagePage - 1) * usagePageSize,
+      });
+      if (u.total > 0 && (usagePage - 1) * usagePageSize >= u.total) {
+        setUsagePage(Math.max(1, Math.ceil(u.total / usagePageSize)));
+        return;
+      }
+      setUsage(u.usage);
+      setUsageTotal(u.total);
+    } catch (e) {
+      setUsageError(e instanceof Error ? e.message : 'Failed to load usage ledger');
+    } finally {
+      setUsageLoading(false);
+    }
+  }, [usagePage, usagePageSize]);
+
+  const load = useCallback(async () => {
+    await Promise.all([loadSettings(), loadUsage()]);
+  }, [loadSettings, loadUsage]);
+
   useEffect(() => {
-    void load();
-  }, [load]);
+    void loadSettings();
+  }, [loadSettings]);
+
+  useEffect(() => {
+    void loadUsage();
+  }, [loadUsage]);
 
   function onProviderChange(next: string) {
     setProvider(next);
@@ -214,8 +264,7 @@ export function EnginePage({
       }
       const res = await api.testEngine(draft);
       setTestResult(res);
-      const [u] = await Promise.all([api.usageHistory(), onSaved()]);
-      setUsage(u.usage);
+      await Promise.all([loadUsage(), onSaved()]);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to test connection');
     } finally {
@@ -242,6 +291,44 @@ export function EnginePage({
       });
     } finally {
       setAutostartBusy(false);
+    }
+  }
+
+  async function handleCheckUpdates() {
+    setCheckingUpdates(true);
+    setDaemonNotice(null);
+    try {
+      await onCheckUpdates();
+    } catch (e) {
+      setDaemonNotice({
+        kind: 'danger',
+        text: e instanceof Error ? e.message : 'Failed to check for updates',
+      });
+    } finally {
+      setCheckingUpdates(false);
+    }
+  }
+
+  async function handleAutoUpdateToggle(enabled: boolean) {
+    setAutoCheckBusy(true);
+    setDaemonNotice(null);
+    try {
+      const updated = await api.patchSettings({ auto_update_check: enabled });
+      setSettings(updated);
+      setDaemonNotice({
+        kind: 'ok',
+        text: updated.auto_update_check
+          ? 'Automatic 6-hour update checks enabled.'
+          : 'Automatic update checks disabled (manual checks still work).',
+      });
+      await onSaved();
+    } catch (e) {
+      setDaemonNotice({
+        kind: 'danger',
+        text: e instanceof Error ? e.message : 'Failed to update check preference',
+      });
+    } finally {
+      setAutoCheckBusy(false);
     }
   }
 
@@ -541,9 +628,65 @@ export function EnginePage({
                   <span className="field-hint">Log file</span>
                   <span className="measure">{daemon.log_path}</span>
                 </div>
+                <div className="daemon-meta-item">
+                  <span className="field-hint">Version &amp; updates</span>
+                  <div className="tag-row">
+                    <span className="tag measure">v{daemon.version}</span>
+                    {updateStatus?.update_available && updateStatus.latest_release ? (
+                      <span className="tag accent measure">
+                        v{updateStatus.latest_release.version} available
+                      </span>
+                    ) : updateStatus?.last_checked_at ? (
+                      <span className="tag ok">Up to date</span>
+                    ) : null}
+                  </div>
+                </div>
+                <div className="daemon-meta-item">
+                  <span className="field-hint">Last release check</span>
+                  <span className="measure">
+                    {formatUtcTime(updateStatus?.last_checked_at)}
+                  </span>
+                </div>
+              </div>
+
+              {updateStatus?.check_error ? (
+                <div className="callout warn" role="status">
+                  <span>Last update check failed: {updateStatus.check_error}</span>
+                </div>
+              ) : null}
+
+              <div className="head-actions">
+                <button
+                  type="button"
+                  className="btn"
+                  disabled={checkingUpdates}
+                  aria-busy={checkingUpdates}
+                  onClick={() => void handleCheckUpdates()}
+                >
+                  {checkingUpdates ? 'Checking...' : 'Check for updates'}
+                </button>
+                {updateStatus?.update_available && updateStatus.latest_release ? (
+                  <button type="button" className="btn btn-primary" onClick={onOpenUpdateModal}>
+                    Update to v{updateStatus.latest_release.version}
+                  </button>
+                ) : null}
+                <button type="button" className="btn" onClick={onOpenWhatsNew}>
+                  What&apos;s new
+                </button>
               </div>
 
               <div className="stack-sm">
+                <label className="rim-check-label" htmlFor="eng-autoupdate">
+                  <input
+                    id="eng-autoupdate"
+                    type="checkbox"
+                    className="rim-check"
+                    checked={settings?.auto_update_check ?? true}
+                    disabled={autoCheckBusy}
+                    onChange={(e) => void handleAutoUpdateToggle(e.target.checked)}
+                  />
+                  <span>Automatically check for updates every 6 hours</span>
+                </label>
                 {daemon.autostart.supported ? (
                   <label className="rim-check-label" htmlFor="eng-autostart">
                     <input
@@ -573,11 +716,19 @@ export function EnginePage({
 
       <section className="panel">
         <div className="panel-header">
-          <h2 className="panel-title">Usage ledger (last 50 calls)</h2>
+          <h2 className="panel-title">Usage ledger ({usageTotal} calls)</h2>
           <span className="field-hint">Every background LLM call is logged with UTC time</span>
         </div>
+        {usageError ? (
+          <div className="callout danger" style={{ margin: 'var(--space-sm)' }}>
+            <span>{usageError}</span>
+            <button type="button" className="btn btn-danger" onClick={() => void loadUsage()}>
+              Retry
+            </button>
+          </div>
+        ) : null}
         <div className="table-wrap">
-          {loading ? (
+          {usageLoading && usage.length === 0 ? (
             <div className="skeleton-row">
               <div className="skeleton-bar skeleton-bar--wide" />
             </div>
@@ -629,6 +780,18 @@ export function EnginePage({
             </table>
           )}
         </div>
+        <PaginationBar
+          label="Usage ledger pages"
+          page={usagePage}
+          pageSize={usagePageSize}
+          total={usageTotal}
+          pageSizeOptions={[10, 20, 50]}
+          onPageChange={setUsagePage}
+          onPageSizeChange={(nextSize) => {
+            setUsagePageSize(nextSize);
+            setUsagePage(1);
+          }}
+        />
       </section>
 
       <ModalDialog

@@ -237,17 +237,8 @@ impl MemoryDb {
         if let Some(val) = existing {
             return Ok(val == "true" || val == "1");
         }
-        let has_memories: bool =
-            conn.query_row("SELECT EXISTS(SELECT 1 FROM memories LIMIT 1)", [], |r| {
-                r.get::<_, i64>(0)
-            })? != 0;
-        // Ignore passive t3-code (marked connected by default whenever T3 Code is installed).
-        let has_prior_conn: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM client_connections WHERE connected = 1 AND client_id != 't3-code' LIMIT 1)",
-            [],
-            |r| r.get::<_, i64>(0),
-        )? != 0;
-        if has_memories || has_prior_conn || has_configured_clients {
+        let has_data = has_existing_user_data_locked(&conn)?;
+        if has_data || has_configured_clients {
             conn.execute(
                 "INSERT INTO settings(key, value) VALUES ('onboarding_completed', 'true')
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -256,6 +247,11 @@ impl MemoryDb {
             return Ok(true);
         }
         Ok(false)
+    }
+
+    pub fn has_existing_user_data(&self) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        has_existing_user_data_locked(&conn)
     }
 
     pub fn get_meta(&self, key: &str) -> Result<Option<String>> {
@@ -474,8 +470,24 @@ impl MemoryDb {
         project_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<SessionSummary>> {
-        let limit = limit.clamp(1, 50) as i64;
+        self.list_sessions_paged(project_id, limit.clamp(1, 50), 0)
+            .map(|(sessions, _)| sessions)
+    }
+
+    pub fn list_sessions_paged(
+        &self,
+        project_id: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<SessionSummary>, usize)> {
+        let limit = limit.clamp(1, 100) as i64;
+        let offset = offset as i64;
         let conn = self.conn.lock().unwrap();
+        let total: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sessions s WHERE (?1 IS NULL OR s.project_id = ?1)",
+            params![project_id],
+            |r| r.get(0),
+        )?;
         let mut stmt = conn.prepare(
             "SELECT s.id, s.project_id, p.name, s.source_client, s.branch,
                     s.started_at, s.ended_at, s.last_turn_at, s.status,
@@ -486,9 +498,9 @@ impl MemoryDb {
              LEFT JOIN projects p ON p.id = s.project_id
              WHERE (?1 IS NULL OR s.project_id = ?1)
              ORDER BY s.last_turn_at DESC
-             LIMIT ?2",
+             LIMIT ?2 OFFSET ?3",
         )?;
-        let rows = stmt.query_map(params![project_id, limit], |r| {
+        let rows = stmt.query_map(params![project_id, limit, offset], |r| {
             Ok(SessionSummary {
                 id: r.get(0)?,
                 project_id: r.get(1)?,
@@ -504,7 +516,7 @@ impl MemoryDb {
                 memory_count: r.get(11)?,
             })
         })?;
-        Ok(rows.filter_map(Result::ok).collect())
+        Ok((rows.filter_map(Result::ok).collect(), total.max(0) as usize))
     }
 
     // --- Raw Events (0-token capture) ---
@@ -596,20 +608,49 @@ impl MemoryDb {
         client: Option<&str>,
         limit: usize,
     ) -> Result<Vec<RawEventView>> {
-        let limit = limit.clamp(1, 100) as i64;
+        self.recent_raw_events_paged(project_id, client, None, limit.clamp(1, 100), 0)
+            .map(|(events, _)| events)
+    }
+
+    pub fn recent_raw_events_paged(
+        &self,
+        project_id: Option<&str>,
+        client: Option<&str>,
+        kind: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<RawEventView>, usize)> {
+        let limit = limit.clamp(1, 200) as i64;
+        let offset = offset as i64;
         let norm_client = client.map(|c| normalize_client(Some(c)));
+        let kind_clause = match kind.map(str::trim) {
+            Some("prompts") => "AND r.event_type = 'prompt'",
+            Some("tools") => "AND r.event_type IN ('tool_use', 'tool_error')",
+            Some("distill") => "AND r.event_type = 'turn_stop'",
+            _ => "",
+        };
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let count_sql = format!(
+            "SELECT COUNT(*) FROM raw_events r
+             WHERE (?1 IS NULL OR r.project_id = ?1)
+               AND (?2 IS NULL OR r.source_client = ?2)
+               {kind_clause}"
+        );
+        let total: i64 =
+            conn.query_row(&count_sql, params![project_id, norm_client], |r| r.get(0))?;
+        let query_sql = format!(
             "SELECT r.id, r.session_id, r.project_id, p.name, r.source_client,
                     r.event_type, r.tool_name, r.payload_json, r.distilled, r.created_at
              FROM raw_events r
              LEFT JOIN projects p ON p.id = r.project_id
              WHERE (?1 IS NULL OR r.project_id = ?1)
                AND (?2 IS NULL OR r.source_client = ?2)
+               {kind_clause}
              ORDER BY r.created_at DESC
-             LIMIT ?3",
-        )?;
-        let rows = stmt.query_map(params![project_id, norm_client, limit], |r| {
+             LIMIT ?3 OFFSET ?4"
+        );
+        let mut stmt = conn.prepare(&query_sql)?;
+        let rows = stmt.query_map(params![project_id, norm_client, limit, offset], |r| {
             let event_type: String = r.get(5)?;
             let tool_name: Option<String> = r.get(6)?;
             let payload_json: String = r.get(7)?;
@@ -626,7 +667,7 @@ impl MemoryDb {
                 created_at: r.get(9)?,
             })
         })?;
-        Ok(rows.filter_map(Result::ok).collect())
+        Ok((rows.filter_map(Result::ok).collect(), total.max(0) as usize))
     }
 
     pub fn mark_events_distilled(&self, event_ids: &[String]) -> Result<()> {
@@ -969,13 +1010,23 @@ impl MemoryDb {
         filter: &SearchFilter,
         query_embedding: Option<&[f32]>,
     ) -> Result<Vec<MemoryHit>> {
+        self.search_memories_paged(filter, query_embedding)
+            .map(|(hits, _)| hits)
+    }
+
+    pub fn search_memories_paged(
+        &self,
+        filter: &SearchFilter,
+        query_embedding: Option<&[f32]>,
+    ) -> Result<(Vec<MemoryHit>, usize)> {
         let limit = filter.limit.unwrap_or(20).clamp(1, 250);
+        let offset = filter.offset.unwrap_or(0);
         let include_inactive = filter.include_inactive.unwrap_or(false);
         let query = filter.query.as_deref().unwrap_or("").trim();
 
         let conn = self.conn.lock().unwrap();
         if query.is_empty() {
-            return list_recent_memories_locked(&conn, filter, include_inactive, limit);
+            return list_recent_memories_locked(&conn, filter, include_inactive, limit, offset);
         }
 
         let mut rrf_scores: HashMap<i64, f64> = HashMap::new();
@@ -1077,8 +1128,9 @@ impl MemoryDb {
                     .then_with(|| b.updated_at.cmp(&a.updated_at))
             });
         }
-        hits.truncate(limit);
-        Ok(hits)
+        let total = hits.len();
+        let page = hits.into_iter().skip(offset).take(limit).collect();
+        Ok((page, total))
     }
 
     pub fn memory_timeline(
@@ -1533,12 +1585,24 @@ impl MemoryDb {
     }
 
     pub fn recent_usage(&self, limit: usize) -> Result<Vec<UsageEntry>> {
+        self.recent_usage_paged(limit, 0)
+            .map(|(entries, _)| entries)
+    }
+
+    pub fn recent_usage_paged(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<UsageEntry>, usize)> {
+        let limit = limit.clamp(1, 200) as i64;
+        let offset = offset as i64;
         let conn = self.conn.lock().unwrap();
+        let total: i64 = conn.query_row("SELECT COUNT(*) FROM usage_ledger", [], |r| r.get(0))?;
         let mut stmt = conn.prepare(
             "SELECT id, provider, model, operation, input_tokens, output_tokens, estimated_cost_usd, session_id, status, error_message, created_at
-             FROM usage_ledger ORDER BY created_at DESC LIMIT ?1",
+             FROM usage_ledger ORDER BY created_at DESC LIMIT ?1 OFFSET ?2",
         )?;
-        let rows = stmt.query_map(params![limit as i64], |r| {
+        let rows = stmt.query_map(params![limit, offset], |r| {
             Ok(UsageEntry {
                 id: r.get(0)?,
                 provider: r.get(1)?,
@@ -1553,7 +1617,7 @@ impl MemoryDb {
                 created_at: r.get(10)?,
             })
         })?;
-        Ok(rows.filter_map(Result::ok).collect())
+        Ok((rows.filter_map(Result::ok).collect(), total.max(0) as usize))
     }
 
     pub fn usage_summary(
@@ -1586,6 +1650,16 @@ impl MemoryDb {
             [],
             |r| r.get(0),
         )?;
+        let total_recalls: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(recall_count), 0) FROM memory_recall_stats",
+            [],
+            |r| r.get(0),
+        )?;
+        let active_sessions: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sessions WHERE status = 'active'",
+            [],
+            |r| r.get(0),
+        )?;
 
         let total_tokens = in_tok + out_tok;
         let budget_exhausted = (settings.daily_token_cap > 0
@@ -1602,6 +1676,8 @@ impl MemoryDb {
             total_memories,
             total_projects,
             pending_raw_events,
+            total_recalls,
+            active_sessions,
             daily_token_cap: settings.daily_token_cap,
             daily_cost_cap_usd: settings.daily_cost_cap_usd,
             budget_exhausted,
@@ -1798,32 +1874,48 @@ fn row_to_graph_record(r: &rusqlite::Row<'_>) -> rusqlite::Result<GraphNodeRecor
     })
 }
 
+fn has_existing_user_data_locked(conn: &Connection) -> Result<bool> {
+    let has_memories: bool =
+        conn.query_row("SELECT EXISTS(SELECT 1 FROM memories LIMIT 1)", [], |r| {
+            r.get::<_, i64>(0)
+        })? != 0;
+    // Ignore passive t3-code (marked connected by default whenever T3 Code is installed).
+    let has_prior_conn: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM client_connections WHERE connected = 1 AND client_id != 't3-code' LIMIT 1)",
+        [],
+        |r| r.get::<_, i64>(0),
+    )? != 0;
+    Ok(has_memories || has_prior_conn)
+}
+
 fn list_recent_memories_locked(
     conn: &Connection,
     filter: &SearchFilter,
     include_inactive: bool,
     limit: usize,
-) -> Result<Vec<MemoryHit>> {
+    offset: usize,
+) -> Result<(Vec<MemoryHit>, usize)> {
     let order = if filter.sort.as_deref() == Some("most_recalled") {
         "ORDER BY COALESCE(rs.recall_count, 0) DESC, m.updated_at DESC"
     } else {
         "ORDER BY (CASE WHEN m.status = 'pinned' THEN 0 ELSE 1 END), m.updated_at DESC"
     };
-    let sql = format!("{MEMORY_HIT_SELECT} {order} LIMIT 500");
+    let sql = format!("{MEMORY_HIT_SELECT} {order}");
     let mut stmt = conn.prepare(&sql)?;
+    let mut total = 0usize;
     let mut hits = Vec::new();
     for row in stmt
         .query_map([], |r| row_to_memory_hit(r, 1.0))?
         .filter_map(Result::ok)
     {
         if matches_filter(&row, filter, include_inactive) {
-            hits.push(row);
-            if hits.len() >= limit {
-                break;
+            if total >= offset && hits.len() < limit {
+                hits.push(row);
             }
+            total += 1;
         }
     }
-    Ok(hits)
+    Ok((hits, total))
 }
 
 fn matches_filter(hit: &MemoryHit, filter: &SearchFilter, include_inactive: bool) -> bool {

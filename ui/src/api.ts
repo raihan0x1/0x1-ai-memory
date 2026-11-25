@@ -14,6 +14,7 @@ import type {
   SessionSummary,
   SettingsView,
   UniversalMcpSnippets,
+  UpdateStatusResponse,
   UsageEntry,
   UsageSummary,
 } from './types';
@@ -21,7 +22,7 @@ import type {
 export const DEFAULT_DAEMON_PORT = 10101;
 
 function resolveSameOriginApiUrl(path: string): string {
-  if (!path.startsWith('/api/') || path.startsWith('//')) {
+  if ((!path.startsWith('/api/') && path !== '/health') || path.startsWith('//')) {
     throw new Error(`Refusing non-API request path: ${path}`);
   }
   const url = new URL(path, window.location.origin);
@@ -64,8 +65,10 @@ export const api = {
       method: 'PATCH',
       body: JSON.stringify({ privacy_mode }),
     }),
-  sessions: (params: { project_id?: string; limit?: number } = {}) =>
-    req<{ sessions: SessionSummary[] }>(`/api/sessions${buildQuery(params)}`),
+  sessions: (params: { project_id?: string; limit?: number; offset?: number } = {}) =>
+    req<{ sessions: SessionSummary[]; total: number; limit: number; offset: number }>(
+      `/api/sessions${buildQuery(params)}`,
+    ),
   distillSession: (id: string) =>
     req<{ queued: boolean; session_id: string }>(
       `/api/sessions/${encodeURIComponent(id)}/distill`,
@@ -75,10 +78,16 @@ export const api = {
     req<{ queued_sessions: number; session_ids: string[] }>('/api/distill/flush', {
       method: 'POST',
     }),
-  rawEvents: (params: { project_id?: string; client?: string; limit?: number } = {}) =>
-    req<{ events: RawEventView[] }>(`/api/raw-events${buildQuery(params)}`),
+  rawEvents: (
+    params: { project_id?: string; client?: string; kind?: string; limit?: number; offset?: number } = {},
+  ) =>
+    req<{ events: RawEventView[]; total: number; limit: number; offset: number }>(
+      `/api/raw-events${buildQuery(params)}`,
+    ),
   searchMemories: (params: Record<string, string | number | boolean | undefined>) =>
-    req<{ count: number; memories: MemoryHit[] }>(`/api/memories${buildQuery(params)}`),
+    req<{ count: number; total: number; limit: number; offset: number; memories: MemoryHit[] }>(
+      `/api/memories${buildQuery(params)}`,
+    ),
   getMemory: (id: string) => req<{ memory: MemoryDetail }>(`/api/memories/${encodeURIComponent(id)}`),
   memoryContext: (id: string) =>
     req<MemoryContextResponse>(`/api/memories/${encodeURIComponent(id)}/context`),
@@ -121,7 +130,10 @@ export const api = {
     const qs = projectId ? `?project_id=${encodeURIComponent(projectId)}` : '';
     return req<ContextPreviewResponse>(`/api/context-preview${qs}`);
   },
-  usageHistory: () => req<{ usage: UsageEntry[] }>('/api/usage'),
+  usageHistory: (params: { limit?: number; offset?: number } = {}) =>
+    req<{ usage: UsageEntry[]; total: number; limit: number; offset: number }>(
+      `/api/usage${buildQuery(params)}`,
+    ),
   settings: () => req<SettingsView>('/api/settings'),
   patchSettings: (patch: Record<string, unknown>) =>
     req<SettingsView>('/api/settings', {
@@ -161,6 +173,17 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ enabled }),
     }),
+  health: () => req<{ ok: boolean; service: string; version: string }>('/health'),
+  updateStatus: () => req<UpdateStatusResponse>('/api/updates/status'),
+  checkUpdates: () => req<UpdateStatusResponse>('/api/updates/check', { method: 'POST' }),
+  applyUpdate: () => req<UpdateStatusResponse>('/api/updates/apply', { method: 'POST' }),
+  dismissUpdate: (version: string) =>
+    req<UpdateStatusResponse>('/api/updates/dismiss', {
+      method: 'POST',
+      body: JSON.stringify({ version }),
+    }),
+  ackWhatsNew: () => req<UpdateStatusResponse>('/api/updates/ack-whats-new', { method: 'POST' }),
+  fetchWhatsNew: () => req<UpdateStatusResponse>('/api/updates/fetch-whats-new', { method: 'POST' }),
 };
 
 /** Exact UTC timestamp (Rim rule: never a bare time without zone). */

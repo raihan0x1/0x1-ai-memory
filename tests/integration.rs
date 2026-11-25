@@ -9,8 +9,10 @@ use ox1_memory::hooks::HookState;
 use ox1_memory::llm::MemoryLlmClient;
 use ox1_memory::models::StreamEvent;
 use ox1_memory::server::{AppState, build_router};
+use ox1_memory::updater::UpdateManager;
 use serde_json::{Value, json};
 use std::path::PathBuf;
+use std::sync::Arc;
 use tempfile::tempdir;
 use tokio::sync::broadcast;
 use tower::ServiceExt;
@@ -38,6 +40,15 @@ fn test_state(tmp: &std::path::Path) -> AppState {
         10101,
         ox1_memory::daemon::AutoStartPlatform::MacOs,
     );
+    let updater = Arc::new(UpdateManager::new(
+        db.clone(),
+        PathBuf::from("/usr/local/bin/0x1-memory"),
+        tmp.to_path_buf(),
+        tmp.join("daemon.log"),
+        10101,
+        shutdown_tx.clone(),
+        events_tx.clone(),
+    ));
     AppState {
         db,
         embedder,
@@ -45,6 +56,7 @@ fn test_state(tmp: &std::path::Path) -> AppState {
         distill,
         connectors,
         autostart,
+        updater,
         events_tx,
         shutdown_tx,
         hook_state: HookState::default(),
@@ -872,4 +884,603 @@ async fn stale_daemon_health_triggers_upgrade_and_ui_cache_headers() {
             .await
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn pagination_across_memories_sessions_raw_events_and_usage() {
+    use ox1_memory::models::NewMemoryInput;
+    use ox1_memory::project::ProjectIdentity;
+    use std::collections::HashSet;
+
+    let tmp = tempdir().unwrap();
+    let state = test_state(tmp.path());
+
+    let p1 = state
+        .db
+        .upsert_project(&ProjectIdentity {
+            id: "proj_pag_1".into(),
+            name: "pag-one".into(),
+            remote_url: None,
+            root_path: "/tmp/pag-one".into(),
+            branch: Some("main".into()),
+        })
+        .unwrap();
+    let p2 = state
+        .db
+        .upsert_project(&ProjectIdentity {
+            id: "proj_pag_2".into(),
+            name: "pag-two".into(),
+            remote_url: None,
+            root_path: "/tmp/pag-two".into(),
+            branch: Some("main".into()),
+        })
+        .unwrap();
+
+    // Seed 25 memories across 2 projects & clients (with searchable keyword "pagtoken")
+    for i in 0..25 {
+        let proj = if i % 2 == 0 { &p1.id } else { &p2.id };
+        let client = if i % 3 == 0 { "codex" } else { "claude-code" };
+        state
+            .db
+            .create_memory(
+                NewMemoryInput {
+                    scope: Some("project".into()),
+                    project_id: Some(proj.clone()),
+                    session_id: None,
+                    source_client: Some(client.into()),
+                    memory_type: "decision".into(),
+                    title: format!("Paginated memory #{i:02} pagtoken"),
+                    summary: format!("Summary for memory {i} pagtoken"),
+                    content: format!("Detailed content {i} pagtoken"),
+                    files: None,
+                    tags: None,
+                    status: Some("active".into()),
+                    supersedes_id: None,
+                },
+                None,
+            )
+            .unwrap();
+    }
+
+    // Seed 10 sessions
+    let mut sess_ids = Vec::new();
+    for i in 0..10 {
+        let proj = if i % 2 == 0 { &p1.id } else { &p2.id };
+        let s = state
+            .db
+            .upsert_session(proj, "claude-code", &format!("ext-sess-{i:02}"), None)
+            .unwrap();
+        sess_ids.push(s.id);
+    }
+
+    // Seed 25 raw events (mixed prompt, tool_use, turn_stop)
+    for i in 0..25 {
+        let (etype, tool) = match i % 3 {
+            0 => ("prompt", None),
+            1 => ("tool_use", Some("Bash")),
+            _ => ("turn_stop", None),
+        };
+        let sid = &sess_ids[i % sess_ids.len()];
+        let proj = if (i % sess_ids.len()) % 2 == 0 {
+            &p1.id
+        } else {
+            &p2.id
+        };
+        state
+            .db
+            .insert_raw_event(sid, proj, "claude-code", etype, tool, "{}")
+            .unwrap();
+    }
+
+    // Seed 55 usage rows (> old 50 cap)
+    for i in 0..55 {
+        state
+            .db
+            .record_usage(
+                "openrouter",
+                "test-model",
+                &format!("op-{i}"),
+                100,
+                50,
+                0.0001,
+                None,
+                "ok",
+                None,
+            )
+            .unwrap();
+    }
+
+    let app = build_router(state);
+
+    // 1. Memories pagination (unfiltered + offset)
+    let m_p1 = body_json(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/memories?limit=10&offset=0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(m_p1["total"], 25);
+    assert_eq!(m_p1["count"], 10);
+    assert_eq!(m_p1["limit"], 10);
+    assert_eq!(m_p1["offset"], 0);
+    let p1_ids: HashSet<String> = m_p1["memories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(p1_ids.len(), 10);
+
+    let m_p3 = body_json(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/memories?limit=10&offset=20")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(m_p3["total"], 25);
+    assert_eq!(m_p3["count"], 5);
+    assert_eq!(m_p3["limit"], 10);
+    assert_eq!(m_p3["offset"], 20);
+    let p3_ids: HashSet<String> = m_p3["memories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(p3_ids.len(), 5);
+    assert!(p1_ids.is_disjoint(&p3_ids));
+
+    // Search query pagination
+    let mq_p1 = body_json(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/memories?query=pagtoken&limit=5&offset=0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    let mq_p2 = body_json(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/memories?query=pagtoken&limit=5&offset=5")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(mq_p1["total"], 25);
+    assert_eq!(mq_p1["memories"].as_array().unwrap().len(), 5);
+    assert_eq!(mq_p2["total"], 25);
+    assert_eq!(mq_p2["memories"].as_array().unwrap().len(), 5);
+    let mq1_ids: HashSet<String> = mq_p1["memories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap().to_string())
+        .collect();
+    let mq2_ids: HashSet<String> = mq_p2["memories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap().to_string())
+        .collect();
+    assert!(mq1_ids.is_disjoint(&mq2_ids));
+
+    // 2. Sessions pagination
+    let s_p1 = body_json(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions?limit=6&offset=0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    let s_p2 = body_json(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions?limit=6&offset=6")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(s_p1["total"], 10);
+    assert_eq!(s_p1["sessions"].as_array().unwrap().len(), 6);
+    assert_eq!(s_p2["total"], 10);
+    assert_eq!(s_p2["sessions"].as_array().unwrap().len(), 4);
+    let s1_ids: HashSet<String> = s_p1["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["id"].as_str().unwrap().to_string())
+        .collect();
+    let s2_ids: HashSet<String> = s_p2["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["id"].as_str().unwrap().to_string())
+        .collect();
+    assert!(s1_ids.is_disjoint(&s2_ids));
+
+    // 3. Raw events pagination + kind=prompts filter (indices 0,3,6,9,12,15,18,21,24 => 9 prompts)
+    let r_p1 = body_json(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/raw-events?limit=5&offset=0&kind=prompts")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    let r_p2 = body_json(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/raw-events?limit=5&offset=5&kind=prompts")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(r_p1["total"], 9);
+    assert_eq!(r_p1["events"].as_array().unwrap().len(), 5);
+    assert_eq!(r_p2["total"], 9);
+    assert_eq!(r_p2["events"].as_array().unwrap().len(), 4);
+    let r1_ids: HashSet<String> = r_p1["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["id"].as_str().unwrap().to_string())
+        .collect();
+    let r2_ids: HashSet<String> = r_p2["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["id"].as_str().unwrap().to_string())
+        .collect();
+    assert!(r1_ids.is_disjoint(&r2_ids));
+
+    // 4. Usage ledger pagination (>50 rows)
+    let u_p3 = body_json(
+        app.oneshot(
+            Request::builder()
+                .uri("/api/usage?limit=20&offset=40")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(u_p3["total"], 55);
+    assert_eq!(u_p3["limit"], 20);
+    assert_eq!(u_p3["offset"], 40);
+    assert_eq!(u_p3["usage"].as_array().unwrap().len(), 15);
+}
+
+#[tokio::test]
+async fn updater_checks_etag_dismisses_seeds_whats_new_and_verifies_swap() {
+    use axum::Router;
+    use axum::http::HeaderMap;
+    use axum::response::IntoResponse;
+    use axum::routing::get;
+    use ox1_memory::updater::{ReleaseInfo, platform_asset_name, sha256_hex};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let tmp = tempdir().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let exe_path = bin_dir.join(if cfg!(windows) {
+        "0x1-memory.exe"
+    } else {
+        "0x1-memory"
+    });
+    std::fs::write(&exe_path, b"old-binary-bytes").unwrap();
+
+    // Prepare mock archive + SHA256SUMS.txt (real tar.gz on Unix; bogus bytes for cross-platform failure check)
+    let asset = platform_asset_name().unwrap_or("0x1-memory-darwin-arm64.tar.gz");
+    let archive_bytes: Vec<u8> = {
+        #[cfg(unix)]
+        {
+            let stage_dir = tmp.path().join("pkg");
+            std::fs::create_dir_all(&stage_dir).unwrap();
+            let mock_bin = stage_dir.join("0x1-memory");
+            std::fs::write(&mock_bin, "#!/bin/sh\necho \"0x1-memory 9.9.9\"\n").unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&mock_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let archive_file = tmp.path().join("pkg.tar.gz");
+            let status = std::process::Command::new("/usr/bin/tar")
+                .args([
+                    "-czf",
+                    archive_file.to_str().unwrap(),
+                    "-C",
+                    stage_dir.to_str().unwrap(),
+                    "0x1-memory",
+                ])
+                .status()
+                .unwrap();
+            assert!(status.success());
+            std::fs::read(archive_file).unwrap()
+        }
+        #[cfg(not(unix))]
+        {
+            b"not-a-real-archive".to_vec()
+        }
+    };
+    let good_sha = sha256_hex(&archive_bytes);
+    let good_sums = format!("{good_sha}  {asset}\n");
+    let bad_sums = format!("{}  {asset}\n", "0".repeat(64));
+
+    let latest_calls = Arc::new(AtomicUsize::new(0));
+    let latest_calls_srv = latest_calls.clone();
+    let sums_payload = Arc::new(tokio::sync::RwLock::new(good_sums.clone()));
+    let sums_srv = sums_payload.clone();
+    let archive_srv = archive_bytes.clone();
+
+    let mock_gh = Router::new()
+        .route(
+            "/repos/raihan0x1/0x1-ai-memory/releases/latest",
+            get(move |headers: HeaderMap| {
+                let calls = latest_calls_srv.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    if headers
+                        .get("if-none-match")
+                        .and_then(|v| v.to_str().ok())
+                        == Some("\"etag-999\"")
+                    {
+                        return StatusCode::NOT_MODIFIED.into_response();
+                    }
+                    (
+                        [(axum::http::header::ETAG, "\"etag-999\"")],
+                        axum::Json(json!({
+                            "tag_name": "v9.9.9",
+                            "name": "v9.9.9",
+                            "body": "## What's Changed\n- Added pagination everywhere\n- Added 1-click Daemon update",
+                            "html_url": "https://github.com/raihan0x1/0x1-ai-memory/releases/tag/v9.9.9",
+                            "published_at": "2026-11-25T10:00:00Z",
+                            "draft": false,
+                            "prerelease": false
+                        })),
+                    )
+                        .into_response()
+                }
+            }),
+        )
+        .route(
+            "/repos/raihan0x1/0x1-ai-memory/releases/tags/v0.3.1",
+            get(|| async {
+                axum::Json(json!({
+                    "tag_name": "v0.3.1",
+                    "name": "v0.3.1",
+                    "body": "- Current release highlights",
+                    "html_url": "https://github.com/raihan0x1/0x1-ai-memory/releases/tag/v0.3.1",
+                    "draft": false,
+                    "prerelease": false
+                }))
+            }),
+        )
+        .route(
+            "/releases/download/v9.9.9/SHA256SUMS.txt",
+            get(move || {
+                let s = sums_srv.clone();
+                async move { s.read().await.clone() }
+            }),
+        )
+        .route(
+            &format!("/releases/download/v9.9.9/{asset}"),
+            get(move || {
+                let bytes = archive_srv.clone();
+                async move { bytes }
+            }),
+        );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, mock_gh).await;
+    });
+
+    let base_api = format!("http://127.0.0.1:{mock_port}");
+    let base_rel = format!("http://127.0.0.1:{mock_port}/releases/download");
+
+    // 1. Fresh DB startup skips "What's new"
+    let mut state = test_state(tmp.path());
+    let updater = Arc::new(UpdateManager::with_urls_and_version(
+        state.db.clone(),
+        exe_path.clone(),
+        tmp.path().to_path_buf(),
+        tmp.join_log(),
+        10101,
+        state.shutdown_tx.clone(),
+        state.events_tx.clone(),
+        "0.3.1".into(),
+        base_api.clone(),
+        base_rel.clone(),
+    ));
+    updater.seed_version_state_on_startup(false).unwrap();
+    let st_fresh = updater.status().await;
+    assert!(!st_fresh.whats_new.should_show);
+
+    // Simulate upgraded DB (previously saw 0.3.0)
+    state.db.set_meta("last_seen_version", "0.3.0").unwrap();
+    updater.seed_version_state_on_startup(false).unwrap();
+    state.updater = updater.clone();
+    let app = build_router(state.clone());
+
+    let st_up = body_json(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/updates/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(st_up["whats_new"]["should_show"], true);
+    assert_eq!(st_up["whats_new"]["previous_version"], "0.3.0");
+
+    // Fetch current version release notes & ack What's New
+    let fetched = body_json(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/updates/fetch-whats-new")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        fetched["whats_new"]["body"]
+            .as_str()
+            .unwrap()
+            .contains("Current release highlights")
+    );
+
+    let acked = body_json(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/updates/ack-whats-new")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(acked["whats_new"]["should_show"], false);
+
+    // 2. Check for updates -> 200 OK caches ETag; second forced check gets 304 Not Modified
+    let check1 = body_json(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/updates/check")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(check1["update_available"], true);
+    assert_eq!(check1["latest_release"]["version"], "9.9.9");
+
+    let check2 = body_json(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/updates/check")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(latest_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(check2["update_available"], true);
+    assert_eq!(check2["latest_release"]["version"], "9.9.9");
+
+    // 3. Dismiss version persists
+    let dismissed = body_json(
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/updates/dismiss")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "version": "9.9.9" }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(dismissed["dismissed_version"], "9.9.9");
+
+    // 4. Fail-closed SHA-256 mismatch leaves active binary untouched
+    let target = ReleaseInfo {
+        tag_name: "v9.9.9".into(),
+        version: "9.9.9".into(),
+        name: "v9.9.9".into(),
+        body: "Release notes for 9.9.9".into(),
+        html_url: "https://github.com/raihan0x1/0x1-ai-memory/releases/tag/v9.9.9".into(),
+        published_at: None,
+    };
+    *sums_payload.write().await = bad_sums;
+    let fail_res = updater.stage_verify_and_swap(&target, asset).await;
+    assert!(fail_res.is_err());
+    assert_eq!(std::fs::read(&exe_path).unwrap(), b"old-binary-bytes");
+
+    // 5. Valid checksum + --version smoke check swaps binary, updates .version stamp, and caches notes
+    #[cfg(unix)]
+    {
+        *sums_payload.write().await = good_sums;
+        updater
+            .stage_verify_and_swap(&target, asset)
+            .await
+            .expect("valid archive & checksum should swap binary");
+        let swapped = std::fs::read_to_string(&exe_path).unwrap();
+        assert!(swapped.contains("0x1-memory 9.9.9"));
+        let stamp = std::fs::read_to_string(bin_dir.join(".version")).unwrap();
+        assert_eq!(stamp.trim(), "9.9.9");
+        let cached_notes = state
+            .db
+            .get_meta("whats_new_cache_json")
+            .unwrap()
+            .expect("release notes should be pre-cached before restart");
+        assert!(cached_notes.contains("Release notes for 9.9.9"));
+    }
+}
+
+trait TmpPathHelper {
+    fn join_log(&self) -> PathBuf;
+}
+
+impl TmpPathHelper for tempfile::TempDir {
+    fn join_log(&self) -> PathBuf {
+        self.path().join("daemon.log")
+    }
 }

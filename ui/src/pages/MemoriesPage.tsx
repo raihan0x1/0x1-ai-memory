@@ -13,6 +13,7 @@ import {
 } from '../components/Icons';
 import { MemoryGraphCanvas } from '../components/MemoryGraphCanvas';
 import { MemoryInspectorDrawer } from '../components/MemoryInspectorDrawer';
+import { PaginationBar } from '../components/PaginationBar';
 import { RimSelect } from '../components/RimSelect';
 import type { MemoryGraphResponse, MemoryHit, Project } from '../types';
 
@@ -96,8 +97,25 @@ export function MemoriesPage({ projects, onChanged }: MemoriesPageProps) {
   const [includeInactive, setIncludeInactive] = useState(false);
 
   const [hits, setHits] = useState<MemoryHit[]>([]);
+  const [total, setTotal] = useState(0);
+  const [pageSize, setPageSize] = useState(20);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+
+  const filterKey = JSON.stringify([
+    query.trim(),
+    projectId,
+    scope,
+    memType,
+    sourceClient,
+    tagFilter,
+    fileFilter,
+    sortMode,
+    includeInactive,
+    pageSize,
+  ]);
+  const [pageState, setPageState] = useState({ key: filterKey, page: 1 });
+  const page = pageState.key === filterKey ? pageState.page : 1;
 
   const [graphData, setGraphData] = useState<MemoryGraphResponse | null>(null);
   const [graphLoading, setGraphLoading] = useState(false);
@@ -158,9 +176,15 @@ export function MemoriesPage({ projects, onChanged }: MemoriesPageProps) {
         file: fileFilter || undefined,
         sort: sortMode || undefined,
         include_inactive: includeInactive,
-        limit: 120,
+        limit: pageSize,
+        offset: (page - 1) * pageSize,
       });
+      if (res.total > 0 && (page - 1) * pageSize >= res.total) {
+        setPageState({ key: filterKey, page: Math.max(1, Math.ceil(res.total / pageSize)) });
+        return;
+      }
       setHits(res.memories);
+      setTotal(res.total);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Search failed');
     } finally {
@@ -176,6 +200,9 @@ export function MemoriesPage({ projects, onChanged }: MemoriesPageProps) {
     fileFilter,
     sortMode,
     includeInactive,
+    pageSize,
+    page,
+    filterKey,
   ]);
 
   const runGraph = useCallback(async () => {
@@ -489,7 +516,7 @@ export function MemoriesPage({ projects, onChanged }: MemoriesPageProps) {
           <section className="panel" aria-label="Memory search results">
             <div className="panel-header">
               <h2 className="panel-title">
-                {loading ? 'Searching...' : `${hits.length} memories`}
+                {loading ? 'Searching...' : `${total} memories`}
               </h2>
               <span className="field-hint">Click any row to inspect lineage, links, or edit</span>
             </div>
@@ -665,6 +692,18 @@ export function MemoriesPage({ projects, onChanged }: MemoriesPageProps) {
                 })}
               </div>
             )}
+
+            <PaginationBar
+              label="Memories pages"
+              page={page}
+              pageSize={pageSize}
+              total={total}
+              pageSizeOptions={[10, 20, 50]}
+              onPageChange={(nextPage) => setPageState({ key: filterKey, page: nextPage })}
+              onPageSizeChange={(nextSize) => {
+                setPageSize(nextSize);
+              }}
+            />
           </section>
         </>
       )}

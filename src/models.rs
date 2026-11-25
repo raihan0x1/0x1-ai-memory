@@ -129,6 +129,7 @@ pub struct SearchFilter {
     pub sort: Option<String>,
     pub include_inactive: Option<bool>,
     pub limit: Option<usize>,
+    pub offset: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -268,6 +269,10 @@ pub struct UsageSummary {
     pub total_memories: i64,
     pub total_projects: i64,
     pub pending_raw_events: i64,
+    #[serde(default)]
+    pub total_recalls: i64,
+    #[serde(default)]
+    pub active_sessions: i64,
     pub daily_token_cap: i64,
     pub daily_cost_cap_usd: f64,
     pub budget_exhausted: bool,
