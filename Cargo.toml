@@ -1,6 +1,6 @@
 [package]
 name = "ox1-memory"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 description = "Local-first, anti-drain cross-agent AI memory engine (single Rust binary + embedded Web UI)"
 license = "MIT"
