@@ -33,3 +33,10 @@ The daemon binds exclusively to `127.0.0.1`. Keep both CORS origin filtering and
 - Every data panel handles all 4 states cleanly: `loading`, `empty`, `error`, and `full`.
 - Parse backend timestamps as explicit UTC (`Z` suffix) before local formatting.
 - All dropdown controls in `ui/src/pages/` use `<RimSelect />` (top-layer popover, WAI-ARIA listbox) instead of native `<select>`.
+
+## 6. Async I/O & Supply-Chain Hardening (SonarCloud Quality Gate)
+
+- Inside Rust `async fn`, never call blocking `std::fs` directly — use `tokio::fs` or `tokio::task::spawn_blocking`.
+- In shell installers (`install.sh`), enforce HTTPS on `curl` (`--proto '=https' --tlsv1.2`).
+- In GitHub Actions workflows (`.github/workflows/`), pin third-party actions to full 40-char commit SHAs, scope `permissions: contents: write` to the specific job that needs it, and pass `--locked` to `cargo build --release`.
+- In the Node launcher (`npm/bin/0x1-memory.mjs`), invoke archive tools (`tar`, `unzip`, `powershell.exe`) via fixed system directories instead of bare `PATH` lookup; in `ui/src/api.ts`, validate same-origin `/api/` paths before calling `fetch`.

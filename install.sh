@@ -36,10 +36,10 @@ TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
 echo "Downloading ${ASSET} from ${REPO}..."
-curl -fsSL "${BASE_URL}/${ASSET}" -o "${TMP_DIR}/${ASSET}"
+curl -fsSL --proto '=https' --tlsv1.2 "${BASE_URL}/${ASSET}" -o "${TMP_DIR}/${ASSET}"
 
 if [ "${OX1_SKIP_CHECKSUM:-0}" != "1" ]; then
-  curl -fsSL "${BASE_URL}/SHA256SUMS.txt" -o "${TMP_DIR}/SHA256SUMS.txt"
+  curl -fsSL --proto '=https' --tlsv1.2 "${BASE_URL}/SHA256SUMS.txt" -o "${TMP_DIR}/SHA256SUMS.txt"
   EXPECTED="$(awk -v file="$ASSET" '$2 == file || $2 == ("*" file) { print $1; exit }' "${TMP_DIR}/SHA256SUMS.txt")"
   if [ -z "$EXPECTED" ]; then
     echo "Checksum entry missing for ${ASSET} in SHA256SUMS.txt (aborting)." >&2

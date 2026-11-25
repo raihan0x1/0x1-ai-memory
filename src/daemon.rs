@@ -3,7 +3,6 @@
 use crate::config::{AppPaths, DEFAULT_PORT, write_atomic_file};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -343,12 +342,17 @@ pub async fn fetch_onboarding_completed(port: u16) -> Option<bool> {
 /// Spawns `0x1-memory serve --foreground --port <port>` detached from the terminal
 /// and waits until `/health` responds OK.
 pub async fn spawn_background(paths: &AppPaths, bin_path: &Path, port: u16) -> Result<u32> {
-    paths.ensure_dirs()?;
-    let stdout_file: File = OpenOptions::new()
+    tokio::fs::create_dir_all(&paths.data_dir).await?;
+    tokio::fs::create_dir_all(&paths.backups_dir).await?;
+    tokio::fs::create_dir_all(&paths.models_dir).await?;
+    let stdout_file = tokio::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&paths.log_path)
-        .with_context(|| format!("Failed to open log file {}", paths.log_path.display()))?;
+        .await
+        .with_context(|| format!("Failed to open log file {}", paths.log_path.display()))?
+        .into_std()
+        .await;
     let stderr_file = stdout_file
         .try_clone()
         .context("Failed to clone daemon log handle")?;
@@ -387,7 +391,9 @@ pub async fn spawn_background(paths: &AppPaths, bin_path: &Path, port: u16) -> R
             return Ok(pid);
         }
         if let Ok(Some(status)) = child.try_wait() {
-            let tail = read_log_tail(&paths.log_path, 20).unwrap_or_default();
+            let tail = read_log_tail_async(&paths.log_path, 20)
+                .await
+                .unwrap_or_default();
             bail!(
                 "Daemon exited early with {status}. Recent log ({}):\n{tail}",
                 paths.log_path.display()
@@ -396,7 +402,9 @@ pub async fn spawn_background(paths: &AppPaths, bin_path: &Path, port: u16) -> R
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    let tail = read_log_tail(&paths.log_path, 20).unwrap_or_default();
+    let tail = read_log_tail_async(&paths.log_path, 20)
+        .await
+        .unwrap_or_default();
     bail!(
         "Timed out waiting for Daemon on http://127.0.0.1:{port}/health. Recent log ({}):\n{tail}",
         paths.log_path.display()
@@ -421,14 +429,14 @@ pub async fn stop_daemon(paths: &AppPaths, port: u16) -> Result<bool> {
         }
         for _ in 0..30 {
             if !daemon_is_healthy(port).await {
-                let _ = std::fs::remove_file(&paths.pid_path);
+                let _ = tokio::fs::remove_file(&paths.pid_path).await;
                 return Ok(true);
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
 
-    if let Ok(raw_pid) = std::fs::read_to_string(&paths.pid_path)
+    if let Ok(raw_pid) = tokio::fs::read_to_string(&paths.pid_path).await
         && let Some((pid, pid_port)) = parse_pid_entry(&raw_pid)
         && pid_port == port
     {
@@ -441,10 +449,22 @@ pub async fn stop_daemon(paths: &AppPaths, port: u16) -> Result<bool> {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
-        let _ = std::fs::remove_file(&paths.pid_path);
+        let _ = tokio::fs::remove_file(&paths.pid_path).await;
     }
 
     Ok(stopped_any)
+}
+
+async fn read_log_tail_async(log_path: &Path, lines: usize) -> Result<String> {
+    match tokio::fs::read_to_string(log_path).await {
+        Ok(content) => {
+            let all: Vec<&str> = content.lines().collect();
+            let start = all.len().saturating_sub(lines);
+            Ok(all[start..].join("\n"))
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(err) => Err(err.into()),
+    }
 }
 
 pub fn format_pid_entry(pid: u32, port: u16) -> String {

@@ -386,7 +386,7 @@ async fn run_serve(paths: AppPaths, port: u16, open_browser: bool) -> Result<()>
             });
         }
     };
-    let _ = std::fs::write(&paths.pid_path, format_pid_entry(std::process::id(), port));
+    let _ = tokio::fs::write(&paths.pid_path, format_pid_entry(std::process::id(), port)).await;
 
     println!("0x1-ai-memory Daemon listening on {base_url}");
     println!("  Web UI : {open_url}");
@@ -414,7 +414,7 @@ async fn run_serve(paths: AppPaths, port: u16, open_browser: bool) -> Result<()>
         })
         .await?;
 
-    let _ = std::fs::remove_file(&paths.pid_path);
+    let _ = tokio::fs::remove_file(&paths.pid_path).await;
     Ok(())
 }
 

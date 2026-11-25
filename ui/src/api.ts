@@ -16,8 +16,20 @@ import type {
 
 export const DEFAULT_DAEMON_PORT = 10101;
 
+function resolveSameOriginApiUrl(path: string): string {
+  if (!path.startsWith('/api/') || path.startsWith('//')) {
+    throw new Error(`Refusing non-API request path: ${path}`);
+  }
+  const url = new URL(path, window.location.origin);
+  if (url.origin !== window.location.origin) {
+    throw new Error(`Refusing cross-origin request: ${url.origin}`);
+  }
+  return `${url.pathname}${url.search}`;
+}
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(path, {
+  const target = resolveSameOriginApiUrl(path);
+  const res = await fetch(target, {
     ...init,
     headers: {
       'Content-Type': 'application/json',

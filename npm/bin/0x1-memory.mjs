@@ -72,17 +72,40 @@ function parseChecksum(sumsText, asset) {
   return null;
 }
 
+function resolveSystemBin(candidates) {
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  throw new Error(`Required system tool not found in standard paths: ${candidates.join(', ')}`);
+}
+
 function extractArchive(archivePath, destDir) {
   if (archivePath.endsWith('.tar.gz')) {
-    const res = spawnSync('tar', ['-xzf', archivePath, '-C', destDir], { stdio: 'inherit' });
+    const tarBin = resolveSystemBin(
+      IS_WIN
+        ? [path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'tar.exe')]
+        : ['/usr/bin/tar', '/bin/tar'],
+    );
+    const res = spawnSync(tarBin, ['-xzf', archivePath, '-C', destDir], { stdio: 'inherit' });
     if (res.status !== 0) {
       throw new Error(`Failed to extract ${path.basename(archivePath)} with tar`);
     }
     return;
   }
   if (IS_WIN) {
+    const psBin = resolveSystemBin([
+      path.join(
+        process.env.SystemRoot || 'C:\\Windows',
+        'System32',
+        'WindowsPowerShell',
+        'v1.0',
+        'powershell.exe',
+      ),
+    ]);
     const res = spawnSync(
-      'powershell',
+      psBin,
       [
         '-NoProfile',
         '-NonInteractive',
@@ -96,7 +119,8 @@ function extractArchive(archivePath, destDir) {
     }
     return;
   }
-  const res = spawnSync('unzip', ['-o', archivePath, '-d', destDir], { stdio: 'inherit' });
+  const unzipBin = resolveSystemBin(['/usr/bin/unzip', '/bin/unzip']);
+  const res = spawnSync(unzipBin, ['-o', archivePath, '-d', destDir], { stdio: 'inherit' });
   if (res.status !== 0) {
     throw new Error(`Failed to extract ${path.basename(archivePath)}`);
   }
