@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { api, DEFAULT_DAEMON_PORT, formatUtcTime } from '../api';
 import { ModalDialog } from '../components/ModalDialog';
 import type { ClientConnection, ConnectionPreview, UniversalMcpSnippets } from '../types';
@@ -21,7 +21,7 @@ export function ConnectionsPage({
   const [feedback, setFeedback] = useState<string | null>(null);
   const [snippetTab, setSnippetTab] = useState<'http' | 'toml' | 'stdio'>('http');
 
-  async function load() {
+  const load = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
@@ -33,11 +33,11 @@ export function ConnectionsPage({
     } finally {
       setLoading(false);
     }
-  }
+  }, []);
 
   useEffect(() => {
     void load();
-  }, []);
+  }, [load]);
 
   async function openPreview(clientId: string) {
     setFeedback(null);
@@ -309,7 +309,9 @@ export function ConnectionsPage({
           <div className="stack">
             <p>{preview.summary}</p>
             <div className="field">
-              <label>Planned changes (automatic backup saved to ~/.0x1-memory/backups/)</label>
+              <span className="field-label">
+                Planned changes (automatic backup saved to ~/.0x1-memory/backups/)
+              </span>
               <pre className="code-block">{preview.diff_preview}</pre>
             </div>
             {preview.manual_step_hint ? (

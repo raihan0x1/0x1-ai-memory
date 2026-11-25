@@ -152,9 +152,13 @@ export function StreamPage({
     }
   }, [projectFilter, clientFilter]);
 
+  const pipelineSignal = `${memories.length}:${summary?.pending_raw_events ?? 0}:${summary?.today_calls ?? 0}`;
+
   useEffect(() => {
-    void loadPipeline();
-  }, [loadPipeline, memories.length, summary?.pending_raw_events, summary?.today_calls]);
+    if (pipelineSignal) {
+      void loadPipeline();
+    }
+  }, [loadPipeline, pipelineSignal]);
 
   const tokenPct =
     summary && summary.daily_token_cap > 0
@@ -373,7 +377,14 @@ export function StreamPage({
               {(summary?.daily_cost_cap_usd ?? 0.5).toFixed(2)})
             </span>
             <div className="meter-row">
-              <div className="meter-track" aria-label={`Daily budget used: ${budgetPct}%`}>
+              <div
+                className="meter-track"
+                role="progressbar"
+                aria-valuenow={budgetPct}
+                aria-valuemin={0}
+                aria-valuemax={100}
+                aria-label="Daily budget used"
+              >
                 <div className={`meter-fill ${meterClass}`} style={{ width: `${budgetPct}%` }} />
               </div>
               <span className="meter-pct measure">{budgetPct}%</span>
@@ -446,7 +457,7 @@ export function StreamPage({
           onChange={setClientFilter}
         />
 
-        <div className="seg-group" role="group" aria-label="Group stream memories">
+        <fieldset className="seg-group" aria-label="Group stream memories">
           {(
             [
               ['day', 'By Day'],
@@ -464,7 +475,7 @@ export function StreamPage({
               {label}
             </button>
           ))}
-        </div>
+        </fieldset>
 
         {activeProjectObj ? (
           <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-xs)' }}>
@@ -501,7 +512,8 @@ export function StreamPage({
           </div>
 
           {loading ? (
-            <div aria-busy="true" aria-label="Loading memories">
+            <div aria-busy="true">
+              <span className="visually-hidden">Loading memories</span>
               {[0, 1, 2].map((i) => (
                 <div key={i} className="skeleton-row">
                   <div className="skeleton-bar skeleton-bar--short" />
@@ -564,7 +576,6 @@ export function StreamPage({
                             key={m.id}
                             className="ledger-row ledger-row--clickable"
                             data-selected={selectedMemoryId === m.id}
-                            onClick={() => setSelectedMemoryId(m.id)}
                           >
                             <div className="ledger-summary">
                               <div className="ledger-client">
@@ -573,7 +584,15 @@ export function StreamPage({
                               </div>
 
                               <div className="ledger-main">
-                                <h3 className="ledger-title">{m.title}</h3>
+                                <h3 className="ledger-title">
+                                  <button
+                                    type="button"
+                                    className="ledger-row-trigger"
+                                    onClick={() => setSelectedMemoryId(m.id)}
+                                  >
+                                    {m.title}
+                                  </button>
+                                </h3>
                                 <p className="ledger-desc">{m.summary}</p>
                                 <div className="tag-row">
                                   {m.status === 'pinned' ? (
@@ -594,8 +613,7 @@ export function StreamPage({
                                       key={t}
                                       type="button"
                                       className="chip"
-                                      onClick={(e) => {
-                                        e.stopPropagation();
+                                      onClick={() => {
                                         onNavigate('memories', { tag: t });
                                       }}
                                     >
@@ -613,8 +631,7 @@ export function StreamPage({
                                       key={f}
                                       type="button"
                                       className="chip chip--file"
-                                      onClick={(e) => {
-                                        e.stopPropagation();
+                                      onClick={() => {
                                         onNavigate('memories', { file: f });
                                       }}
                                     >
@@ -630,12 +647,7 @@ export function StreamPage({
                                 </div>
                               </div>
 
-                              <div
-                                className="ledger-aside"
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                }}
-                              >
+                              <div className="ledger-aside">
                                 <time className="field-hint measure" dateTime={m.updated_at}>
                                   {formatUtcTime(m.updated_at)}
                                 </time>
@@ -775,7 +787,7 @@ export function StreamPage({
                   paddingBlock: 'var(--space-xs)',
                 }}
               >
-                <div className="seg-group" role="group" aria-label="Filter live event tail">
+                <fieldset className="seg-group" aria-label="Filter live event tail">
                   {(
                     [
                       ['all', 'All'],
@@ -794,7 +806,7 @@ export function StreamPage({
                       {label}
                     </button>
                   ))}
-                </div>
+                </fieldset>
               </div>
 
               {pipelineLoading && displayedTail.length === 0 ? (

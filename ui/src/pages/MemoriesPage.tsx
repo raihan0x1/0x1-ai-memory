@@ -545,7 +545,6 @@ export function MemoriesPage({ projects, onChanged }: MemoriesPageProps) {
                               key={`${group.key}-${m.id}`}
                               className="ledger-row ledger-row--clickable"
                               data-selected={selectedMemoryId === m.id}
-                              onClick={() => setSelectedMemoryId(m.id)}
                             >
                               <div className="ledger-summary">
                                 <div className="ledger-client">
@@ -556,7 +555,15 @@ export function MemoriesPage({ projects, onChanged }: MemoriesPageProps) {
                                 </div>
 
                                 <div className="ledger-main">
-                                  <h3 className="ledger-title">{m.title}</h3>
+                                  <h3 className="ledger-title">
+                                    <button
+                                      type="button"
+                                      className="ledger-row-trigger"
+                                      onClick={() => setSelectedMemoryId(m.id)}
+                                    >
+                                      {m.title}
+                                    </button>
+                                  </h3>
                                   <p className="ledger-desc">{m.summary}</p>
                                   <div className="tag-row">
                                     <span
@@ -589,8 +596,7 @@ export function MemoriesPage({ projects, onChanged }: MemoriesPageProps) {
                                             ? ' chip--active'
                                             : ''
                                         }`}
-                                        onClick={(e) => {
-                                          e.stopPropagation();
+                                        onClick={() => {
                                           setTagFilter((prev) =>
                                             prev.toLowerCase() === t.toLowerCase() ? '' : t,
                                           );
@@ -609,8 +615,7 @@ export function MemoriesPage({ projects, onChanged }: MemoriesPageProps) {
                                             ? ' chip--active'
                                             : ''
                                         }`}
-                                        onClick={(e) => {
-                                          e.stopPropagation();
+                                        onClick={() => {
                                           setFileFilter((prev) =>
                                             prev.toLowerCase() === f.toLowerCase() ? '' : f,
                                           );
@@ -628,12 +633,7 @@ export function MemoriesPage({ projects, onChanged }: MemoriesPageProps) {
                                   </div>
                                 </div>
 
-                                <div
-                                  className="ledger-aside"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                  }}
-                                >
+                                <div className="ledger-aside">
                                   <time className="field-hint measure" dateTime={m.updated_at}>
                                     {formatUtcTime(m.updated_at)}
                                   </time>

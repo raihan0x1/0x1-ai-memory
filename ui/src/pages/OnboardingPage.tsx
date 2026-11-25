@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { api, DEFAULT_DAEMON_PORT } from '../api';
 import { ModalDialog } from '../components/ModalDialog';
 import type {
@@ -129,7 +129,7 @@ export function OnboardingPage({
     }
   }, [settings, engineInitialized]);
 
-  async function loadClients() {
+  const loadClients = useCallback(async () => {
     setClientsLoading(true);
     setClientsError(null);
     try {
@@ -141,11 +141,11 @@ export function OnboardingPage({
     } finally {
       setClientsLoading(false);
     }
-  }
+  }, []);
 
   useEffect(() => {
     void loadClients();
-  }, []);
+  }, [loadClients]);
 
   useEffect(() => {
     const current = STEPS[step];

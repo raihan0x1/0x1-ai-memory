@@ -447,7 +447,7 @@ export function MemoryGraphCanvas({
     <section className="panel ticks" aria-label="Memory knowledge graph">
       <div className="panel-header">
         <div className="head-actions">
-          <div className="seg-group" role="group" aria-label="Color nodes by">
+          <fieldset className="seg-group" aria-label="Color nodes by">
             <button
               type="button"
               className="seg-btn"
@@ -464,7 +464,7 @@ export function MemoryGraphCanvas({
             >
               Color: Client
             </button>
-          </div>
+          </fieldset>
 
           <label className="rim-check-label">
             <input

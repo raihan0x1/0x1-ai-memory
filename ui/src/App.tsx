@@ -316,7 +316,7 @@ export function App() {
                 </p>
               </div>
               <div className="field">
-                <label>Start again anytime from your terminal</label>
+                <span className="field-label">Start again anytime from your terminal</span>
                 <pre className="code-block">
                   {'0x1-memory\n# or\nnpx 0x1-ai-memory'}
                 </pre>

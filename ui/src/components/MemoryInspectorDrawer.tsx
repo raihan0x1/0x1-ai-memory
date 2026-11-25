@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { api, formatUtcTime } from '../api';
 import {
   IconClose,
@@ -128,7 +128,7 @@ function LocalNeighborSvg({
               ? clipToBox(nx, ny, cx, cy, 70, 18)
               : clipToBox(cx, cy, nx, ny, 61, 15);
           return (
-            <g key={`${link.memory.id}-${link.edge_kind}-${idx}`}>
+            <g key={`${link.memory.id}-${link.edge_kind}-${link.direction}-${link.label}`}>
               <line
                 x1={rawX1 === rawX2 && rawY1 === rawY2 ? rawX1 : x1}
                 y1={rawX1 === rawX2 && rawY1 === rawY2 ? rawY1 : y1}
@@ -154,10 +154,14 @@ function LocalNeighborSvg({
               : link.memory.title;
           const stroke = EDGE_COLORS[link.edge_kind] ?? '#5e5b55';
           return (
-            <g
-              key={`node-${link.memory.id}-${idx}`}
+            <a
+              key={`node-${link.memory.id}-${link.edge_kind}-${link.direction}-${link.label}`}
+              href={`#memory-${link.memory.id}`}
               style={{ cursor: 'pointer' }}
-              onClick={() => onSelectMemory(link.memory.id)}
+              onClick={(e) => {
+                e.preventDefault();
+                onSelectMemory(link.memory.id);
+              }}
             >
               <title>{`${link.memory.title} (${EDGE_KIND_LABELS[link.edge_kind] ?? link.edge_kind}: ${link.label})`}</title>
               <rect
@@ -179,7 +183,7 @@ function LocalNeighborSvg({
               >
                 {shortTitle}
               </text>
-            </g>
+            </a>
           );
         })}
 
@@ -218,6 +222,13 @@ export function MemoryInspectorDrawer({
   onFilterFile,
   onMutated,
 }: MemoryInspectorDrawerProps) {
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  const isOpen = Boolean(memoryId);
+  const isOpenRef = useRef(isOpen);
+  isOpenRef.current = isOpen;
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+
   const [tab, setTab] = useState<InspectorTab>('details');
   const [ctx, setCtx] = useState<MemoryContextResponse | null>(null);
   const [loading, setLoading] = useState(false);
@@ -271,15 +282,60 @@ export function MemoryInspectorDrawer({
   }, [memoryId]);
 
   useEffect(() => {
-    if (!memoryId) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [memoryId, onClose]);
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    if (isOpen && !dialog.open) {
+      dialog.showModal();
+    } else if (!isOpen && dialog.open) {
+      dialog.close();
+    }
+  }, [isOpen]);
 
-  if (!memoryId) return null;
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+
+    const handleClose = () => {
+      dialog.returnValue = '';
+      if (isOpenRef.current) onCloseRef.current();
+    };
+    dialog.addEventListener('close', handleClose);
+
+    // Fallback light-dismiss when native `closedby="any"` is unsupported (Safari)
+    let cleanupFallback = () => {};
+    if (!('closedBy' in HTMLDialogElement.prototype)) {
+      const outside = (e: PointerEvent) => {
+        if (e.target !== dialog) return false;
+        const r = dialog.getBoundingClientRect();
+        return (
+          e.clientX < r.left ||
+          e.clientX > r.right ||
+          e.clientY < r.top ||
+          e.clientY > r.bottom
+        );
+      };
+      let pressedOutside = false;
+      const onDown = (e: PointerEvent) => {
+        pressedOutside = outside(e);
+      };
+      const onUp = (e: PointerEvent) => {
+        if (pressedOutside && outside(e)) {
+          dialog.close();
+        }
+      };
+      dialog.addEventListener('pointerdown', onDown);
+      dialog.addEventListener('pointerup', onUp);
+      cleanupFallback = () => {
+        dialog.removeEventListener('pointerdown', onDown);
+        dialog.removeEventListener('pointerup', onUp);
+      };
+    }
+
+    return () => {
+      dialog.removeEventListener('close', handleClose);
+      cleanupFallback();
+    };
+  }, []);
 
   const mem = ctx?.memory;
 
@@ -369,13 +425,14 @@ export function MemoryInspectorDrawer({
   }
 
   return (
-    <div
-      className="inspector-backdrop"
-      onClick={(e) => {
-        if (e.target === e.currentTarget) onClose();
-      }}
+    <dialog
+      ref={dialogRef}
+      className="inspector-drawer"
+      aria-label="Memory inspector"
+      {...({ closedby: 'any' } as Record<string, string>)}
     >
-      <aside className="inspector-drawer" aria-label="Memory inspector">
+      {memoryId ? (
+        <>
         <div className="inspector-head">
           <div className="inspector-head-top">
             <div className="tag-row">
@@ -688,9 +745,9 @@ export function MemoryInspectorDrawer({
                       />
 
                       <div className="lineage-chain">
-                        {ctx.neighbors.map((link, idx) => (
+                        {ctx.neighbors.map((link) => (
                           <button
-                            key={`${link.memory.id}-${link.edge_kind}-${idx}`}
+                            key={`${link.memory.id}-${link.edge_kind}-${link.direction}-${link.label}`}
                             type="button"
                             className="lineage-step"
                             onClick={() => onSelectMemory(link.memory.id)}
@@ -850,7 +907,8 @@ export function MemoryInspectorDrawer({
             )}
           </div>
         ) : null}
-      </aside>
-    </div>
+        </>
+      ) : null}
+    </dialog>
   );
 }

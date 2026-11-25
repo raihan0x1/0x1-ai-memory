@@ -75,7 +75,7 @@ export function RimSelect({
 
   const closeMenu = useCallback((returnFocus = false) => {
     const el = menuRef.current as (HTMLDivElement & { hidePopover?: () => void }) | null;
-    if (el && el.matches(':popover-open') && typeof el.hidePopover === 'function') {
+    if (el?.matches(':popover-open') && typeof el.hidePopover === 'function') {
       try {
         el.hidePopover();
       } catch {
@@ -91,7 +91,7 @@ export function RimSelect({
   const openMenu = useCallback(() => {
     if (disabled || options.length === 0) return;
     const idx = options.findIndex((o) => o.value === value);
-    setActiveIndex(idx >= 0 ? idx : 0);
+    setActiveIndex(Math.max(0, idx));
     reposition();
     setOpen(true);
   }, [disabled, options, reposition, value]);
@@ -139,10 +139,9 @@ export function RimSelect({
 
   // Keep active option visible inside menu scroll container
   useEffect(() => {
-    if (!open || !menuRef.current) return;
-    const activeEl = menuRef.current.querySelector<HTMLElement>('[data-active="true"]');
-    activeEl?.scrollIntoView({ block: 'nearest' });
-  }, [open, activeIndex]);
+    if (!open) return;
+    document.getElementById(`${listboxId}-opt-${activeIndex}`)?.scrollIntoView({ block: 'nearest' });
+  }, [open, activeIndex, listboxId]);
 
   function commit(idx: number) {
     const opt = options[idx];
@@ -253,6 +252,7 @@ export function RimSelect({
               key={opt.value}
               id={`${listboxId}-opt-${idx}`}
               role="option"
+              tabIndex={-1}
               aria-selected={isSelected}
               data-selected={isSelected ? 'true' : undefined}
               data-active={isActive ? 'true' : undefined}

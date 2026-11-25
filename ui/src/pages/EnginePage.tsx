@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent } from 'react';
+import { useCallback, useEffect, useState, type FormEvent } from 'react';
 import { api, formatUtcTime } from '../api';
 import { ModalDialog } from '../components/ModalDialog';
 import { RimSelect } from '../components/RimSelect';
@@ -121,7 +121,7 @@ export function EnginePage({
   const [confirmStopOpen, setConfirmStopOpen] = useState(false);
   const [stopping, setStopping] = useState(false);
 
-  function syncFormFromSettings(s: SettingsView) {
+  const syncFormFromSettings = useCallback((s: SettingsView) => {
     setProvider(s.provider);
     setModel(s.model);
     setBaseUrl(s.base_url);
@@ -132,9 +132,9 @@ export function EnginePage({
     setEmbeddingModel(s.embedding_model);
     setRetentionDays(String(s.raw_event_retention_days));
     setIdleSeconds(String(s.distill_idle_seconds));
-  }
+  }, []);
 
-  async function load() {
+  const load = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
@@ -147,11 +147,11 @@ export function EnginePage({
     } finally {
       setLoading(false);
     }
-  }
+  }, [syncFormFromSettings]);
 
   useEffect(() => {
     void load();
-  }, []);
+  }, [load]);
 
   function onProviderChange(next: string) {
     setProvider(next);

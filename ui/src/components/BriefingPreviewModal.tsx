@@ -162,7 +162,7 @@ export function BriefingPreviewModal({
       ) : null}
 
       <div className="stack-sm" style={{ gap: '6px' }}>
-        <div className="budget-bar" aria-label="Token budget breakdown">
+        <div className="budget-bar" role="img" aria-label="Token budget breakdown">
           <div
             className="budget-seg--pinned"
             style={{ width: `${Math.min(100, (pinnedTok / budget) * 100)}%` }}
