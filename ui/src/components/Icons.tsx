@@ -61,3 +61,140 @@ export function IconSearch({ size = 14, className }: IconProps) {
     </svg>
   );
 }
+
+export function IconList({ size = 14, className }: IconProps) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6" className={className} aria-hidden="true">
+      <path d="M5 4h8M5 8h8M5 12h8M2.5 4h.5M2.5 8h.5M2.5 12h.5" strokeLinecap="square" />
+    </svg>
+  );
+}
+
+export function IconGraph({ size = 14, className }: IconProps) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" className={className} aria-hidden="true">
+      <circle cx="3.5" cy="8" r="2" />
+      <circle cx="12.5" cy="3.5" r="2" />
+      <circle cx="12.5" cy="12.5" r="2" />
+      <path d="M5.3 7.1L10.7 4.4M5.3 8.9L10.7 11.6" />
+    </svg>
+  );
+}
+
+export function IconTimeline({ size = 14, className }: IconProps) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" className={className} aria-hidden="true">
+      <path d="M4 2.5v11M4 5h8M4 8.5h6M4 12h9" strokeLinecap="square" />
+    </svg>
+  );
+}
+
+export function IconPin({ size = 13, className }: IconProps) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" className={className} aria-hidden="true">
+      <path d="M5 2.5h6l-1 4.5 2 2v1H4V9l2-2-1-4.5ZM8 10v4" strokeLinecap="square" strokeLinejoin="miter" />
+    </svg>
+  );
+}
+
+export function IconCopy({ size = 13, className }: IconProps) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" className={className} aria-hidden="true">
+      <rect x="5.5" y="5.5" width="8" height="8" />
+      <path d="M10.5 5.5V2.5h-8v8h3" strokeLinecap="square" />
+    </svg>
+  );
+}
+
+export function IconClose({ size = 14, className }: IconProps) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6" className={className} aria-hidden="true">
+      <path d="M3.5 3.5l9 9M12.5 3.5l-9 9" strokeLinecap="square" />
+    </svg>
+  );
+}
+
+export function IconPause({ size = 13, className }: IconProps) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.75" className={className} aria-hidden="true">
+      <path d="M5.5 3.5v9M10.5 3.5v9" strokeLinecap="square" />
+    </svg>
+  );
+}
+
+export function IconPlay({ size = 13, className }: IconProps) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6" className={className} aria-hidden="true">
+      <path d="M4.5 3l8 5-8 5V3Z" strokeLinejoin="miter" />
+    </svg>
+  );
+}
+
+export function IconBolt({ size = 13, className }: IconProps) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6" className={className} aria-hidden="true">
+      <path d="M9 1.5L3.5 9H8l-1 5.5L12.5 7H8l1-5.5Z" strokeLinejoin="miter" />
+    </svg>
+  );
+}
+
+export function IconTag({ size = 12, className }: IconProps) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" className={className} aria-hidden="true">
+      <path d="M2.5 8.2V2.5h5.7l5.3 5.3-5.7 5.7-5.3-5.3Z" strokeLinejoin="miter" />
+      <circle cx="5.5" cy="5.5" r="0.9" fill="currentColor" stroke="none" />
+    </svg>
+  );
+}
+
+export function IconFile({ size = 12, className }: IconProps) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" className={className} aria-hidden="true">
+      <path d="M3.5 2h6l3 3v9h-9V2Z" strokeLinejoin="miter" />
+      <path d="M9.5 2v3h3" strokeLinejoin="miter" />
+    </svg>
+  );
+}
+
+export function IconLink({ size = 14, className }: IconProps) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" className={className} aria-hidden="true">
+      <path d="M6.5 9.5l3-3M5.5 7L4 8.5a2.1 2.1 0 0 0 3 3L8.5 10M7.5 6L9 4.5a2.1 2.1 0 0 1 3 3L10.5 9" strokeLinecap="square" />
+    </svg>
+  );
+}
+
+export function IconZoomIn({ size = 13, className }: IconProps) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6" className={className} aria-hidden="true">
+      <circle cx="7" cy="7" r="4.5" />
+      <path d="M7 5v4M5 7h4M10.5 10.5L14 14" strokeLinecap="square" />
+    </svg>
+  );
+}
+
+export function IconZoomOut({ size = 13, className }: IconProps) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6" className={className} aria-hidden="true">
+      <circle cx="7" cy="7" r="4.5" />
+      <path d="M5 7h4M10.5 10.5L14 14" strokeLinecap="square" />
+    </svg>
+  );
+}
+
+export function IconReset({ size = 13, className }: IconProps) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6" className={className} aria-hidden="true">
+      <path d="M2.5 7.5A5.5 5.5 0 1 1 4 11.4M2.5 4v3.5H6" strokeLinecap="square" strokeLinejoin="miter" />
+    </svg>
+  );
+}
+
+export function IconPanelRight({ size = 14, className }: IconProps) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" className={className} aria-hidden="true">
+      <rect x="2" y="2.5" width="12" height="11" />
+      <path d="M10 2.5v11" />
+    </svg>
+  );
+}

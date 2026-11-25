@@ -566,3 +566,215 @@ async fn engine_test_uses_unsaved_draft_without_mutating_saved_settings() {
 
     mock_task.abort();
 }
+
+#[tokio::test]
+async fn sessions_raw_events_graph_context_and_recall_apis_work() {
+    let tmp = tempdir().unwrap();
+    let repo_dir = tmp.path().join("graph-repo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    let state = test_state(tmp.path());
+    let app = build_router(state.clone());
+
+    let proj = ox1_memory::project::resolve_project(&repo_dir);
+    state.db.upsert_project(&proj).unwrap();
+
+    // Hook prompt + PostToolUse (with null error)
+    let _ = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/hooks/antigravity?event=PreInvocation")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "cwd": repo_dir.to_string_lossy(),
+                        "conversationId": "conv-ui-1",
+                        "lastUserInput": "Fix auth rotation"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let _ = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/hooks/antigravity?event=PostToolUse")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "cwd": repo_dir.to_string_lossy(),
+                        "conversationId": "conv-ui-1",
+                        "tool_name": "edit_file",
+                        "tool_input": { "TargetFile": "src/auth.rs" },
+                        "error": null
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Create two linked memories
+    let m1 = state
+        .db
+        .create_memory(
+            ox1_memory::models::NewMemoryInput {
+                scope: Some("project".into()),
+                project_id: Some(proj.id.clone()),
+                session_id: None,
+                source_client: Some("codex".into()),
+                memory_type: "decision".into(),
+                title: "Session auth v1".into(),
+                summary: "Use signed cookies".into(),
+                content: "Initial signed cookie implementation in src/auth.rs".into(),
+                files: Some(vec!["src/auth.rs".into()]),
+                tags: Some(vec!["auth".into()]),
+                status: None,
+                supersedes_id: None,
+            },
+            None,
+        )
+        .unwrap();
+
+    let m2 = state
+        .db
+        .create_memory(
+            ox1_memory::models::NewMemoryInput {
+                scope: Some("project".into()),
+                project_id: Some(proj.id.clone()),
+                session_id: None,
+                source_client: Some("claude-code".into()),
+                memory_type: "decision".into(),
+                title: "Session auth v2".into(),
+                summary: "Rotate refresh tokens".into(),
+                content: "Added refresh rotation in src/auth.rs".into(),
+                files: Some(vec!["src/auth.rs".into()]),
+                tags: Some(vec!["auth".into()]),
+                status: Some("pinned".into()),
+                supersedes_id: Some(m1.id.clone()),
+            },
+            None,
+        )
+        .unwrap();
+
+    // SessionStart hook increments recall_count on m2
+    let _ = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/hooks/codex?event=SessionStart")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "cwd": repo_dir.to_string_lossy(),
+                        "session_id": "codex-recall-check"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let sessions = body_json(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(!sessions["sessions"].as_array().unwrap().is_empty());
+
+    let raw_events = body_json(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/raw-events")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    let evs = raw_events["events"].as_array().unwrap();
+    assert!(evs.iter().any(|e| e["event_type"] == "tool_use"));
+    assert!(!evs.iter().any(|e| e["event_type"] == "tool_error"));
+
+    let graph = body_json(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/graph?project_id={}&include_inactive=true",
+                        proj.id
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(graph["nodes"].as_array().unwrap().len(), 2);
+    assert!(!graph["edges"].as_array().unwrap().is_empty());
+
+    let ctx = body_json(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/memories/{}/context", m2.id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(ctx["memory"]["recall_count"], 1);
+    assert_eq!(ctx["lineage"].as_array().unwrap().len(), 2);
+    assert!(!ctx["neighbors"].as_array().unwrap().is_empty());
+
+    let preview = body_json(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/context-preview?project_id={}", proj.id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(!preview["sections"].as_array().unwrap().is_empty());
+    assert!(preview["archive_approx_tokens"].as_u64().unwrap() > 0);
+
+    let flush = body_json(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/distill/flush")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(flush["queued_sessions"].as_u64().unwrap() >= 1);
+}

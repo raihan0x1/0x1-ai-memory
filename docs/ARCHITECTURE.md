@@ -64,7 +64,7 @@ Primary research backing every integration detail:
 
 ---
 
-## 3. SQLite Storage Schema (7 Core Tables + 2 Search Indexes)
+## 3. SQLite Storage Schema (8 Core Tables + 2 Search Indexes)
 
 Designed to stay clean and cloud-sync-ready (UUIDv7/ULID-friendly string IDs, explicit timestamps, soft lifecycle states):
 
@@ -91,6 +91,7 @@ Designed to stay clean and cloud-sync-ready (UUIDv7/ULID-friendly string IDs, ex
    - `t3_watcher_enabled` (`true|false`)
    - `distill_idle_seconds` (default `120`)
    - `onboarding_completed` (`true|false`, auto-seeded `true` once for upgraded installs with existing data or client configs)
+8. **`memory_recall_stats`**: `memory_id`, `recall_count`, `last_recalled_at`, `clients_json` — lightweight cross-agent recall telemetry incremented only when `SessionStart`, `UserPromptSubmit`/`PreInvocation`, `memory_search`, or `memory_get` serves a memory.
 
 ---
 
@@ -123,8 +124,8 @@ Total tool definition footprint kept under ~550 tokens:
 ## 6. Embedded Web UI (1 SPA, Onboarding + 4 Dashboard Pages)
 
 0. **Onboarding (`/onboarding`)**: Distraction-free 4-step first-run flow (Welcome → AI Clients with combined diff preview → Memory Engine → Ready with opt-in Auto-Start toggle). Auto-skipped once for upgraded users; re-runnable anytime.
-1. **Live Stream (`/`)**: Real-time SSE cross-agent memory feed (color-coded badges: Claude / Codex / Antigravity / T3) + project filter + **Live Token & Cost Meter** showing today's spend vs daily budget cap.
-2. **Memories (`/memories`)**: True backend hybrid search (FTS5 + vector), inline edit/pin/supersede/delete, and a live **Context Preview** drawer showing the exact ~300–500 token briefing that will be injected into the next coding session.
+1. **Live Stream (`/`)**: Split 2-column Activity Console — left column shows real-time SSE cross-agent memories grouped by Day/Session/Flat with clickable tags/files and drawer inspection + **Live Token & Cost Meter**; right collapsible **Pipeline Rail** shows active/recent sessions with 1-click `Distill now` / `Flush pending` and a pauseable, aggregated **Live Event Tail**.
+2. **Memories (`/memories`)**: True backend hybrid search (FTS5 + vector), multi-axis grouping (`Project` / `Type` / `Session` / `File` / `Tag` / `Flat`), recall-hit sorting, interactive Canvas 2D + `d3-force` **Graph Map** with zero-LLM derived edges, a unified **Right Inspector Drawer** (edit, supersession lineage, timeline, 1-hop SVG neighborhood), and a **Briefing Preview** modal with token budget breakdown and progressive disclosure savings.
 3. **Connections (`/connections`)**: Auto-detected client cards with live heartbeat status, Port Mismatch detection & 1-click Reconnect, dry-run diff preview before connect, 1-click Connect/Disconnect/Test Ping, Codex `/hooks` 1-step callout, T3 watcher toggle, and Universal MCP snippet.
 4. **Engine & Budget (`/engine`)**: Clean ~12-setting form for provider selection (OpenRouter / Gemini / Ollama / OpenAI-compatible / Zero-LLM / Opt-in CLI), API key & model config, Test Connection button, strict zero-silent-fallback status, hard daily token/USD caps, plus Local Daemon status, opt-in Auto-Start toggle, and confirmed Stop Daemon control.
 

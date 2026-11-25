@@ -53,6 +53,12 @@ pub struct Memory {
     pub tags: Vec<String>,
     pub status: String, // "active" | "pinned" | "superseded" | "archived"
     pub superseded_by: Option<String>,
+    #[serde(default)]
+    pub recall_count: i64,
+    #[serde(default)]
+    pub last_recalled_at: Option<String>,
+    #[serde(default)]
+    pub last_recalled_clients: Vec<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -63,6 +69,8 @@ pub struct MemoryHit {
     pub scope: String,
     pub project_id: Option<String>,
     pub project_name: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
     pub source_client: String,
     pub memory_type: String,
     pub title: String,
@@ -70,6 +78,14 @@ pub struct MemoryHit {
     pub status: String,
     pub files: Vec<String>,
     pub tags: Vec<String>,
+    #[serde(default)]
+    pub superseded_by: Option<String>,
+    #[serde(default)]
+    pub recall_count: i64,
+    #[serde(default)]
+    pub last_recalled_at: Option<String>,
+    #[serde(default)]
+    pub last_recalled_clients: Vec<String>,
     pub updated_at: String,
     pub score: f64,
 }
@@ -108,8 +124,122 @@ pub struct SearchFilter {
     pub scope: Option<String>,
     pub memory_type: Option<String>,
     pub source_client: Option<String>,
+    pub tag: Option<String>,
+    pub file: Option<String>,
+    pub sort: Option<String>,
     pub include_inactive: Option<bool>,
     pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSummary {
+    pub id: String,
+    pub project_id: String,
+    pub project_name: Option<String>,
+    pub source_client: String,
+    pub branch: Option<String>,
+    pub started_at: String,
+    pub ended_at: Option<String>,
+    pub last_turn_at: String,
+    pub status: String,
+    pub pending_events: i64,
+    pub total_events: i64,
+    pub memory_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RawEventView {
+    pub id: String,
+    pub session_id: String,
+    pub project_id: String,
+    pub project_name: Option<String>,
+    pub source_client: String,
+    pub event_type: String,
+    pub tool_name: Option<String>,
+    pub preview: String,
+    pub distilled: bool,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphNode {
+    pub id: String,
+    pub title: String,
+    pub summary: String,
+    pub scope: String,
+    pub project_id: Option<String>,
+    pub project_name: Option<String>,
+    pub source_client: String,
+    pub memory_type: String,
+    pub status: String,
+    pub files: Vec<String>,
+    pub tags: Vec<String>,
+    pub session_id: Option<String>,
+    pub superseded_by: Option<String>,
+    pub recall_count: i64,
+    pub updated_at: String,
+    pub degree: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphEdge {
+    pub source: String,
+    pub target: String,
+    pub kind: String, // "supersedes" | "same_file" | "same_session" | "shared_tag" | "semantic_similar"
+    pub weight: f64,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryGraphResponse {
+    pub nodes: Vec<GraphNode>,
+    pub edges: Vec<GraphEdge>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NeighborLink {
+    pub memory: MemoryHit,
+    pub edge_kind: String,
+    pub weight: f64,
+    pub label: String,
+    pub direction: String, // "outgoing" | "incoming" | "undirected"
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryContextResponse {
+    pub memory: Memory,
+    pub timeline: Vec<MemoryHit>,
+    pub lineage: Vec<MemoryHit>,
+    pub neighbors: Vec<NeighborLink>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BriefingItemBreakdown {
+    pub id: String,
+    pub title: String,
+    pub source_client: String,
+    pub memory_type: String,
+    pub status: String,
+    pub approx_tokens: usize,
+    pub included: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BriefingSectionBreakdown {
+    pub kind: String, // "pinned" | "project" | "global"
+    pub label: String,
+    pub tokens: usize,
+    pub items: Vec<BriefingItemBreakdown>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ContextPreviewDetailed {
+    pub briefing: String,
+    pub memory_count: usize,
+    pub approx_tokens: usize,
+    pub token_budget: usize,
+    pub archive_approx_tokens: usize,
+    pub sections: Vec<BriefingSectionBreakdown>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

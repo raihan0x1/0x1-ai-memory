@@ -1,19 +1,41 @@
-import { useState, type FormEvent } from 'react';
-import { api, formatUtcTime } from '../api';
+import { useCallback, useEffect, useMemo, useState, type FormEvent } from 'react';
+import { api, formatUtcClock, formatUtcDayKey, formatUtcDayLabel, formatUtcTime } from '../api';
+import {
+  IconBolt,
+  IconChevronDown,
+  IconFile,
+  IconPanelRight,
+  IconPause,
+  IconPin,
+  IconPlay,
+  IconTag,
+} from '../components/Icons';
+import { MemoryInspectorDrawer } from '../components/MemoryInspectorDrawer';
 import { ModalDialog } from '../components/ModalDialog';
 import { RimSelect } from '../components/RimSelect';
-import type { MemoryHit, Project, UsageSummary } from '../types';
+import type {
+  LiveStreamItem,
+  MemoryHit,
+  Project,
+  RawEventView,
+  SessionSummary,
+  UsageSummary,
+} from '../types';
 import type { Tab } from '../App';
 
 interface StreamPageProps {
   summary: UsageSummary | null;
   projects: Project[];
   memories: MemoryHit[];
+  liveEvents: LiveStreamItem[];
   loading: boolean;
   sseConnected: boolean;
   onRefresh: () => Promise<void>;
-  onNavigate: (tab: Tab) => void;
+  onNavigate: (tab: Tab, queryParams?: Record<string, string>) => void;
 }
+
+type StreamGroupMode = 'day' | 'session' | 'flat';
+type TailFilter = 'all' | 'prompts' | 'tools' | 'distill';
 
 const CLIENT_OPTIONS = [
   { value: '', label: 'All AI clients' },
@@ -45,10 +67,39 @@ const TYPE_OPTIONS = [
   { value: 'session_summary', label: 'session_summary' },
 ];
 
+interface AggregatedTailRow {
+  key: string;
+  item: LiveStreamItem;
+  repeatCount: number;
+}
+
+function aggregateTail(items: LiveStreamItem[]): AggregatedTailRow[] {
+  const out: AggregatedTailRow[] = [];
+  for (const item of items) {
+    const canAggregate =
+      (item.event_type === 'tool_use' || item.event_type === 'tool_error') &&
+      Boolean(item.tool_name);
+    const prev = out[out.length - 1];
+    if (
+      canAggregate &&
+      prev &&
+      prev.item.session_id === item.session_id &&
+      prev.item.event_type === item.event_type &&
+      prev.item.tool_name === item.tool_name
+    ) {
+      prev.repeatCount += 1;
+    } else {
+      out.push({ key: item.id, item, repeatCount: 1 });
+    }
+  }
+  return out;
+}
+
 export function StreamPage({
   summary,
   projects,
   memories,
+  liveEvents,
   loading,
   sseConnected,
   onRefresh,
@@ -56,16 +107,54 @@ export function StreamPage({
 }: StreamPageProps) {
   const [projectFilter, setProjectFilter] = useState('');
   const [clientFilter, setClientFilter] = useState('');
+  const [groupMode, setGroupMode] = useState<StreamGroupMode>('day');
+  const [railVisible, setRailVisible] = useState(true);
+  const [collapsedGroups, setCollapsedGroups] = useState<Record<string, boolean>>({});
+  const [selectedMemoryId, setSelectedMemoryId] = useState<string | null>(null);
+
+  const [sessions, setSessions] = useState<SessionSummary[]>([]);
+  const [rawEvents, setRawEvents] = useState<RawEventView[]>([]);
+  const [pipelineLoading, setPipelineLoading] = useState(true);
+  const [pipelineError, setPipelineError] = useState<string | null>(null);
+  const [distillingId, setDistillingId] = useState<string | null>(null);
+  const [flushing, setFlushing] = useState(false);
+  const [pausedSnapshot, setPausedSnapshot] = useState<AggregatedTailRow[] | null>(null);
+  const [tailFilter, setTailFilter] = useState<TailFilter>('all');
+  const tailPaused = pausedSnapshot !== null;
+
   const [saveOpen, setSaveOpen] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
-
   const [title, setTitle] = useState('');
   const [summaryText, setSummaryText] = useState('');
   const [content, setContent] = useState('');
   const [memType, setMemType] = useState('decision');
   const [scope, setScope] = useState<'project' | 'global'>('project');
   const [targetProject, setTargetProject] = useState('');
+
+  const loadPipeline = useCallback(async () => {
+    setPipelineError(null);
+    try {
+      const [sRes, rRes] = await Promise.all([
+        api.sessions({ project_id: projectFilter || undefined, limit: 8 }),
+        api.rawEvents({
+          project_id: projectFilter || undefined,
+          client: clientFilter || undefined,
+          limit: 50,
+        }),
+      ]);
+      setSessions(sRes.sessions);
+      setRawEvents(rRes.events);
+    } catch (err) {
+      setPipelineError(err instanceof Error ? err.message : 'Failed to load pipeline activity');
+    } finally {
+      setPipelineLoading(false);
+    }
+  }, [projectFilter, clientFilter]);
+
+  useEffect(() => {
+    void loadPipeline();
+  }, [loadPipeline, memories.length, summary?.pending_raw_events, summary?.today_calls]);
 
   const tokenPct =
     summary && summary.daily_token_cap > 0
@@ -78,11 +167,99 @@ export function StreamPage({
   const budgetPct = Math.max(tokenPct, costPct);
   const meterClass = budgetPct >= 90 ? 'danger' : budgetPct >= 70 ? 'warn' : '';
 
-  const filtered = memories.filter((m) => {
-    if (projectFilter && m.project_id !== projectFilter && m.scope !== 'global') return false;
-    if (clientFilter && m.source_client !== clientFilter) return false;
-    return true;
-  });
+  const filtered = useMemo(
+    () =>
+      memories.filter((m) => {
+        if (projectFilter && m.project_id !== projectFilter && m.scope !== 'global') return false;
+        if (clientFilter && m.source_client !== clientFilter) return false;
+        return true;
+      }),
+    [memories, projectFilter, clientFilter],
+  );
+
+  const sessionMap = useMemo(() => {
+    const map = new Map<string, SessionSummary>();
+    for (const s of sessions) map.set(s.id, s);
+    return map;
+  }, [sessions]);
+
+  const groupedMemories = useMemo(() => {
+    if (groupMode === 'flat') {
+      return [{ key: 'all', label: `All recent (${filtered.length})`, items: filtered }];
+    }
+    const groups = new Map<string, { label: string; items: MemoryHit[] }>();
+    for (const m of filtered) {
+      let key: string;
+      let label: string;
+      if (groupMode === 'day') {
+        key = formatUtcDayKey(m.updated_at);
+        label = formatUtcDayLabel(m.updated_at);
+      } else {
+        key = m.session_id || `manual_${m.source_client}`;
+        const sess = m.session_id ? sessionMap.get(m.session_id) : undefined;
+        label = sess
+          ? `${sess.source_client} · ${sess.project_name ?? 'project'}${sess.branch ? ` (${sess.branch})` : ''}`
+          : m.session_id
+            ? `${m.source_client} · session ${m.session_id.slice(0, 12)}`
+            : `Manual / MCP (${m.source_client})`;
+      }
+      const existing = groups.get(key);
+      if (existing) existing.items.push(m);
+      else groups.set(key, { label, items: [m] });
+    }
+    return Array.from(groups.entries()).map(([key, g]) => ({ key, ...g }));
+  }, [filtered, groupMode, sessionMap]);
+
+  const liveTail = useMemo(() => {
+    const base: LiveStreamItem[] = rawEvents.map((ev) => ({
+      id: ev.id,
+      kind: 'raw_event',
+      timestamp: ev.created_at,
+      source_client: ev.source_client,
+      project_id: ev.project_id,
+      project_name: ev.project_name,
+      session_id: ev.session_id,
+      event_type: ev.event_type,
+      tool_name: ev.tool_name,
+      preview: ev.preview,
+    }));
+    const combined = [...liveEvents, ...base];
+    const seen = new Set<string>();
+    const deduped: LiveStreamItem[] = [];
+    for (const item of combined) {
+      if (seen.has(item.id)) continue;
+      seen.add(item.id);
+      if (projectFilter && item.project_id && item.project_id !== projectFilter) continue;
+      if (
+        clientFilter &&
+        item.source_client !== 'distill' &&
+        item.source_client !== clientFilter
+      ) {
+        continue;
+      }
+      if (tailFilter === 'prompts' && item.event_type !== 'prompt') continue;
+      if (
+        tailFilter === 'tools' &&
+        item.event_type !== 'tool_use' &&
+        item.event_type !== 'tool_error'
+      ) {
+        continue;
+      }
+      if (
+        tailFilter === 'distill' &&
+        item.kind !== 'usage_recorded' &&
+        item.kind !== 'memory_created' &&
+        item.event_type !== 'turn_stop'
+      ) {
+        continue;
+      }
+      deduped.push(item);
+      if (deduped.length >= 60) break;
+    }
+    return aggregateTail(deduped);
+  }, [rawEvents, liveEvents, projectFilter, clientFilter, tailFilter]);
+
+  const displayedTail = pausedSnapshot ?? liveTail;
 
   const activeProjectObj = projects.find((p) => p.id === projectFilter);
   const projectFilterOptions = [
@@ -90,6 +267,13 @@ export function StreamPage({
     ...projects.map((p) => ({ value: p.id, label: p.name, meta: p.privacy_mode })),
   ];
   const projectTargetOptions = projects.map((p) => ({ value: p.id, label: p.name }));
+  const totalRecalls = useMemo(
+    () => memories.reduce((acc, m) => acc + (m.recall_count || 0), 0),
+    [memories],
+  );
+  const activeSessionsCount = sessions.filter((s) => s.status === 'active').length;
+  const hasAnyPending = sessions.some((s) => s.pending_events > 0);
+  const isZeroLlm = !summary || summary.active_provider === 'none';
 
   async function handleSave(e: FormEvent) {
     e.preventDefault();
@@ -123,7 +307,36 @@ export function StreamPage({
     await onRefresh();
   }
 
-  const isZeroLlm = !summary || summary.active_provider === 'none';
+  async function handleTogglePin(m: MemoryHit) {
+    await api.updateMemory(m.id, { status: m.status === 'pinned' ? 'active' : 'pinned' });
+    await onRefresh();
+  }
+
+  async function handleDistillSession(sid: string) {
+    setDistillingId(sid);
+    setPipelineError(null);
+    try {
+      await api.distillSession(sid);
+      await Promise.all([onRefresh(), loadPipeline()]);
+    } catch (err) {
+      setPipelineError(err instanceof Error ? err.message : 'Failed to queue distillation');
+    } finally {
+      setDistillingId(null);
+    }
+  }
+
+  async function handleFlushPending() {
+    setFlushing(true);
+    setPipelineError(null);
+    try {
+      await api.distillFlush();
+      await Promise.all([onRefresh(), loadPipeline()]);
+    } catch (err) {
+      setPipelineError(err instanceof Error ? err.message : 'Failed to flush pending events');
+    } finally {
+      setFlushing(false);
+    }
+  }
 
   return (
     <div>
@@ -131,7 +344,7 @@ export function StreamPage({
         <div>
           <h1 className="page-title">Live cross-agent stream</h1>
           <p className="page-subtitle">
-            Unified local memory shared by Claude Code, Codex, Antigravity, and T3 Code.
+            Real-time capture and shared memory across Claude Code, Codex, Antigravity, and T3 Code.
           </p>
         </div>
         <div className="head-actions">
@@ -188,8 +401,8 @@ export function StreamPage({
             <div className="metric-value">{summary?.total_memories ?? 0}</div>
           </div>
           <span className="metric-sub measure">
-            {summary?.total_projects ?? 0} projects, {summary?.pending_raw_events ?? 0} queued raw
-            events
+            {summary?.total_projects ?? 0} projects · {totalRecalls} agent recalls ·{' '}
+            {summary?.pending_raw_events ?? 0} queued
           </span>
         </div>
 
@@ -200,7 +413,9 @@ export function StreamPage({
               {sseConnected ? 'Live' : 'Offline'}
             </div>
           </div>
-          <span className="metric-sub">{summary?.embedding_status ?? 'fts5'}</span>
+          <span className="metric-sub measure">
+            {summary?.embedding_status ?? 'fts5'} · {activeSessionsCount} active sessions
+          </span>
         </div>
       </section>
 
@@ -231,16 +446,29 @@ export function StreamPage({
           onChange={setClientFilter}
         />
 
+        <div className="seg-group" role="group" aria-label="Group stream memories">
+          {(
+            [
+              ['day', 'By Day'],
+              ['session', 'By Session'],
+              ['flat', 'Flat'],
+            ] as const
+          ).map(([mode, label]) => (
+            <button
+              key={mode}
+              type="button"
+              className="seg-btn"
+              aria-pressed={groupMode === mode}
+              onClick={() => setGroupMode(mode)}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+
         {activeProjectObj ? (
-          <div
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              gap: 'var(--space-xs)',
-              marginLeft: 'auto',
-            }}
-          >
-            <span className="field-hint">Project privacy</span>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-xs)' }}>
+            <span className="field-hint">Privacy</span>
             <RimSelect
               id="proj-privacy"
               ariaLabel="Project privacy mode"
@@ -250,79 +478,389 @@ export function StreamPage({
             />
           </div>
         ) : null}
+
+        <button
+          type="button"
+          className="btn"
+          style={{ marginLeft: 'auto' }}
+          aria-pressed={railVisible}
+          onClick={() => setRailVisible((v) => !v)}
+        >
+          <IconPanelRight size={14} />
+          {railVisible ? 'Hide pipeline' : 'Show pipeline'}
+        </button>
       </div>
 
-      <section className="panel" aria-label="Recent cross-agent memories">
-        <div className="panel-header">
-          <h2 className="panel-title">Recent memories ({filtered.length})</h2>
-          <button type="button" className="btn btn-ghost" onClick={() => onNavigate('memories')}>
-            Search all
-          </button>
-        </div>
+      <div className={railVisible ? 'stream-layout' : ''}>
+        <section className="panel" aria-label="Recent cross-agent memories">
+          <div className="panel-header">
+            <h2 className="panel-title">Recent memories ({filtered.length})</h2>
+            <button type="button" className="btn btn-ghost" onClick={() => onNavigate('memories')}>
+              Search &amp; graph
+            </button>
+          </div>
 
-        {loading ? (
-          <div aria-busy="true" aria-label="Loading memories">
-            {[0, 1, 2].map((i) => (
-              <div key={i} className="skeleton-row">
-                <div className="skeleton-bar skeleton-bar--short" />
-                <div className="skeleton-bar skeleton-bar--wide" />
-              </div>
-            ))}
-          </div>
-        ) : filtered.length === 0 ? (
-          <div className="empty-state">
-            <p>
-              No memories recorded yet. Connect Claude Code, Codex, Antigravity, or T3 Code, or save
-              a decision directly.
-            </p>
-            <span className="field-hint measure">
-              Local MCP ready at {window.location.origin}/mcp
-            </span>
-            <div className="head-actions">
-              <button
-                type="button"
-                className="btn btn-primary"
-                onClick={() => onNavigate('onboarding')}
-              >
-                Open onboarding
-              </button>
-              <button type="button" className="btn" onClick={() => setSaveOpen(true)}>
-                Save first memory
-              </button>
-            </div>
-          </div>
-        ) : (
-          <ul className="ledger">
-            {filtered.map((m) => (
-              <li key={m.id} className="ledger-row">
-                <div className="ledger-summary">
-                  <div className="ledger-client">
-                    <span className={`tag ${m.source_client}`}>{m.source_client}</span>
-                    <span className="field-hint">{m.memory_type}</span>
-                  </div>
-                  <div className="ledger-main">
-                    <h3 className="ledger-title">{m.title}</h3>
-                    <p className="ledger-desc">{m.summary}</p>
-                    <div className="tag-row">
-                      {m.status === 'pinned' ? <span className="tag accent">pinned</span> : null}
-                      {m.scope === 'global' ? (
-                        <span className="tag">global</span>
-                      ) : m.project_name ? (
-                        <span className="tag">{m.project_name}</span>
-                      ) : null}
-                    </div>
-                  </div>
-                  <div className="ledger-aside">
-                    <time className="field-hint measure" dateTime={m.updated_at}>
-                      {formatUtcTime(m.updated_at)}
-                    </time>
-                  </div>
+          {loading ? (
+            <div aria-busy="true" aria-label="Loading memories">
+              {[0, 1, 2].map((i) => (
+                <div key={i} className="skeleton-row">
+                  <div className="skeleton-bar skeleton-bar--short" />
+                  <div className="skeleton-bar skeleton-bar--wide" />
                 </div>
-              </li>
-            ))}
-          </ul>
-        )}
-      </section>
+              ))}
+            </div>
+          ) : filtered.length === 0 ? (
+            <div className="empty-state">
+              <p>
+                No memories recorded yet. Connect Claude Code, Codex, Antigravity, or T3 Code, or
+                save a decision directly.
+              </p>
+              <span className="field-hint measure">
+                Local MCP ready at {window.location.origin}/mcp
+              </span>
+              <div className="head-actions">
+                <button
+                  type="button"
+                  className="btn btn-primary"
+                  onClick={() => onNavigate('onboarding')}
+                >
+                  Open onboarding
+                </button>
+                <button type="button" className="btn" onClick={() => setSaveOpen(true)}>
+                  Save first memory
+                </button>
+              </div>
+            </div>
+          ) : (
+            <div>
+              {groupedMemories.map((group) => {
+                const isCollapsed = Boolean(collapsedGroups[group.key]);
+                return (
+                  <div key={group.key} className="group-block">
+                    {groupMode !== 'flat' ? (
+                      <button
+                        type="button"
+                        className="group-head"
+                        aria-expanded={!isCollapsed}
+                        onClick={() =>
+                          setCollapsedGroups((prev) => ({
+                            ...prev,
+                            [group.key]: !prev[group.key],
+                          }))
+                        }
+                      >
+                        <span className="group-head-left">
+                          <IconChevronDown size={13} className="group-chevron" />
+                          <span>{group.label}</span>
+                        </span>
+                        <span className="tag measure">{group.items.length}</span>
+                      </button>
+                    ) : null}
+
+                    {!isCollapsed ? (
+                      <ul className="ledger">
+                        {group.items.map((m) => (
+                          <li
+                            key={m.id}
+                            className="ledger-row ledger-row--clickable"
+                            data-selected={selectedMemoryId === m.id}
+                            onClick={() => setSelectedMemoryId(m.id)}
+                          >
+                            <div className="ledger-summary">
+                              <div className="ledger-client">
+                                <span className={`tag ${m.source_client}`}>{m.source_client}</span>
+                                <span className="field-hint">{m.memory_type}</span>
+                              </div>
+
+                              <div className="ledger-main">
+                                <h3 className="ledger-title">{m.title}</h3>
+                                <p className="ledger-desc">{m.summary}</p>
+                                <div className="tag-row">
+                                  {m.status === 'pinned' ? (
+                                    <span className="tag accent">pinned</span>
+                                  ) : null}
+                                  {m.scope === 'global' ? (
+                                    <span className="tag">global</span>
+                                  ) : m.project_name ? (
+                                    <span className="tag">{m.project_name}</span>
+                                  ) : null}
+                                  {m.recall_count > 0 ? (
+                                    <span className="tag ok measure">
+                                      recalled {m.recall_count}x
+                                    </span>
+                                  ) : null}
+                                  {m.tags.slice(0, 3).map((t) => (
+                                    <button
+                                      key={t}
+                                      type="button"
+                                      className="chip"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        onNavigate('memories', { tag: t });
+                                      }}
+                                    >
+                                      <IconTag size={10} />
+                                      {t}
+                                    </button>
+                                  ))}
+                                  {m.tags.length > 3 ? (
+                                    <span className="field-hint measure">
+                                      +{m.tags.length - 3}
+                                    </span>
+                                  ) : null}
+                                  {m.files.slice(0, 2).map((f) => (
+                                    <button
+                                      key={f}
+                                      type="button"
+                                      className="chip chip--file"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        onNavigate('memories', { file: f });
+                                      }}
+                                    >
+                                      <IconFile size={10} />
+                                      {f}
+                                    </button>
+                                  ))}
+                                  {m.files.length > 2 ? (
+                                    <span className="field-hint measure">
+                                      +{m.files.length - 2} files
+                                    </span>
+                                  ) : null}
+                                </div>
+                              </div>
+
+                              <div
+                                className="ledger-aside"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                }}
+                              >
+                                <time className="field-hint measure" dateTime={m.updated_at}>
+                                  {formatUtcTime(m.updated_at)}
+                                </time>
+                                <div className="tag-row">
+                                  <button
+                                    type="button"
+                                    className="btn-subtle"
+                                    onClick={() => setSelectedMemoryId(m.id)}
+                                  >
+                                    Inspect
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="btn-subtle"
+                                    onClick={() => void handleTogglePin(m)}
+                                  >
+                                    <IconPin size={11} />
+                                    {m.status === 'pinned' ? 'Unpin' : 'Pin'}
+                                  </button>
+                                </div>
+                              </div>
+                            </div>
+                          </li>
+                        ))}
+                      </ul>
+                    ) : null}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </section>
+
+        {railVisible ? (
+          <aside className="stream-rail" aria-label="Live capture and distillation pipeline">
+            {pipelineError ? (
+              <div className="callout danger">
+                <span>{pipelineError}</span>
+                <button type="button" className="btn btn-danger" onClick={() => void loadPipeline()}>
+                  Retry
+                </button>
+              </div>
+            ) : null}
+
+            <section className="panel">
+              <div className="panel-header">
+                <h2 className="panel-title">Sessions &amp; queue</h2>
+                {hasAnyPending && !isZeroLlm ? (
+                  <button
+                    type="button"
+                    className="btn-subtle"
+                    disabled={flushing}
+                    onClick={() => void handleFlushPending()}
+                  >
+                    <IconBolt size={12} />
+                    {flushing ? 'Flushing...' : 'Flush pending'}
+                  </button>
+                ) : null}
+              </div>
+
+              {isZeroLlm && (summary?.pending_raw_events ?? 0) > 0 ? (
+                <div className="callout warn" style={{ margin: 'var(--space-sm)' }}>
+                  <span>
+                    Zero-LLM mode active: configure a provider in Engine to auto-distill raw
+                    events.
+                  </span>
+                </div>
+              ) : null}
+
+              {pipelineLoading ? (
+                <div className="skeleton-row">
+                  <div className="skeleton-bar skeleton-bar--wide" />
+                </div>
+              ) : sessions.length === 0 ? (
+                <div className="empty-state" style={{ paddingBlock: 'var(--space-lg)' }}>
+                  <p>No sessions captured yet.</p>
+                </div>
+              ) : (
+                <ul className="session-list">
+                  {sessions.slice(0, 6).map((s) => (
+                    <li key={s.id} className="session-row">
+                      <div className="session-row-top">
+                        <div className="tag-row">
+                          <span className={`tag ${s.source_client}`}>{s.source_client}</span>
+                          <span style={{ fontSize: 'var(--text-sm)', fontWeight: 500 }}>
+                            {s.project_name ?? 'workspace'}
+                          </span>
+                          {s.branch ? <span className="tag measure">{s.branch}</span> : null}
+                        </div>
+                        <span className={`tag ${s.status === 'active' ? 'ok' : ''}`}>
+                          {s.status}
+                        </span>
+                      </div>
+
+                      <div className="session-row-meta">
+                        <span className="field-hint measure">
+                          {s.pending_events} queued · {s.memory_count} mem ·{' '}
+                          {formatUtcClock(s.last_turn_at)}
+                        </span>
+                        {s.pending_events > 0 && !isZeroLlm ? (
+                          <button
+                            type="button"
+                            className="btn-subtle"
+                            disabled={distillingId === s.id}
+                            onClick={() => void handleDistillSession(s.id)}
+                          >
+                            <IconBolt size={11} />
+                            {distillingId === s.id ? 'Queuing...' : 'Distill now'}
+                          </button>
+                        ) : null}
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </section>
+
+            <section className="panel">
+              <div className="panel-header">
+                <h2 className="panel-title">Live event tail</h2>
+                <button
+                  type="button"
+                  className="btn-subtle"
+                  aria-pressed={tailPaused}
+                  onClick={() => setPausedSnapshot((prev) => (prev === null ? liveTail : null))}
+                >
+                  {tailPaused ? <IconPlay size={12} /> : <IconPause size={12} />}
+                  {tailPaused ? 'Resume' : 'Pause'}
+                </button>
+              </div>
+
+              <div
+                className="panel-header"
+                style={{
+                  background: 'var(--color-paper-3)',
+                  borderBottomColor: 'var(--color-rule-2)',
+                  paddingBlock: 'var(--space-xs)',
+                }}
+              >
+                <div className="seg-group" role="group" aria-label="Filter live event tail">
+                  {(
+                    [
+                      ['all', 'All'],
+                      ['prompts', 'Prompts'],
+                      ['tools', 'Tools'],
+                      ['distill', 'Distill'],
+                    ] as const
+                  ).map(([kind, label]) => (
+                    <button
+                      key={kind}
+                      type="button"
+                      className="seg-btn"
+                      aria-pressed={tailFilter === kind}
+                      onClick={() => setTailFilter(kind)}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {pipelineLoading && displayedTail.length === 0 ? (
+                <div className="skeleton-row" aria-busy="true">
+                  <div className="skeleton-bar skeleton-bar--short" />
+                  <div className="skeleton-bar skeleton-bar--wide" />
+                </div>
+              ) : displayedTail.length === 0 ? (
+                <div className="empty-state" style={{ paddingBlock: 'var(--space-lg)' }}>
+                  <p>Waiting for hook or MCP activity.</p>
+                </div>
+              ) : (
+                <ul className="event-tail">
+                  {displayedTail.map(({ key, item, repeatCount }) => {
+                    const isErr =
+                      item.event_type === 'tool_error' ||
+                      item.status === 'error' ||
+                      item.status === 'budget_blocked';
+                    const isGood =
+                      item.kind === 'memory_created' ||
+                      (item.kind === 'usage_recorded' && item.status === 'ok');
+                    return (
+                      <li key={key} className="event-row">
+                        <div className="event-row-top">
+                          <div className="tag-row">
+                            <span className={`tag ${item.source_client}`}>
+                              {item.source_client}
+                            </span>
+                            <span
+                              className={`tag ${isErr ? 'danger' : isGood ? 'ok' : ''}`}
+                            >
+                              {item.tool_name ?? item.event_type}
+                              {repeatCount > 1 ? ` x${repeatCount}` : ''}
+                            </span>
+                          </div>
+                          <time className="field-hint measure" dateTime={item.timestamp}>
+                            {formatUtcClock(item.timestamp)}
+                          </time>
+                        </div>
+                        <span className="event-preview" title={item.preview}>
+                          {item.preview}
+                        </span>
+                      </li>
+                    );
+                  })}
+                </ul>
+              )}
+            </section>
+          </aside>
+        ) : null}
+      </div>
+
+      <MemoryInspectorDrawer
+        memoryId={selectedMemoryId}
+        onClose={() => setSelectedMemoryId(null)}
+        onSelectMemory={(id) => setSelectedMemoryId(id)}
+        onFilterTag={(t) => {
+          setSelectedMemoryId(null);
+          onNavigate('memories', { tag: t });
+        }}
+        onFilterFile={(f) => {
+          setSelectedMemoryId(null);
+          onNavigate('memories', { file: f });
+        }}
+        onMutated={onRefresh}
+      />
 
       <ModalDialog
         open={saveOpen}

@@ -373,7 +373,7 @@ export function EnginePage({
                   type="password"
                   className="input input--mono"
                   autoComplete="off"
-                  placeholder="Leave blank to keep existing, or enter key / env:VAR_NAME"
+                  placeholder="Blank to keep current, or enter key / env:VAR"
                   value={apiKeyInput}
                   onChange={(e) => setApiKeyInput(e.target.value)}
                 />
@@ -415,6 +415,7 @@ export function EnginePage({
           <div className="grid-2">
             <div className="field">
               <label htmlFor="eng-emb">Embeddings mode (1 runtime, no Python)</label>
+              <span className="field-hint">Local fastembed ONNX runs offline at $0</span>
               <RimSelect
                 id="eng-emb"
                 ariaLabel="Embeddings mode"

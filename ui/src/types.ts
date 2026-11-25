@@ -13,6 +13,7 @@ export interface MemoryHit {
   scope: 'project' | 'global';
   project_id: string | null;
   project_name: string | null;
+  session_id: string | null;
   source_client: string;
   memory_type: string;
   title: string;
@@ -20,15 +21,122 @@ export interface MemoryHit {
   status: 'active' | 'pinned' | 'superseded' | 'archived';
   files: string[];
   tags: string[];
+  superseded_by: string | null;
+  recall_count: number;
+  last_recalled_at: string | null;
+  last_recalled_clients: string[];
   updated_at: string;
   score: number;
 }
 
 export interface MemoryDetail extends MemoryHit {
-  session_id: string | null;
   content: string;
-  superseded_by: string | null;
   created_at: string;
+}
+
+export interface SessionSummary {
+  id: string;
+  project_id: string;
+  project_name: string | null;
+  source_client: string;
+  branch: string | null;
+  started_at: string;
+  ended_at: string | null;
+  last_turn_at: string;
+  status: 'active' | 'ended';
+  pending_events: number;
+  total_events: number;
+  memory_count: number;
+}
+
+export interface RawEventView {
+  id: string;
+  session_id: string;
+  project_id: string;
+  project_name: string | null;
+  source_client: string;
+  event_type: string;
+  tool_name: string | null;
+  preview: string;
+  distilled: boolean;
+  created_at: string;
+}
+
+export interface LiveStreamItem {
+  id: string;
+  kind:
+    | 'raw_event'
+    | 'usage_recorded'
+    | 'memory_created'
+    | 'memory_updated'
+    | 'memory_deleted'
+    | 'connection_changed';
+  timestamp: string;
+  source_client: string;
+  project_id: string | null;
+  project_name: string | null;
+  session_id: string | null;
+  event_type: string;
+  tool_name: string | null;
+  preview: string;
+  status?: string;
+  tokens?: number;
+  cost_usd?: number;
+  memory_id?: string;
+}
+
+export type GraphEdgeKind =
+  | 'supersedes'
+  | 'same_file'
+  | 'same_session'
+  | 'shared_tag'
+  | 'semantic_similar';
+
+export interface GraphNode {
+  id: string;
+  title: string;
+  summary: string;
+  scope: 'project' | 'global';
+  project_id: string | null;
+  project_name: string | null;
+  source_client: string;
+  memory_type: string;
+  status: 'active' | 'pinned' | 'superseded' | 'archived';
+  files: string[];
+  tags: string[];
+  session_id: string | null;
+  superseded_by: string | null;
+  recall_count: number;
+  updated_at: string;
+  degree: number;
+}
+
+export interface GraphEdge {
+  source: string;
+  target: string;
+  kind: GraphEdgeKind;
+  weight: number;
+  label: string;
+}
+
+export interface MemoryGraphResponse {
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+}
+
+export interface NeighborLink {
+  memory: MemoryHit;
+  edge_kind: GraphEdgeKind;
+  weight: number;
+  label: string;
+  direction: 'outgoing' | 'incoming' | 'undirected';
+}
+
+export interface MemoryContextResponse {
+  memory: MemoryDetail;
+  timeline: MemoryHit[];
+  lineage: MemoryHit[];
+  neighbors: NeighborLink[];
 }
 
 export interface UsageSummary {
@@ -142,9 +250,28 @@ export interface ConnectionTestResult {
   message: string;
 }
 
+export interface BriefingItemBreakdown {
+  id: string;
+  title: string;
+  source_client: string;
+  memory_type: string;
+  status: string;
+  approx_tokens: number;
+  included: boolean;
+}
+
+export interface BriefingSectionBreakdown {
+  kind: 'pinned' | 'project' | 'global';
+  label: string;
+  tokens: number;
+  items: BriefingItemBreakdown[];
+}
+
 export interface ContextPreviewResponse {
   briefing: string;
   memory_count: number;
   approx_tokens: number;
   token_budget: number;
+  archive_approx_tokens: number;
+  sections: BriefingSectionBreakdown[];
 }

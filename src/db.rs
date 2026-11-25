@@ -184,6 +184,13 @@ impl MemoryDb {
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS memory_recall_stats (
+                memory_id TEXT PRIMARY KEY,
+                recall_count INTEGER NOT NULL DEFAULT 0,
+                last_recalled_at TEXT,
+                clients_json TEXT NOT NULL DEFAULT '[]'
+            );
             "
         ))?;
         Ok(())
@@ -462,6 +469,44 @@ impl MemoryDb {
         Ok(())
     }
 
+    pub fn list_sessions(
+        &self,
+        project_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<SessionSummary>> {
+        let limit = limit.clamp(1, 50) as i64;
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT s.id, s.project_id, p.name, s.source_client, s.branch,
+                    s.started_at, s.ended_at, s.last_turn_at, s.status,
+                    COALESCE((SELECT COUNT(*) FROM raw_events r WHERE r.session_id = s.id AND r.distilled = 0), 0),
+                    COALESCE((SELECT COUNT(*) FROM raw_events r WHERE r.session_id = s.id), 0),
+                    COALESCE((SELECT COUNT(*) FROM memories m WHERE m.session_id = s.id), 0)
+             FROM sessions s
+             LEFT JOIN projects p ON p.id = s.project_id
+             WHERE (?1 IS NULL OR s.project_id = ?1)
+             ORDER BY s.last_turn_at DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![project_id, limit], |r| {
+            Ok(SessionSummary {
+                id: r.get(0)?,
+                project_id: r.get(1)?,
+                project_name: r.get(2)?,
+                source_client: r.get(3)?,
+                branch: r.get(4)?,
+                started_at: r.get(5)?,
+                ended_at: r.get(6)?,
+                last_turn_at: r.get(7)?,
+                status: r.get(8)?,
+                pending_events: r.get(9)?,
+                total_events: r.get(10)?,
+                memory_count: r.get(11)?,
+            })
+        })?;
+        Ok(rows.filter_map(Result::ok).collect())
+    }
+
     // --- Raw Events (0-token capture) ---
 
     pub fn insert_raw_event(
@@ -527,6 +572,60 @@ impl MemoryDb {
              LIMIT 10",
         )?;
         let rows = stmt.query_map(params![cutoff], |r| r.get::<_, String>(0))?;
+        Ok(rows.filter_map(Result::ok).collect())
+    }
+
+    pub fn sessions_with_any_pending_events(&self, limit: usize) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let limit = limit.clamp(1, 50) as i64;
+        let mut stmt = conn.prepare(
+            "SELECT r.session_id
+             FROM raw_events r
+             WHERE r.distilled = 0
+             GROUP BY r.session_id
+             ORDER BY MAX(r.created_at) DESC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], |r| r.get::<_, String>(0))?;
+        Ok(rows.filter_map(Result::ok).collect())
+    }
+
+    pub fn recent_raw_events(
+        &self,
+        project_id: Option<&str>,
+        client: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<RawEventView>> {
+        let limit = limit.clamp(1, 100) as i64;
+        let norm_client = client.map(|c| normalize_client(Some(c)));
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT r.id, r.session_id, r.project_id, p.name, r.source_client,
+                    r.event_type, r.tool_name, r.payload_json, r.distilled, r.created_at
+             FROM raw_events r
+             LEFT JOIN projects p ON p.id = r.project_id
+             WHERE (?1 IS NULL OR r.project_id = ?1)
+               AND (?2 IS NULL OR r.source_client = ?2)
+             ORDER BY r.created_at DESC
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![project_id, norm_client, limit], |r| {
+            let event_type: String = r.get(5)?;
+            let tool_name: Option<String> = r.get(6)?;
+            let payload_json: String = r.get(7)?;
+            Ok(RawEventView {
+                id: r.get(0)?,
+                session_id: r.get(1)?,
+                project_id: r.get(2)?,
+                project_name: r.get(3)?,
+                source_client: r.get(4)?,
+                preview: summarize_raw_payload(&event_type, tool_name.as_deref(), &payload_json),
+                event_type,
+                tool_name,
+                distilled: r.get::<_, i64>(8)? != 0,
+                created_at: r.get(9)?,
+            })
+        })?;
         Ok(rows.filter_map(Result::ok).collect())
     }
 
@@ -670,6 +769,9 @@ impl MemoryDb {
             tags,
             status,
             superseded_by: None,
+            recall_count: 0,
+            last_recalled_at: None,
+            last_recalled_clients: Vec::new(),
             created_at: now.clone(),
             updated_at: now,
         })
@@ -703,20 +805,65 @@ impl MemoryDb {
         }
         let conn = self.conn.lock().unwrap();
         let mut out = Vec::with_capacity(ids.len());
-        let mut stmt = conn.prepare(
-            "SELECT m.id, m.scope, m.project_id, p.name, m.session_id, m.source_client,
-                    m.memory_type, m.title, m.summary, m.content, m.files_json, m.tags_json,
-                    m.status, m.superseded_by, m.created_at, m.updated_at
-             FROM memories m
-             LEFT JOIN projects p ON p.id = m.project_id
-             WHERE m.id = ?1",
-        )?;
+        let sql = format!("{MEMORY_SELECT} WHERE m.id = ?1");
+        let mut stmt = conn.prepare(&sql)?;
         for id in ids {
             if let Some(mem) = stmt.query_row(params![id], row_to_memory).optional()? {
                 out.push(mem);
             }
         }
         Ok(out)
+    }
+
+    pub fn record_memory_recalls(&self, ids: &[String], client: &str) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let mut seen = HashSet::new();
+        let unique_ids: Vec<&str> = ids
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty() && seen.insert(*s))
+            .collect();
+        if unique_ids.is_empty() {
+            return Ok(());
+        }
+        let norm_client = normalize_client(Some(client));
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        for id in unique_ids {
+            let existing: Option<(i64, String)> = tx
+                .query_row(
+                    "SELECT recall_count, clients_json FROM memory_recall_stats WHERE memory_id = ?1",
+                    params![id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            if let Some((count, clients_json)) = existing {
+                let mut clients: Vec<String> =
+                    serde_json::from_str(&clients_json).unwrap_or_default();
+                clients.retain(|c| c != &norm_client);
+                clients.insert(0, norm_client.clone());
+                clients.truncate(8);
+                let updated_clients = serde_json::to_string(&clients)?;
+                tx.execute(
+                    "UPDATE memory_recall_stats
+                     SET recall_count = ?2, last_recalled_at = ?3, clients_json = ?4
+                     WHERE memory_id = ?1",
+                    params![id, count + 1, now, updated_clients],
+                )?;
+            } else {
+                let clients_json = serde_json::to_string(&vec![norm_client.clone()])?;
+                tx.execute(
+                    "INSERT INTO memory_recall_stats(memory_id, recall_count, last_recalled_at, clients_json)
+                     VALUES (?1, 1, ?2, ?3)",
+                    params![id, now, clients_json],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn update_memory(
@@ -804,6 +951,10 @@ impl MemoryDb {
                 "DELETE FROM memories_vec WHERE memory_rowid = ?1",
                 params![rowid],
             );
+            let _ = tx.execute(
+                "DELETE FROM memory_recall_stats WHERE memory_id = ?1",
+                params![id],
+            );
             tx.execute("DELETE FROM memories WHERE id = ?1", params![id])?;
             tx.commit()?;
             Ok(true)
@@ -818,7 +969,7 @@ impl MemoryDb {
         filter: &SearchFilter,
         query_embedding: Option<&[f32]>,
     ) -> Result<Vec<MemoryHit>> {
-        let limit = filter.limit.unwrap_or(20).clamp(1, 100);
+        let limit = filter.limit.unwrap_or(20).clamp(1, 250);
         let include_inactive = filter.include_inactive.unwrap_or(false);
         let query = filter.query.as_deref().unwrap_or("").trim();
 
@@ -882,35 +1033,12 @@ impl MemoryDb {
         }
 
         let mut hits = Vec::new();
-        let mut stmt = conn.prepare(
-            "SELECT m.rowid, m.id, m.scope, m.project_id, p.name, m.source_client,
-                    m.memory_type, m.title, m.summary, m.status, m.files_json, m.tags_json, m.updated_at
-             FROM memories m
-             LEFT JOIN projects p ON p.id = m.project_id
-             WHERE m.rowid = ?1",
-        )?;
+        let sql = format!("{MEMORY_HIT_SELECT} WHERE m.rowid = ?1");
+        let mut stmt = conn.prepare(&sql)?;
 
         for (rowid, base_score) in rrf_scores {
             let Some(mut hit) = stmt
-                .query_row(params![rowid], |r| {
-                    let files_json: String = r.get(10)?;
-                    let tags_json: String = r.get(11)?;
-                    Ok(MemoryHit {
-                        id: r.get(1)?,
-                        scope: r.get(2)?,
-                        project_id: r.get(3)?,
-                        project_name: r.get(4)?,
-                        source_client: r.get(5)?,
-                        memory_type: r.get(6)?,
-                        title: r.get(7)?,
-                        summary: r.get(8)?,
-                        status: r.get(9)?,
-                        files: serde_json::from_str(&files_json).unwrap_or_default(),
-                        tags: serde_json::from_str(&tags_json).unwrap_or_default(),
-                        updated_at: r.get(12)?,
-                        score: base_score,
-                    })
-                })
+                .query_row(params![rowid], |r| row_to_memory_hit(r, base_score))
                 .optional()?
             else {
                 continue;
@@ -930,12 +1058,25 @@ impl MemoryDb {
             hits.push(hit);
         }
 
-        hits.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| b.updated_at.cmp(&a.updated_at))
-        });
+        if filter.sort.as_deref() == Some("most_recalled") {
+            hits.sort_by(|a, b| {
+                b.recall_count
+                    .cmp(&a.recall_count)
+                    .then_with(|| {
+                        b.score
+                            .partial_cmp(&a.score)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .then_with(|| b.updated_at.cmp(&a.updated_at))
+            });
+        } else {
+            hits.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| b.updated_at.cmp(&a.updated_at))
+            });
+        }
         hits.truncate(limit);
         Ok(hits)
     }
@@ -949,57 +1090,140 @@ impl MemoryDb {
         let before = before.clamp(0, 20);
         let after = after.clamp(0, 20);
         let conn = self.conn.lock().unwrap();
+        memory_timeline_locked(&conn, anchor_id, before, after)
+    }
 
-        let anchor: Option<(String, Option<String>)> = conn
-            .query_row(
-                "SELECT created_at, project_id FROM memories WHERE id = ?1",
-                params![anchor_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-
-        let Some((anchor_time, project_id)) = anchor else {
-            return Ok(Vec::new());
+    pub fn memory_context(&self, memory_id: &str) -> Result<Option<MemoryContextResponse>> {
+        let conn = self.conn.lock().unwrap();
+        let mem_sql = format!("{MEMORY_SELECT} WHERE m.id = ?1");
+        let Some(memory) = conn
+            .query_row(&mem_sql, params![memory_id], row_to_memory)
+            .optional()?
+        else {
+            return Ok(None);
         };
 
-        let mut older =
-            query_timeline_side(&conn, project_id.as_deref(), &anchor_time, true, before)?;
-        older.reverse();
-        // Query anchor directly on the already-locked connection (never re-lock self.conn!).
-        let anchor_mem = conn
-            .query_row(
-                "SELECT m.id, m.scope, m.project_id, p.name, m.session_id, m.source_client,
-                        m.memory_type, m.title, m.summary, m.content, m.files_json, m.tags_json,
-                        m.status, m.superseded_by, m.created_at, m.updated_at
-                 FROM memories m
-                 LEFT JOIN projects p ON p.id = m.project_id
-                 WHERE m.id = ?1",
-                params![anchor_id],
-                row_to_memory,
-            )
-            .optional()?;
-        let newer = query_timeline_side(&conn, project_id.as_deref(), &anchor_time, false, after)?;
+        let timeline = memory_timeline_locked(&conn, memory_id, 5, 5)?;
+        let lineage = memory_lineage_locked(&conn, &memory)?;
 
-        let mut out = older;
-        if let Some(m) = anchor_mem {
-            out.push(MemoryHit {
-                id: m.id,
-                scope: m.scope,
-                project_id: m.project_id,
-                project_name: m.project_name,
-                source_client: m.source_client,
-                memory_type: m.memory_type,
-                title: m.title,
-                summary: m.summary,
-                status: m.status,
-                files: m.files,
-                tags: m.tags,
-                updated_at: m.updated_at,
-                score: 1.0,
-            });
+        let candidate_filter = SearchFilter {
+            project_id: memory.project_id.clone(),
+            ..Default::default()
+        };
+        let mut records = load_graph_records_locked(&conn, &candidate_filter, true, 160)?;
+        let mut seen_ids: HashSet<String> = records.iter().map(|r| r.hit.id.clone()).collect();
+        let extra_ids: Vec<String> = std::iter::once(memory.id.clone())
+            .chain(lineage.iter().map(|h| h.id.clone()))
+            .filter(|id| seen_ids.insert(id.clone()))
+            .collect();
+        if !extra_ids.is_empty() {
+            let extra_sql = format!("{GRAPH_NODE_SELECT} WHERE m.id = ?1");
+            let mut stmt = conn.prepare(&extra_sql)?;
+            for id in extra_ids {
+                if let Some(rec) = stmt
+                    .query_row(params![id], row_to_graph_record)
+                    .optional()?
+                {
+                    records.push(rec);
+                }
+            }
         }
-        out.extend(newer);
-        Ok(out)
+
+        let by_id: HashMap<String, MemoryHit> = records
+            .iter()
+            .map(|r| (r.hit.id.clone(), r.hit.clone()))
+            .collect();
+        let edges = compute_edges_for_nodes_locked(&conn, &records);
+        let mut neighbors = Vec::new();
+        for edge in edges {
+            if edge.source != memory_id && edge.target != memory_id {
+                continue;
+            }
+            let (other_id, direction) = if edge.source == memory_id {
+                let dir = if edge.kind == "supersedes" {
+                    "outgoing"
+                } else {
+                    "undirected"
+                };
+                (&edge.target, dir)
+            } else {
+                let dir = if edge.kind == "supersedes" {
+                    "incoming"
+                } else {
+                    "undirected"
+                };
+                (&edge.source, dir)
+            };
+            if let Some(other) = by_id.get(other_id) {
+                neighbors.push(NeighborLink {
+                    memory: other.clone(),
+                    edge_kind: edge.kind,
+                    weight: edge.weight,
+                    label: edge.label,
+                    direction: direction.to_string(),
+                });
+            }
+        }
+        neighbors.sort_by(|a, b| {
+            b.weight
+                .partial_cmp(&a.weight)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.memory.updated_at.cmp(&a.memory.updated_at))
+        });
+        neighbors.truncate(24);
+
+        Ok(Some(MemoryContextResponse {
+            memory,
+            timeline,
+            lineage,
+            neighbors,
+        }))
+    }
+
+    pub fn build_memory_graph(
+        &self,
+        filter: &SearchFilter,
+        limit: usize,
+    ) -> Result<MemoryGraphResponse> {
+        let limit = limit.clamp(1, 250);
+        let include_inactive = filter.include_inactive.unwrap_or(false);
+        let conn = self.conn.lock().unwrap();
+        let records = load_graph_records_locked(&conn, filter, include_inactive, limit)?;
+        let edges = compute_edges_for_nodes_locked(&conn, &records);
+
+        let mut degrees: HashMap<&str, usize> = HashMap::new();
+        for edge in &edges {
+            *degrees.entry(edge.source.as_str()).or_insert(0) += 1;
+            *degrees.entry(edge.target.as_str()).or_insert(0) += 1;
+        }
+
+        let nodes = records
+            .into_iter()
+            .map(|r| {
+                let h = r.hit;
+                let degree = degrees.get(h.id.as_str()).copied().unwrap_or(0);
+                GraphNode {
+                    id: h.id,
+                    title: h.title,
+                    summary: h.summary,
+                    scope: h.scope,
+                    project_id: h.project_id,
+                    project_name: h.project_name,
+                    source_client: h.source_client,
+                    memory_type: h.memory_type,
+                    status: h.status,
+                    files: h.files,
+                    tags: h.tags,
+                    session_id: h.session_id,
+                    superseded_by: h.superseded_by,
+                    recall_count: h.recall_count,
+                    updated_at: h.updated_at,
+                    degree,
+                }
+            })
+            .collect();
+
+        Ok(MemoryGraphResponse { nodes, edges })
     }
 
     /// Builds an ultra-lean (~300-500 token) SessionStart briefing shared across all clients.
@@ -1008,16 +1232,31 @@ impl MemoryDb {
         project_id: Option<&str>,
         token_budget: usize,
     ) -> Result<(String, usize)> {
+        let (detail, _) = self.build_session_briefing_detailed(project_id, token_budget)?;
+        Ok((detail.briefing, detail.memory_count))
+    }
+
+    pub fn build_session_briefing_detailed(
+        &self,
+        project_id: Option<&str>,
+        token_budget: usize,
+    ) -> Result<(ContextPreviewDetailed, Vec<String>)> {
         let max_chars = token_budget.clamp(100, 2_000) * 4;
         let conn = self.conn.lock().unwrap();
         let mut seen = HashSet::new();
-        let mut pinned_lines = Vec::new();
-        let mut global_lines = Vec::new();
-        let mut project_lines = Vec::new();
+
+        struct CandidateLine {
+            item: BriefingItemBreakdown,
+            line: String,
+        }
+
+        let mut pinned_items = Vec::new();
+        let mut global_items = Vec::new();
+        let mut project_items = Vec::new();
 
         // 1. Pinned memories (project + global)
         let mut stmt = conn.prepare(
-            "SELECT id, source_client, memory_type, title, summary
+            "SELECT id, source_client, memory_type, status, title, summary
              FROM memories
              WHERE status = 'pinned' AND (scope = 'global' OR project_id = ?1)
              ORDER BY updated_at DESC LIMIT 5",
@@ -1030,21 +1269,34 @@ impl MemoryDb {
                     r.get::<_, String>(2)?,
                     r.get::<_, String>(3)?,
                     r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
                 ))
             })?
             .filter_map(Result::ok)
         {
             if seen.insert(row.0.clone()) {
-                pinned_lines.push(format!(
+                let line = format!(
                     "- [pinned|{}|{}] {} — {} (id:{})",
-                    row.1, row.2, row.3, row.4, row.0
-                ));
+                    row.1, row.2, row.4, row.5, row.0
+                );
+                pinned_items.push(CandidateLine {
+                    item: BriefingItemBreakdown {
+                        id: row.0,
+                        title: row.4,
+                        source_client: row.1,
+                        memory_type: row.2,
+                        status: row.3,
+                        approx_tokens: (line.len() + 1).div_ceil(4),
+                        included: false,
+                    },
+                    line,
+                });
             }
         }
 
         // 2. Global user preferences
         let mut stmt = conn.prepare(
-            "SELECT id, source_client, memory_type, title, summary
+            "SELECT id, source_client, memory_type, status, title, summary
              FROM memories
              WHERE scope = 'global' AND status = 'active'
              ORDER BY updated_at DESC LIMIT 4",
@@ -1057,19 +1309,32 @@ impl MemoryDb {
                     r.get::<_, String>(2)?,
                     r.get::<_, String>(3)?,
                     r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
                 ))
             })?
             .filter_map(Result::ok)
         {
             if seen.insert(row.0.clone()) {
-                global_lines.push(format!("- [{}|{}] {} (id:{})", row.1, row.2, row.3, row.0));
+                let line = format!("- [{}|{}] {} (id:{})", row.1, row.2, row.4, row.0);
+                global_items.push(CandidateLine {
+                    item: BriefingItemBreakdown {
+                        id: row.0,
+                        title: row.4,
+                        source_client: row.1,
+                        memory_type: row.2,
+                        status: row.3,
+                        approx_tokens: (line.len() + 1).div_ceil(4),
+                        included: false,
+                    },
+                    line,
+                });
             }
         }
 
         // 3. Recent cross-client active project memories
         if let Some(pid) = project_id {
             let mut stmt = conn.prepare(
-                "SELECT id, source_client, memory_type, title, summary
+                "SELECT id, source_client, memory_type, status, title, summary
                  FROM memories
                  WHERE project_id = ?1 AND status = 'active'
                  ORDER BY updated_at DESC LIMIT 8",
@@ -1082,59 +1347,116 @@ impl MemoryDb {
                         r.get::<_, String>(2)?,
                         r.get::<_, String>(3)?,
                         r.get::<_, String>(4)?,
+                        r.get::<_, String>(5)?,
                     ))
                 })?
                 .filter_map(Result::ok)
             {
                 if seen.insert(row.0.clone()) {
-                    project_lines.push(format!(
+                    let line = format!(
                         "- [{}|{}] {}: {} (id:{})",
-                        row.1, row.2, row.3, row.4, row.0
-                    ));
+                        row.1, row.2, row.4, row.5, row.0
+                    );
+                    project_items.push(CandidateLine {
+                        item: BriefingItemBreakdown {
+                            id: row.0,
+                            title: row.4,
+                            source_client: row.1,
+                            memory_type: row.2,
+                            status: row.3,
+                            approx_tokens: (line.len() + 1).div_ceil(4),
+                            included: false,
+                        },
+                        line,
+                    });
                 }
             }
         }
 
-        let count = pinned_lines.len() + global_lines.len() + project_lines.len();
+        let archive_approx_tokens: usize = conn
+            .query_row(
+                "SELECT COALESCE(SUM((LENGTH(title) + LENGTH(summary) + LENGTH(content) + 3) / 4), 0)
+                 FROM memories
+                 WHERE status IN ('active', 'pinned')
+                   AND (scope = 'global' OR project_id = ?1)",
+                params![project_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            .max(0) as usize;
+
+        let count = pinned_items.len() + global_items.len() + project_items.len();
         if count == 0 {
-            return Ok((String::new(), 0));
+            return Ok((
+                ContextPreviewDetailed {
+                    briefing: String::new(),
+                    memory_count: 0,
+                    approx_tokens: 0,
+                    token_budget,
+                    archive_approx_tokens,
+                    sections: Vec::new(),
+                },
+                Vec::new(),
+            ));
         }
 
         let mut buf = String::from(
             "# 0x1-ai-memory (Cross-Agent Briefing)\nUse `memory_get([id])` for full details or `memory_search(query)` for older context.\n",
         );
-        if !pinned_lines.is_empty() {
-            buf.push_str("\n## Pinned\n");
-            for line in pinned_lines {
-                if buf.len() + line.len() + 2 > max_chars {
+        let mut included_ids = Vec::new();
+        let mut sections = Vec::new();
+
+        for (kind, label, header, candidates) in [
+            ("pinned", "Pinned", "\n## Pinned\n", &mut pinned_items),
+            (
+                "project",
+                "Recent Project Memory",
+                "\n## Recent Project Memory (All AI Clients)\n",
+                &mut project_items,
+            ),
+            (
+                "global",
+                "Global Preferences",
+                "\n## Global Preferences\n",
+                &mut global_items,
+            ),
+        ] {
+            if candidates.is_empty() {
+                continue;
+            }
+            buf.push_str(header);
+            let mut section_tokens = 0usize;
+            for cand in candidates.iter_mut() {
+                if buf.len() + cand.line.len() + 2 > max_chars {
                     break;
                 }
-                buf.push_str(&line);
+                buf.push_str(&cand.line);
                 buf.push('\n');
+                cand.item.included = true;
+                section_tokens += cand.item.approx_tokens;
+                included_ids.push(cand.item.id.clone());
             }
-        }
-        if !project_lines.is_empty() {
-            buf.push_str("\n## Recent Project Memory (All AI Clients)\n");
-            for line in project_lines {
-                if buf.len() + line.len() + 2 > max_chars {
-                    break;
-                }
-                buf.push_str(&line);
-                buf.push('\n');
-            }
-        }
-        if !global_lines.is_empty() {
-            buf.push_str("\n## Global Preferences\n");
-            for line in global_lines {
-                if buf.len() + line.len() + 2 > max_chars {
-                    break;
-                }
-                buf.push_str(&line);
-                buf.push('\n');
-            }
+            sections.push(BriefingSectionBreakdown {
+                kind: kind.to_string(),
+                label: label.to_string(),
+                tokens: section_tokens,
+                items: candidates.iter().map(|c| c.item.clone()).collect(),
+            });
         }
 
-        Ok((buf.trim().to_string(), count))
+        let briefing = buf.trim().to_string();
+        let approx_tokens = briefing.len().div_ceil(4);
+        Ok((
+            ContextPreviewDetailed {
+                briefing,
+                memory_count: included_ids.len(),
+                approx_tokens,
+                token_budget,
+                archive_approx_tokens,
+                sections,
+            },
+            included_ids,
+        ))
     }
 
     pub fn memories_missing_embeddings(
@@ -1374,41 +1696,124 @@ impl MemoryDb {
     }
 }
 
+const MEMORY_SELECT: &str = "
+    SELECT m.id, m.scope, m.project_id, p.name, m.session_id, m.source_client,
+           m.memory_type, m.title, m.summary, m.content, m.files_json, m.tags_json,
+           m.status, m.superseded_by, m.created_at, m.updated_at,
+           COALESCE(rs.recall_count, 0), rs.last_recalled_at, COALESCE(rs.clients_json, '[]')
+    FROM memories m
+    LEFT JOIN projects p ON p.id = m.project_id
+    LEFT JOIN memory_recall_stats rs ON rs.memory_id = m.id
+";
+
+const MEMORY_HIT_SELECT: &str = "
+    SELECT m.id, m.scope, m.project_id, p.name, m.session_id, m.source_client,
+           m.memory_type, m.title, m.summary, m.status, m.files_json, m.tags_json,
+           m.superseded_by, m.updated_at,
+           COALESCE(rs.recall_count, 0), rs.last_recalled_at, COALESCE(rs.clients_json, '[]')
+    FROM memories m
+    LEFT JOIN projects p ON p.id = m.project_id
+    LEFT JOIN memory_recall_stats rs ON rs.memory_id = m.id
+";
+
+const GRAPH_NODE_SELECT: &str = "
+    SELECT m.rowid, m.created_at,
+           m.id, m.scope, m.project_id, p.name, m.session_id, m.source_client,
+           m.memory_type, m.title, m.summary, m.status, m.files_json, m.tags_json,
+           m.superseded_by, m.updated_at,
+           COALESCE(rs.recall_count, 0), rs.last_recalled_at, COALESCE(rs.clients_json, '[]')
+    FROM memories m
+    LEFT JOIN projects p ON p.id = m.project_id
+    LEFT JOIN memory_recall_stats rs ON rs.memory_id = m.id
+";
+
+struct GraphNodeRecord {
+    rowid: i64,
+    created_at: String,
+    hit: MemoryHit,
+}
+
+fn memory_to_hit(m: &Memory, score: f64) -> MemoryHit {
+    MemoryHit {
+        id: m.id.clone(),
+        scope: m.scope.clone(),
+        project_id: m.project_id.clone(),
+        project_name: m.project_name.clone(),
+        session_id: m.session_id.clone(),
+        source_client: m.source_client.clone(),
+        memory_type: m.memory_type.clone(),
+        title: m.title.clone(),
+        summary: m.summary.clone(),
+        status: m.status.clone(),
+        files: m.files.clone(),
+        tags: m.tags.clone(),
+        superseded_by: m.superseded_by.clone(),
+        recall_count: m.recall_count,
+        last_recalled_at: m.last_recalled_at.clone(),
+        last_recalled_clients: m.last_recalled_clients.clone(),
+        updated_at: m.updated_at.clone(),
+        score,
+    }
+}
+
+fn row_to_memory_hit_offset(
+    r: &rusqlite::Row<'_>,
+    offset: usize,
+    score: f64,
+) -> rusqlite::Result<MemoryHit> {
+    let files_json: String = r.get(offset + 10)?;
+    let tags_json: String = r.get(offset + 11)?;
+    let clients_json: String = r.get(offset + 16)?;
+    Ok(MemoryHit {
+        id: r.get(offset)?,
+        scope: r.get(offset + 1)?,
+        project_id: r.get(offset + 2)?,
+        project_name: r.get(offset + 3)?,
+        session_id: r.get(offset + 4)?,
+        source_client: r.get(offset + 5)?,
+        memory_type: r.get(offset + 6)?,
+        title: r.get(offset + 7)?,
+        summary: r.get(offset + 8)?,
+        status: r.get(offset + 9)?,
+        files: serde_json::from_str(&files_json).unwrap_or_default(),
+        tags: serde_json::from_str(&tags_json).unwrap_or_default(),
+        superseded_by: r.get(offset + 12)?,
+        updated_at: r.get(offset + 13)?,
+        recall_count: r.get(offset + 14)?,
+        last_recalled_at: r.get(offset + 15)?,
+        last_recalled_clients: serde_json::from_str(&clients_json).unwrap_or_default(),
+        score,
+    })
+}
+
+fn row_to_memory_hit(r: &rusqlite::Row<'_>, score: f64) -> rusqlite::Result<MemoryHit> {
+    row_to_memory_hit_offset(r, 0, score)
+}
+
+fn row_to_graph_record(r: &rusqlite::Row<'_>) -> rusqlite::Result<GraphNodeRecord> {
+    Ok(GraphNodeRecord {
+        rowid: r.get(0)?,
+        created_at: r.get(1)?,
+        hit: row_to_memory_hit_offset(r, 2, 1.0)?,
+    })
+}
+
 fn list_recent_memories_locked(
     conn: &Connection,
     filter: &SearchFilter,
     include_inactive: bool,
     limit: usize,
 ) -> Result<Vec<MemoryHit>> {
-    let mut stmt = conn.prepare(
-        "SELECT m.id, m.scope, m.project_id, p.name, m.source_client,
-                m.memory_type, m.title, m.summary, m.status, m.files_json, m.tags_json, m.updated_at
-         FROM memories m
-         LEFT JOIN projects p ON p.id = m.project_id
-         ORDER BY (CASE WHEN m.status = 'pinned' THEN 0 ELSE 1 END), m.updated_at DESC
-         LIMIT 250",
-    )?;
+    let order = if filter.sort.as_deref() == Some("most_recalled") {
+        "ORDER BY COALESCE(rs.recall_count, 0) DESC, m.updated_at DESC"
+    } else {
+        "ORDER BY (CASE WHEN m.status = 'pinned' THEN 0 ELSE 1 END), m.updated_at DESC"
+    };
+    let sql = format!("{MEMORY_HIT_SELECT} {order} LIMIT 500");
+    let mut stmt = conn.prepare(&sql)?;
     let mut hits = Vec::new();
     for row in stmt
-        .query_map([], |r| {
-            let files_json: String = r.get(9)?;
-            let tags_json: String = r.get(10)?;
-            Ok(MemoryHit {
-                id: r.get(0)?,
-                scope: r.get(1)?,
-                project_id: r.get(2)?,
-                project_name: r.get(3)?,
-                source_client: r.get(4)?,
-                memory_type: r.get(5)?,
-                title: r.get(6)?,
-                summary: r.get(7)?,
-                status: r.get(8)?,
-                files: serde_json::from_str(&files_json).unwrap_or_default(),
-                tags: serde_json::from_str(&tags_json).unwrap_or_default(),
-                updated_at: r.get(11)?,
-                score: 1.0,
-            })
-        })?
+        .query_map([], |r| row_to_memory_hit(r, 1.0))?
         .filter_map(Result::ok)
     {
         if matches_filter(&row, filter, include_inactive) {
@@ -1446,7 +1851,445 @@ fn matches_filter(hit: &MemoryHit, filter: &SearchFilter, include_inactive: bool
     {
         return false;
     }
-    true
+    if let Some(tag) = filter
+        .tag
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        && !hit.tags.iter().any(|t| t.eq_ignore_ascii_case(tag))
+    {
+        return false;
+    }
+    if let Some(file) = filter
+        .file
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let needle = file.to_ascii_lowercase();
+        if !hit
+            .files
+            .iter()
+            .any(|f| f.to_ascii_lowercase().contains(&needle))
+        {
+            return false;
+        }
+    }
+    !(filter.sort.as_deref() == Some("never_recalled") && hit.recall_count > 0)
+}
+
+fn memory_timeline_locked(
+    conn: &Connection,
+    anchor_id: &str,
+    before: usize,
+    after: usize,
+) -> Result<Vec<MemoryHit>> {
+    let anchor: Option<(String, Option<String>)> = conn
+        .query_row(
+            "SELECT created_at, project_id FROM memories WHERE id = ?1",
+            params![anchor_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+
+    let Some((anchor_time, project_id)) = anchor else {
+        return Ok(Vec::new());
+    };
+
+    let mut older = query_timeline_side(conn, project_id.as_deref(), &anchor_time, true, before)?;
+    older.reverse();
+    let anchor_sql = format!("{MEMORY_SELECT} WHERE m.id = ?1");
+    let anchor_mem = conn
+        .query_row(&anchor_sql, params![anchor_id], row_to_memory)
+        .optional()?;
+    let newer = query_timeline_side(conn, project_id.as_deref(), &anchor_time, false, after)?;
+
+    let mut out = older;
+    if let Some(m) = anchor_mem {
+        out.push(memory_to_hit(&m, 1.0));
+    }
+    out.extend(newer);
+    Ok(out)
+}
+
+fn memory_lineage_locked(conn: &Connection, anchor: &Memory) -> Result<Vec<MemoryHit>> {
+    let mut visited = HashSet::new();
+    visited.insert(anchor.id.clone());
+
+    let mut prev_chain = Vec::new();
+    let prev_sql = format!(
+        "{MEMORY_HIT_SELECT} WHERE m.superseded_by = ?1 ORDER BY m.created_at DESC LIMIT 1"
+    );
+    let mut prev_stmt = conn.prepare(&prev_sql)?;
+    let mut cursor = anchor.id.clone();
+    for _ in 0..20 {
+        let Some(prev) = prev_stmt
+            .query_row(params![cursor], |r| row_to_memory_hit(r, 1.0))
+            .optional()?
+        else {
+            break;
+        };
+        if !visited.insert(prev.id.clone()) {
+            break;
+        }
+        cursor = prev.id.clone();
+        prev_chain.push(prev);
+    }
+    prev_chain.reverse();
+
+    let mut next_chain = Vec::new();
+    let next_sql = format!("{MEMORY_HIT_SELECT} WHERE m.id = ?1");
+    let mut next_stmt = conn.prepare(&next_sql)?;
+    let mut next_cursor = anchor.superseded_by.clone();
+    for _ in 0..20 {
+        let Some(next_id) = next_cursor else {
+            break;
+        };
+        if !visited.insert(next_id.clone()) {
+            break;
+        }
+        let Some(next) = next_stmt
+            .query_row(params![next_id], |r| row_to_memory_hit(r, 1.0))
+            .optional()?
+        else {
+            break;
+        };
+        next_cursor = next.superseded_by.clone();
+        next_chain.push(next);
+    }
+
+    let mut lineage = prev_chain;
+    lineage.push(memory_to_hit(anchor, 1.0));
+    lineage.extend(next_chain);
+    Ok(lineage)
+}
+
+fn load_graph_records_locked(
+    conn: &Connection,
+    filter: &SearchFilter,
+    include_inactive: bool,
+    limit: usize,
+) -> Result<Vec<GraphNodeRecord>> {
+    let sql = format!(
+        "{GRAPH_NODE_SELECT} ORDER BY (CASE WHEN m.status = 'pinned' THEN 0 ELSE 1 END), m.updated_at DESC LIMIT 500"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut records = Vec::new();
+    for rec in stmt
+        .query_map([], row_to_graph_record)?
+        .filter_map(Result::ok)
+    {
+        if matches_filter(&rec.hit, filter, include_inactive) {
+            records.push(rec);
+            if records.len() >= limit {
+                break;
+            }
+        }
+    }
+    Ok(records)
+}
+
+fn compute_edges_for_nodes_locked(
+    conn: &Connection,
+    records: &[GraphNodeRecord],
+) -> Vec<GraphEdge> {
+    if records.len() < 2 {
+        return Vec::new();
+    }
+    let idx_by_id: HashMap<&str, usize> = records
+        .iter()
+        .enumerate()
+        .map(|(i, r)| (r.hit.id.as_str(), i))
+        .collect();
+    let mut edges = Vec::new();
+    let mut seen_undirected: HashSet<(usize, usize, &'static str)> = HashSet::new();
+
+    // 1. Directed supersession edges (older memory -> superseding memory)
+    for r in records {
+        if let Some(target_id) = r.hit.superseded_by.as_deref()
+            && idx_by_id.contains_key(target_id)
+            && target_id != r.hit.id
+        {
+            edges.push(GraphEdge {
+                source: r.hit.id.clone(),
+                target: target_id.to_string(),
+                kind: "supersedes".into(),
+                weight: 1.0,
+                label: "superseded by".into(),
+            });
+        }
+    }
+
+    // 2. Shared files (hub-damped)
+    let mut by_file: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, r) in records.iter().enumerate() {
+        let mut unique_files = HashSet::new();
+        for f in &r.hit.files {
+            let norm = f
+                .trim()
+                .to_ascii_lowercase()
+                .trim_start_matches("./")
+                .to_string();
+            if !norm.is_empty() && unique_files.insert(norm.clone()) {
+                by_file.entry(norm).or_default().push(i);
+            }
+        }
+    }
+    let mut shared_files_by_pair: HashMap<(usize, usize), Vec<String>> = HashMap::new();
+    for (path, mut idxs) in by_file {
+        if idxs.len() < 2 {
+            continue;
+        }
+        if (records.len() >= 8 && idxs.len() * 10 > records.len() * 3) || idxs.len() > 12 {
+            continue;
+        }
+        idxs.truncate(6);
+        let base = path.rsplit(['/', '\\']).next().unwrap_or(&path).to_string();
+        for a in 0..idxs.len() {
+            for b in (a + 1)..idxs.len() {
+                let (u, v) = if idxs[a] < idxs[b] {
+                    (idxs[a], idxs[b])
+                } else {
+                    (idxs[b], idxs[a])
+                };
+                shared_files_by_pair
+                    .entry((u, v))
+                    .or_default()
+                    .push(base.clone());
+            }
+        }
+    }
+    for ((u, v), files) in shared_files_by_pair {
+        if seen_undirected.insert((u, v, "same_file")) {
+            let count = files.len();
+            let label = if count == 1 {
+                files[0].clone()
+            } else {
+                format!("{count} shared files")
+            };
+            edges.push(GraphEdge {
+                source: records[u].hit.id.clone(),
+                target: records[v].hit.id.clone(),
+                kind: "same_file".into(),
+                weight: 0.85 + 0.04 * (count.min(3) as f64),
+                label,
+            });
+        }
+    }
+
+    // 3. Same session chronological chain
+    let mut by_session: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, r) in records.iter().enumerate() {
+        if let Some(sid) = r.hit.session_id.as_deref().filter(|s| !s.is_empty()) {
+            by_session.entry(sid).or_default().push(i);
+        }
+    }
+    for (_, mut idxs) in by_session {
+        if idxs.len() < 2 {
+            continue;
+        }
+        idxs.sort_by(|&a, &b| {
+            records[a]
+                .created_at
+                .cmp(&records[b].created_at)
+                .then_with(|| records[a].hit.id.cmp(&records[b].hit.id))
+        });
+        for pair in idxs.windows(2) {
+            let (u, v) = if pair[0] < pair[1] {
+                (pair[0], pair[1])
+            } else {
+                (pair[1], pair[0])
+            };
+            if seen_undirected.insert((u, v, "same_session")) {
+                edges.push(GraphEdge {
+                    source: records[u].hit.id.clone(),
+                    target: records[v].hit.id.clone(),
+                    kind: "same_session".into(),
+                    weight: 0.75,
+                    label: "same session".into(),
+                });
+            }
+        }
+    }
+
+    // 4. Shared tags (hub-damped)
+    {
+        let mut by_tag: HashMap<String, Vec<usize>> = HashMap::new();
+        for (i, r) in records.iter().enumerate() {
+            let mut unique_tags = HashSet::new();
+            for t in &r.hit.tags {
+                let norm = t.trim().to_ascii_lowercase();
+                if !norm.is_empty() && unique_tags.insert(norm.clone()) {
+                    by_tag.entry(norm).or_default().push(i);
+                }
+            }
+        }
+        let mut shared_tags_by_pair: HashMap<(usize, usize), Vec<String>> = HashMap::new();
+        for (tag, mut idxs) in by_tag {
+            if idxs.len() < 2 {
+                continue;
+            }
+            if (records.len() >= 8 && idxs.len() * 100 > records.len() * 35) || idxs.len() > 15 {
+                continue;
+            }
+            idxs.truncate(8);
+            for a in 0..idxs.len() {
+                for b in (a + 1)..idxs.len() {
+                    let (u, v) = if idxs[a] < idxs[b] {
+                        (idxs[a], idxs[b])
+                    } else {
+                        (idxs[b], idxs[a])
+                    };
+                    shared_tags_by_pair
+                        .entry((u, v))
+                        .or_default()
+                        .push(tag.clone());
+                }
+            }
+        }
+        let min_shared = if records.len() > 30 { 2 } else { 1 };
+        for ((u, v), tags) in shared_tags_by_pair {
+            if tags.len() < min_shared {
+                continue;
+            }
+            if seen_undirected.insert((u, v, "shared_tag")) {
+                let label = tags.iter().take(2).cloned().collect::<Vec<_>>().join(", ");
+                edges.push(GraphEdge {
+                    source: records[u].hit.id.clone(),
+                    target: records[v].hit.id.clone(),
+                    kind: "shared_tag".into(),
+                    weight: 0.5 + 0.05 * (tags.len().min(4) as f64),
+                    label,
+                });
+            }
+        }
+    }
+
+    // 5. Top-3 cosine semantic neighbors from memories_vec
+    let mut vecs: Vec<Option<Vec<f32>>> = vec![None; records.len()];
+    if let Ok(mut stmt) = conn.prepare("SELECT embedding FROM memories_vec WHERE memory_rowid = ?1")
+    {
+        for (i, r) in records.iter().enumerate() {
+            if let Ok(Some(bytes)) = stmt
+                .query_row(params![r.rowid], |row| row.get::<_, Vec<u8>>(0))
+                .optional()
+                && bytes.len() == EMBEDDING_DIM * 4
+            {
+                let floats: Vec<f32> = bytes
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c))
+                    .collect();
+                vecs[i] = Some(floats);
+            }
+        }
+    }
+    let mut semantic_best: HashMap<(usize, usize), f64> = HashMap::new();
+    for i in 0..records.len() {
+        let Some(ref va) = vecs[i] else {
+            continue;
+        };
+        let mut cands: Vec<(usize, f64)> = Vec::new();
+        for j in 0..records.len() {
+            if i == j {
+                continue;
+            }
+            let Some(ref vb) = vecs[j] else {
+                continue;
+            };
+            let same_context = records[i].hit.project_id == records[j].hit.project_id
+                || records[i].hit.scope == "global"
+                || records[j].hit.scope == "global";
+            let min_sim = if same_context { 0.72 } else { 0.80 };
+            let sim = cosine_similarity(va, vb);
+            if sim >= min_sim {
+                cands.push((j, sim));
+            }
+        }
+        cands.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        for (j, sim) in cands.into_iter().take(3) {
+            let pair = if i < j { (i, j) } else { (j, i) };
+            let entry = semantic_best.entry(pair).or_insert(0.0);
+            if sim > *entry {
+                *entry = sim;
+            }
+        }
+    }
+    for ((u, v), sim) in semantic_best {
+        if seen_undirected.insert((u, v, "semantic_similar")) {
+            let pct = (sim * 100.0).round() as i32;
+            edges.push(GraphEdge {
+                source: records[u].hit.id.clone(),
+                target: records[v].hit.id.clone(),
+                kind: "semantic_similar".into(),
+                weight: sim,
+                label: format!("{pct}% semantic"),
+            });
+        }
+    }
+
+    edges
+}
+
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
+    let mut dot = 0.0f64;
+    let mut na = 0.0f64;
+    let mut nb = 0.0f64;
+    for (x, y) in a.iter().zip(b.iter()) {
+        let xf = *x as f64;
+        let yf = *y as f64;
+        dot += xf * yf;
+        na += xf * xf;
+        nb += yf * yf;
+    }
+    if na <= 0.0 || nb <= 0.0 {
+        0.0
+    } else {
+        dot / (na.sqrt() * nb.sqrt())
+    }
+}
+
+fn summarize_raw_payload(event_type: &str, tool_name: Option<&str>, payload_json: &str) -> String {
+    let parsed: serde_json::Value = serde_json::from_str(payload_json).unwrap_or_default();
+    let snippet = match event_type {
+        "prompt" => parsed
+            .get("prompt")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        "turn_stop" => parsed
+            .get("assistant")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Turn finished")
+            .to_string(),
+        _ => {
+            let input = parsed.get("input");
+            let detail = input
+                .and_then(|v| {
+                    v.get("CommandLine")
+                        .or_else(|| v.get("command"))
+                        .or_else(|| v.get("Path"))
+                        .or_else(|| v.get("file_path"))
+                        .or_else(|| v.get("TargetFile"))
+                })
+                .and_then(|v| v.as_str())
+                .or_else(|| parsed.get("output").and_then(|v| v.as_str()))
+                .unwrap_or("");
+            let tool = tool_name.unwrap_or("tool");
+            if detail.is_empty() {
+                tool.to_string()
+            } else {
+                format!("{tool}: {detail}")
+            }
+        }
+    };
+    let clean: String = snippet.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut truncated: String = clean.chars().take(120).collect();
+    if clean.chars().count() > 120 {
+        truncated.push_str("...");
+    }
+    truncated
 }
 
 fn query_timeline_side(
@@ -1460,39 +2303,17 @@ fn query_timeline_side(
         return Ok(Vec::new());
     }
     let sql = if older {
-        "SELECT m.id, m.scope, m.project_id, p.name, m.source_client,
-                m.memory_type, m.title, m.summary, m.status, m.files_json, m.tags_json, m.updated_at
-         FROM memories m
-         LEFT JOIN projects p ON p.id = m.project_id
-         WHERE (?1 IS NULL OR m.project_id = ?1) AND m.created_at < ?2
-         ORDER BY m.created_at DESC LIMIT ?3"
+        format!(
+            "{MEMORY_HIT_SELECT} WHERE (?1 IS NULL OR m.project_id = ?1) AND m.created_at < ?2 ORDER BY m.created_at DESC LIMIT ?3"
+        )
     } else {
-        "SELECT m.id, m.scope, m.project_id, p.name, m.source_client,
-                m.memory_type, m.title, m.summary, m.status, m.files_json, m.tags_json, m.updated_at
-         FROM memories m
-         LEFT JOIN projects p ON p.id = m.project_id
-         WHERE (?1 IS NULL OR m.project_id = ?1) AND m.created_at > ?2
-         ORDER BY m.created_at ASC LIMIT ?3"
+        format!(
+            "{MEMORY_HIT_SELECT} WHERE (?1 IS NULL OR m.project_id = ?1) AND m.created_at > ?2 ORDER BY m.created_at ASC LIMIT ?3"
+        )
     };
-    let mut stmt = conn.prepare(sql)?;
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params![project_id, anchor_time, limit as i64], |r| {
-        let files_json: String = r.get(9)?;
-        let tags_json: String = r.get(10)?;
-        Ok(MemoryHit {
-            id: r.get(0)?,
-            scope: r.get(1)?,
-            project_id: r.get(2)?,
-            project_name: r.get(3)?,
-            source_client: r.get(4)?,
-            memory_type: r.get(5)?,
-            title: r.get(6)?,
-            summary: r.get(7)?,
-            status: r.get(8)?,
-            files: serde_json::from_str(&files_json).unwrap_or_default(),
-            tags: serde_json::from_str(&tags_json).unwrap_or_default(),
-            updated_at: r.get(11)?,
-            score: 1.0,
-        })
+        row_to_memory_hit(r, 1.0)
     })?;
     Ok(rows.filter_map(Result::ok).collect())
 }
@@ -1550,6 +2371,7 @@ fn row_to_raw_event(r: &rusqlite::Row<'_>) -> rusqlite::Result<RawEvent> {
 fn row_to_memory(r: &rusqlite::Row<'_>) -> rusqlite::Result<Memory> {
     let files_json: String = r.get(10)?;
     let tags_json: String = r.get(11)?;
+    let clients_json: String = r.get(18)?;
     Ok(Memory {
         id: r.get(0)?,
         scope: r.get(1)?,
@@ -1567,6 +2389,9 @@ fn row_to_memory(r: &rusqlite::Row<'_>) -> rusqlite::Result<Memory> {
         superseded_by: r.get(13)?,
         created_at: r.get(14)?,
         updated_at: r.get(15)?,
+        recall_count: r.get(16)?,
+        last_recalled_at: r.get(17)?,
+        last_recalled_clients: serde_json::from_str(&clients_json).unwrap_or_default(),
     })
 }
 
@@ -1700,5 +2525,112 @@ mod tests {
         upgraded_mem.save_settings(&s).unwrap();
         assert!(!upgraded_mem.seed_onboarding_if_existing(true).unwrap());
         assert!(!upgraded_mem.get_settings().unwrap().onboarding_completed);
+    }
+
+    #[test]
+    fn graph_edges_lineage_recalls_and_briefing_breakdown() {
+        let db = MemoryDb::open_in_memory().unwrap();
+        let proj = ProjectIdentity {
+            id: "proj_g".into(),
+            name: "graph-proj".into(),
+            remote_url: None,
+            root_path: "/tmp/graph-proj".into(),
+            branch: Some("main".into()),
+        };
+        db.upsert_project(&proj).unwrap();
+        let sess = db
+            .upsert_session("proj_g", "codex", "ext-sess-1", Some("main"))
+            .unwrap();
+
+        let m1 = db
+            .create_memory(
+                NewMemoryInput {
+                    scope: Some("project".into()),
+                    project_id: Some("proj_g".into()),
+                    session_id: Some(sess.id.clone()),
+                    source_client: Some("codex".into()),
+                    memory_type: "decision".into(),
+                    title: "Initial auth".into(),
+                    summary: "Use cookies".into(),
+                    content: "Longer detail body for archive token estimation check".into(),
+                    files: Some(vec!["src/auth.rs".into()]),
+                    tags: Some(vec!["auth".into(), "security".into()]),
+                    status: None,
+                    supersedes_id: None,
+                },
+                Some(&unit_vec(10)),
+            )
+            .unwrap();
+
+        let m2 = db
+            .create_memory(
+                NewMemoryInput {
+                    scope: Some("project".into()),
+                    project_id: Some("proj_g".into()),
+                    session_id: Some(sess.id.clone()),
+                    source_client: Some("claude-code".into()),
+                    memory_type: "decision".into(),
+                    title: "Rotated refresh tokens".into(),
+                    summary: "Added rotation to auth cookies".into(),
+                    content: "Updated src/auth.rs to rotate refresh tokens on every refresh exchange, revoking reused tokens immediately to mitigate replay attacks and token theft across sessions.".repeat(3),
+                    files: Some(vec!["src/auth.rs".into()]),
+                    tags: Some(vec!["auth".into()]),
+                    status: Some("pinned".into()),
+                    supersedes_id: Some(m1.id.clone()),
+                },
+                Some(&unit_vec(10)),
+            )
+            .unwrap();
+
+        // Record recalls and check sort filters
+        db.record_memory_recalls(std::slice::from_ref(&m2.id), "antigravity")
+            .unwrap();
+        let most_recalled = db
+            .search_memories(
+                &SearchFilter {
+                    project_id: Some("proj_g".into()),
+                    sort: Some("most_recalled".into()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        assert_eq!(most_recalled[0].id, m2.id);
+        assert_eq!(most_recalled[0].recall_count, 1);
+        assert_eq!(most_recalled[0].last_recalled_clients, vec!["antigravity"]);
+
+        // Graph includes supersedes, same_file, same_session, semantic_similar, shared_tag
+        let graph = db
+            .build_memory_graph(
+                &SearchFilter {
+                    project_id: Some("proj_g".into()),
+                    include_inactive: Some(true),
+                    ..Default::default()
+                },
+                50,
+            )
+            .unwrap();
+        assert_eq!(graph.nodes.len(), 2);
+        let kinds: HashSet<&str> = graph.edges.iter().map(|e| e.kind.as_str()).collect();
+        assert!(kinds.contains("supersedes"));
+        assert!(kinds.contains("same_file"));
+        assert!(kinds.contains("same_session"));
+        assert!(kinds.contains("semantic_similar"));
+        assert!(kinds.contains("shared_tag"));
+
+        // Context returns lineage + neighbors + timeline without Mutex deadlock
+        let ctx = db.memory_context(&m2.id).unwrap().unwrap();
+        assert_eq!(ctx.lineage.len(), 2);
+        assert_eq!(ctx.lineage[0].id, m1.id);
+        assert_eq!(ctx.lineage[1].id, m2.id);
+        assert!(!ctx.neighbors.is_empty());
+
+        // Detailed briefing breakdown
+        let (preview, included) = db
+            .build_session_briefing_detailed(Some("proj_g"), 450)
+            .unwrap();
+        assert_eq!(included, vec![m2.id.clone()]);
+        assert!(!preview.sections.is_empty());
+        assert!(preview.archive_approx_tokens > preview.approx_tokens);
     }
 }

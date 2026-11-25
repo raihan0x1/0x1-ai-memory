@@ -203,10 +203,15 @@ async fn execute_tool_call(
                     .and_then(|v| v.as_u64())
                     .map(|n| n as usize)
                     .or(Some(10)),
+                ..Default::default()
             };
             let hits = db
                 .search_memories(&filter, q_vec.as_deref())
                 .map_err(|e| (-32603, e.to_string()))?;
+            if !hits.is_empty() {
+                let ids: Vec<String> = hits.iter().map(|h| h.id.clone()).collect();
+                let _ = db.record_memory_recalls(&ids, client_hint.unwrap_or("mcp"));
+            }
             json!({ "count": hits.len(), "results": hits })
         }
         "memory_get" => {
@@ -222,6 +227,10 @@ async fn execute_tool_call(
             let memories = db
                 .get_memories_by_ids(&ids)
                 .map_err(|e| (-32603, e.to_string()))?;
+            if !memories.is_empty() {
+                let found_ids: Vec<String> = memories.iter().map(|m| m.id.clone()).collect();
+                let _ = db.record_memory_recalls(&found_ids, client_hint.unwrap_or("mcp"));
+            }
             json!({ "count": memories.len(), "memories": memories })
         }
         "memory_timeline" => {

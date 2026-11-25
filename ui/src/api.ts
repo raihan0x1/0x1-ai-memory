@@ -5,9 +5,13 @@ import type {
   ConnectionTestResult,
   ContextPreviewResponse,
   DaemonInfo,
+  MemoryContextResponse,
   MemoryDetail,
+  MemoryGraphResponse,
   MemoryHit,
   Project,
+  RawEventView,
+  SessionSummary,
   SettingsView,
   UniversalMcpSnippets,
   UsageEntry,
@@ -43,6 +47,15 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+function buildQuery(params: Record<string, string | number | boolean | undefined>): string {
+  const qs = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) {
+    if (v !== undefined && v !== '') qs.set(k, String(v));
+  }
+  const s = qs.toString();
+  return s ? `?${s}` : '';
+}
+
 export const api = {
   summary: () => req<UsageSummary>('/api/summary'),
   projects: () => req<{ projects: Project[] }>('/api/projects'),
@@ -51,14 +64,26 @@ export const api = {
       method: 'PATCH',
       body: JSON.stringify({ privacy_mode }),
     }),
-  searchMemories: (params: Record<string, string | number | boolean | undefined>) => {
-    const qs = new URLSearchParams();
-    for (const [k, v] of Object.entries(params)) {
-      if (v !== undefined && v !== '') qs.set(k, String(v));
-    }
-    return req<{ count: number; memories: MemoryHit[] }>(`/api/memories?${qs.toString()}`);
-  },
+  sessions: (params: { project_id?: string; limit?: number } = {}) =>
+    req<{ sessions: SessionSummary[] }>(`/api/sessions${buildQuery(params)}`),
+  distillSession: (id: string) =>
+    req<{ queued: boolean; session_id: string }>(
+      `/api/sessions/${encodeURIComponent(id)}/distill`,
+      { method: 'POST' },
+    ),
+  distillFlush: () =>
+    req<{ queued_sessions: number; session_ids: string[] }>('/api/distill/flush', {
+      method: 'POST',
+    }),
+  rawEvents: (params: { project_id?: string; client?: string; limit?: number } = {}) =>
+    req<{ events: RawEventView[] }>(`/api/raw-events${buildQuery(params)}`),
+  searchMemories: (params: Record<string, string | number | boolean | undefined>) =>
+    req<{ count: number; memories: MemoryHit[] }>(`/api/memories${buildQuery(params)}`),
   getMemory: (id: string) => req<{ memory: MemoryDetail }>(`/api/memories/${encodeURIComponent(id)}`),
+  memoryContext: (id: string) =>
+    req<MemoryContextResponse>(`/api/memories/${encodeURIComponent(id)}/context`),
+  graph: (params: Record<string, string | number | boolean | undefined>) =>
+    req<MemoryGraphResponse>(`/api/graph${buildQuery(params)}`),
   createMemory: (body: {
     scope: string;
     project_id?: string | null;
@@ -81,6 +106,8 @@ export const api = {
       title: string;
       summary: string;
       content: string;
+      tags: string[];
+      files: string[];
       superseded_by: string;
     }>,
   ) =>
@@ -148,4 +175,36 @@ export function formatUtcTime(iso: string | null | undefined): string {
   const mi = String(d.getUTCMinutes()).padStart(2, '0');
   const ss = String(d.getUTCSeconds()).padStart(2, '0');
   return `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss} UTC`;
+}
+
+/** Short UTC HH:MM:SS UTC clock for compact live stream tails. */
+export function formatUtcClock(iso: string | null | undefined): string {
+  if (!iso) return '--:--:-- UTC';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  const hh = String(d.getUTCHours()).padStart(2, '0');
+  const mi = String(d.getUTCMinutes()).padStart(2, '0');
+  const ss = String(d.getUTCSeconds()).padStart(2, '0');
+  return `${hh}:${mi}:${ss} UTC`;
+}
+
+/** UTC calendar day label (`Today · YYYY-MM-DD UTC`, `Yesterday`, or `YYYY-MM-DD UTC`). */
+export function formatUtcDayLabel(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return 'Unknown date';
+  const key = d.toISOString().slice(0, 10);
+  const now = new Date();
+  const todayKey = now.toISOString().slice(0, 10);
+  const yest = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - 1))
+    .toISOString()
+    .slice(0, 10);
+  if (key === todayKey) return `Today · ${key} UTC`;
+  if (key === yest) return `Yesterday · ${key} UTC`;
+  return `${key} UTC`;
+}
+
+export function formatUtcDayKey(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return 'unknown';
+  return d.toISOString().slice(0, 10);
 }

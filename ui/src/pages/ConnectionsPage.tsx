@@ -148,7 +148,7 @@ export function ConnectionsPage({
           ))}
         </div>
       ) : (
-        <div className="grid-2">
+        <div className="grid-2 connections-grid">
           {connections.map((c) => (
             <section key={c.client_id} className="panel">
               <div className="panel-header">
@@ -195,7 +195,7 @@ export function ConnectionsPage({
                   </span>
                 </div>
 
-                <div className="head-actions" style={{ marginTop: 'var(--space-xs)' }}>
+                <div className="head-actions card-actions">
                   {!c.connected ? (
                     <button
                       type="button"

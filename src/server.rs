@@ -79,6 +79,10 @@ pub fn build_router(state: AppState) -> Router {
         // REST API for Web UI & CLI
         .route("/api/stream", get(sse_stream))
         .route("/api/summary", get(api_summary))
+        .route("/api/sessions", get(api_list_sessions))
+        .route("/api/sessions/{id}/distill", post(api_distill_session))
+        .route("/api/raw-events", get(api_list_raw_events))
+        .route("/api/distill/flush", post(api_distill_flush))
         .route("/api/projects", get(api_list_projects))
         .route("/api/projects/{id}/privacy", patch(api_project_privacy))
         .route(
@@ -92,6 +96,8 @@ pub fn build_router(state: AppState) -> Router {
                 .delete(api_delete_memory),
         )
         .route("/api/memories/{id}/timeline", get(api_memory_timeline))
+        .route("/api/memories/{id}/context", get(api_memory_context))
+        .route("/api/graph", get(api_memory_graph))
         .route("/api/context-preview", get(api_context_preview))
         .route("/api/usage", get(api_usage_history))
         .route(
@@ -403,6 +409,94 @@ async fn api_memory_timeline(
     Ok(Json(json!({ "timeline": items })))
 }
 
+async fn api_memory_context(
+    State(st): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    match st.db.memory_context(&id).map_err(internal_err)? {
+        Some(ctx) => Ok(Json(serde_json::to_value(ctx).unwrap_or_default())),
+        None => Err((StatusCode::NOT_FOUND, "Memory not found".into())),
+    }
+}
+
+async fn api_memory_graph(
+    State(st): State<AppState>,
+    Query(filter): Query<SearchFilter>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let limit = filter.limit.unwrap_or(180);
+    let graph = st
+        .db
+        .build_memory_graph(&filter, limit)
+        .map_err(internal_err)?;
+    Ok(Json(serde_json::to_value(graph).unwrap_or_default()))
+}
+
+#[derive(Deserialize)]
+struct SessionsQuery {
+    project_id: Option<String>,
+    limit: Option<usize>,
+}
+
+async fn api_list_sessions(
+    State(st): State<AppState>,
+    Query(q): Query<SessionsQuery>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let sessions = st
+        .db
+        .list_sessions(
+            q.project_id.as_deref().filter(|s| !s.is_empty()),
+            q.limit.unwrap_or(12),
+        )
+        .map_err(internal_err)?;
+    Ok(Json(json!({ "sessions": sessions })))
+}
+
+#[derive(Deserialize)]
+struct RawEventsQuery {
+    project_id: Option<String>,
+    client: Option<String>,
+    limit: Option<usize>,
+}
+
+async fn api_list_raw_events(
+    State(st): State<AppState>,
+    Query(q): Query<RawEventsQuery>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let events = st
+        .db
+        .recent_raw_events(
+            q.project_id.as_deref().filter(|s| !s.is_empty()),
+            q.client.as_deref().filter(|s| !s.is_empty()),
+            q.limit.unwrap_or(50),
+        )
+        .map_err(internal_err)?;
+    Ok(Json(json!({ "events": events })))
+}
+
+async fn api_distill_session(
+    State(st): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Json<Value> {
+    st.distill.queue_session(id.clone());
+    Json(json!({ "queued": true, "session_id": id }))
+}
+
+async fn api_distill_flush(
+    State(st): State<AppState>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let session_ids = st
+        .db
+        .sessions_with_any_pending_events(25)
+        .map_err(internal_err)?;
+    for sid in &session_ids {
+        st.distill.queue_session(sid.clone());
+    }
+    Ok(Json(json!({
+        "queued_sessions": session_ids.len(),
+        "session_ids": session_ids
+    })))
+}
+
 #[derive(Deserialize)]
 struct ContextPreviewQuery {
     project_id: Option<String>,
@@ -413,17 +507,14 @@ async fn api_context_preview(
     Query(q): Query<ContextPreviewQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let settings = st.db.get_settings().map_err(internal_err)?;
-    let (briefing, count) = st
+    let (detail, _) = st
         .db
-        .build_session_briefing(q.project_id.as_deref(), settings.session_start_token_budget)
+        .build_session_briefing_detailed(
+            q.project_id.as_deref().filter(|s| !s.is_empty()),
+            settings.session_start_token_budget,
+        )
         .map_err(internal_err)?;
-    let approx_tokens = briefing.len().div_ceil(4);
-    Ok(Json(json!({
-        "briefing": briefing,
-        "memory_count": count,
-        "approx_tokens": approx_tokens,
-        "token_budget": settings.session_start_token_budget
-    })))
+    Ok(Json(serde_json::to_value(detail).unwrap_or_default()))
 }
 
 async fn api_usage_history(

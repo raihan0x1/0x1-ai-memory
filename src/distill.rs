@@ -220,6 +220,17 @@ pub async fn distill_session_once(
                 Some(&msg),
             );
             let _ = db.mark_events_distilled(&event_ids);
+            let _ = events_tx.send(StreamEvent {
+                kind: "usage_recorded".into(),
+                timestamp: Utc::now().to_rfc3339(),
+                payload: json!({
+                    "status": "error",
+                    "session_id": session_id,
+                    "provider": settings.provider,
+                    "model": settings.model,
+                    "error_message": msg,
+                }),
+            });
         }
     }
 }

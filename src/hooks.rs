@@ -81,13 +81,22 @@ pub async fn handle_hook(
 
     match event_name.as_str() {
         "SessionStart" => {
-            let (briefing, count) = db
-                .build_session_briefing(Some(&project.id), settings.session_start_token_budget)
+            let (detail, included_ids) = db
+                .build_session_briefing_detailed(
+                    Some(&project.id),
+                    settings.session_start_token_budget,
+                )
                 .unwrap_or_default();
-            if briefing.is_empty() {
+            if detail.briefing.is_empty() {
                 return json!({});
             }
-            format_context_injection(&client, "SessionStart", &briefing, count)
+            let _ = db.record_memory_recalls(&included_ids, &client);
+            format_context_injection(
+                &client,
+                "SessionStart",
+                &detail.briefing,
+                detail.memory_count,
+            )
         }
         "UserPromptSubmit" | "PreInvocation" => {
             let prompt = payload
@@ -139,6 +148,8 @@ pub async fn handle_hook(
                     q_vec.as_deref(),
                 ) && !hits.is_empty()
                 {
+                    let ids: Vec<String> = hits.iter().map(|h| h.id.clone()).collect();
+                    let _ = db.record_memory_recalls(&ids, &client);
                     let mut lines = String::from(
                         "Relevant cross-agent memories (call `memory_get([id])` if needed):\n",
                     );
@@ -185,7 +196,9 @@ pub async fn handle_hook(
                 return json!({});
             }
 
-            let ev_type = if event_name == "PostToolUseFailure" || payload.get("error").is_some() {
+            let ev_type = if event_name == "PostToolUseFailure"
+                || json_error_is_present(payload.get("error"))
+            {
                 "tool_error"
             } else {
                 "tool_use"
@@ -198,14 +211,20 @@ pub async fn handle_hook(
                 }),
                 1_200,
             );
-            let _ = db.insert_raw_event(
+            if let Ok(ev) = db.insert_raw_event(
                 &session.id,
                 &project.id,
                 &client,
                 ev_type,
                 Some(tool_name),
                 &compact_payload.to_string(),
-            );
+            ) {
+                let _ = events_tx.send(StreamEvent {
+                    kind: "raw_event".into(),
+                    timestamp: Utc::now().to_rfc3339(),
+                    payload: serde_json::to_value(&ev).unwrap_or_default(),
+                });
+            }
             json!({})
         }
         "Stop" | "PreCompact" | "SessionEnd" => {
@@ -214,16 +233,20 @@ pub async fn handle_hook(
                     .get("last_assistant_message")
                     .or_else(|| payload.get("lastAssistantMessage"))
                     .and_then(|v| v.as_str())
-                {
-                    let clean = scrub_json_value(&json!({ "assistant": last_msg }), 2_000);
-                    let _ = db.insert_raw_event(
+                    && let Ok(ev) = db.insert_raw_event(
                         &session.id,
                         &project.id,
                         &client,
                         "turn_stop",
                         None,
-                        &clean.to_string(),
-                    );
+                        &scrub_json_value(&json!({ "assistant": last_msg }), 2_000).to_string(),
+                    )
+                {
+                    let _ = events_tx.send(StreamEvent {
+                        kind: "raw_event".into(),
+                        timestamp: Utc::now().to_rfc3339(),
+                        payload: serde_json::to_value(&ev).unwrap_or_default(),
+                    });
                 }
                 // Trigger async 1x per-turn distillation off the hot path (<5ms hook return!)
                 distill.queue_session(session.id.clone());
@@ -234,6 +257,17 @@ pub async fn handle_hook(
             json!({})
         }
         _ => json!({}),
+    }
+}
+
+fn json_error_is_present(val: Option<&Value>) -> bool {
+    match val {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(Value::String(s)) => !s.trim().is_empty(),
+        Some(Value::Array(a)) => !a.is_empty(),
+        Some(Value::Object(o)) => !o.is_empty(),
+        Some(Value::Number(_)) => true,
     }
 }
 
@@ -403,5 +437,49 @@ mod tests {
         .await;
         assert!(p1.get("injectSteps").is_some());
         assert!(p2.get("injectSteps").is_none());
+
+        // PostToolUse with null or empty error records tool_use (never tool_error)
+        let proj = crate::project::resolve_project(tmp.path());
+        handle_hook(
+            "antigravity",
+            Some("PostToolUse"),
+            json!({"cwd": tmp.path(), "conversationId": "agy-1", "tool_name": "run_command", "error": null}),
+            &db,
+            &embedder,
+            &distill,
+            &tx,
+            &state,
+        )
+        .await;
+        handle_hook(
+            "antigravity",
+            Some("PostToolUse"),
+            json!({"cwd": tmp.path(), "conversationId": "agy-1", "tool_name": "run_command", "error": ""}),
+            &db,
+            &embedder,
+            &distill,
+            &tx,
+            &state,
+        )
+        .await;
+        handle_hook(
+            "antigravity",
+            Some("PostToolUse"),
+            json!({"cwd": tmp.path(), "conversationId": "agy-1", "tool_name": "run_command", "error": "exit code 1"}),
+            &db,
+            &embedder,
+            &distill,
+            &tx,
+            &state,
+        )
+        .await;
+        let recent = db.recent_raw_events(Some(&proj.id), None, 10).unwrap();
+        let err_count = recent
+            .iter()
+            .filter(|e| e.event_type == "tool_error")
+            .count();
+        let ok_count = recent.iter().filter(|e| e.event_type == "tool_use").count();
+        assert_eq!(err_count, 1);
+        assert_eq!(ok_count, 2);
     }
 }
