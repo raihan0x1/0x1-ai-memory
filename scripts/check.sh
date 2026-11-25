@@ -77,9 +77,9 @@ for path in sorted(pathlib.Path("ui/src/pages").glob("*.tsx")):
                     raise SystemExit(f"HTML5 stepMismatch trap in {path}: min={min_v}, step={step_v}")
 PY
 
-if [ "$SKIP_UI" -eq 0 ]; then
-  echo "==> Building embedded UI"
-  (cd ui && pnpm build)
+if [[ "$SKIP_UI" -eq 0 ]]; then
+  echo "==> Linting & building embedded UI"
+  (cd ui && pnpm lint && pnpm build)
 fi
 
 echo "==> Checking Rust formatting, Clippy, and tests (offline ONNX)"

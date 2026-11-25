@@ -78,6 +78,50 @@ if git rev-parse --verify "origin/${BRANCH}" >/dev/null 2>&1; then
   fi
 fi
 
+if [[ "$SKIP_CHECKS" -eq 0 ]]; then
+  echo "==> Checking SonarCloud Quality Gate on ${BRANCH}"
+  HEAD_SHA="$(git rev-parse HEAD)"
+  python3 - "$HEAD_SHA" <<'PY'
+import json, sys, urllib.request
+
+head_sha = sys.argv[1]
+base = "https://sonarcloud.io/api"
+qg_url = f"{base}/qualitygates/project_status?projectKey=raihan0x1_0x1-ai-memory&branch=main"
+ana_url = f"{base}/project_analyses/search?project=raihan0x1_0x1-ai-memory&branch=main&ps=1"
+
+try:
+    with urllib.request.urlopen(qg_url, timeout=5) as r:
+        qg = json.loads(r.read().decode())["projectStatus"]
+    with urllib.request.urlopen(ana_url, timeout=5) as r:
+        analyses = json.loads(r.read().decode()).get("analyses", [])
+except Exception as exc:
+    print(f"WARNING: Could not query SonarCloud Quality Gate ({exc}); continuing.")
+    sys.exit(0)
+
+status = qg.get("status")
+analyzed_rev = analyses[0].get("revision", "") if analyses else ""
+
+if status == "OK":
+    print(f"SonarCloud Quality Gate: OK (rev={analyzed_rev[:7]})")
+    sys.exit(0)
+
+failing = [
+    f"{c.get('metricKey')}={c.get('actualValue')} (threshold {c.get('errorThreshold')})"
+    for c in qg.get("conditions", [])
+    if c.get("status") != "OK"
+]
+if analyzed_rev == head_sha:
+    print(f"ERROR: SonarCloud Quality Gate failed on HEAD ({head_sha[:7]}): {', '.join(failing)}", file=sys.stderr)
+    print("See: https://sonarcloud.io/dashboard?id=raihan0x1_0x1-ai-memory&branch=main", file=sys.stderr)
+    sys.exit(1)
+
+print(
+    f"WARNING: Latest SonarCloud analysis ({analyzed_rev[:7]}) has status={status} "
+    f"({', '.join(failing)}), while HEAD is {head_sha[:7]} (unpushed local commits). Proceeding..."
+)
+PY
+fi
+
 CURRENT_VER="$(python3 -c '
 import re, pathlib
 text = pathlib.Path("Cargo.toml").read_text()
