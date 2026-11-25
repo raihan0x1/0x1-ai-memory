@@ -308,19 +308,38 @@ impl AutoStartManager {
     }
 }
 
-pub async fn daemon_is_healthy(port: u16) -> bool {
-    let Ok(client) = reqwest::Client::builder()
+#[derive(Debug, Clone, Deserialize)]
+pub struct DaemonHealth {
+    pub ok: bool,
+    pub version: Option<String>,
+    pub port: Option<u16>,
+}
+
+pub async fn fetch_daemon_health(port: u16) -> Option<DaemonHealth> {
+    let client = reqwest::Client::builder()
         .timeout(Duration::from_millis(400))
         .build()
-    else {
-        return false;
-    };
-    client
+        .ok()?;
+    let resp = client
         .get(format!("http://127.0.0.1:{port}/health"))
         .send()
         .await
-        .map(|r| r.status().is_success())
-        .unwrap_or(false)
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.json::<DaemonHealth>().await.ok().filter(|h| h.ok)
+}
+
+pub async fn daemon_is_healthy(port: u16) -> bool {
+    fetch_daemon_health(port).await.is_some()
+}
+
+pub fn daemon_needs_upgrade(running_version: Option<&str>, current_version: &str) -> bool {
+    match running_version {
+        Some(v) => v.trim_start_matches('v') != current_version.trim_start_matches('v'),
+        None => true,
+    }
 }
 
 pub async fn fetch_onboarding_completed(port: u16) -> Option<bool> {
@@ -543,6 +562,14 @@ mod tests {
         );
         assert_eq!(parse_pid_entry("4242\n"), Some((4242, DEFAULT_PORT)));
         assert_eq!(parse_pid_entry("bad"), None);
+    }
+
+    #[test]
+    fn daemon_upgrade_check_detects_version_mismatch() {
+        assert!(!daemon_needs_upgrade(Some("0.3.0"), "0.3.0"));
+        assert!(!daemon_needs_upgrade(Some("v0.3.0"), "0.3.0"));
+        assert!(daemon_needs_upgrade(Some("0.2.3"), "0.3.0"));
+        assert!(daemon_needs_upgrade(None, "0.3.0"));
     }
 
     #[test]

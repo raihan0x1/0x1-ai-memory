@@ -778,3 +778,98 @@ async fn sessions_raw_events_graph_context_and_recall_apis_work() {
     .await;
     assert!(flush["queued_sessions"].as_u64().unwrap() >= 1);
 }
+
+#[tokio::test]
+async fn stale_daemon_health_triggers_upgrade_and_ui_cache_headers() {
+    use axum::{Json, Router, routing::get, routing::post};
+
+    let tmp = tempdir().unwrap();
+    let state = test_state(tmp.path());
+    let app = build_router(state);
+
+    let root_resp = app
+        .clone()
+        .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(root_resp.status(), StatusCode::OK);
+    assert_eq!(
+        root_resp
+            .headers()
+            .get(axum::http::header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("no-cache")
+    );
+
+    let missing_asset = app
+        .oneshot(
+            Request::builder()
+                .uri("/assets/does-not-exist.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing_asset.status(), StatusCode::NOT_FOUND);
+
+    // Mock a stale v0.2.3 daemon exposing /health and /api/daemon/stop on an ephemeral port
+    let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+    let mock_app = Router::new()
+        .route(
+            "/health",
+            get(|| async {
+                Json(json!({
+                    "ok": true,
+                    "service": "0x1-ai-memory",
+                    "version": "0.2.3"
+                }))
+            }),
+        )
+        .route(
+            "/api/daemon/stop",
+            post(move || {
+                let tx = stop_tx.clone();
+                async move {
+                    let _ = tx.send(true);
+                    Json(json!({ "stopping": true }))
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, mock_app)
+            .with_graceful_shutdown(async move {
+                while !*stop_rx.borrow() {
+                    if stop_rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+            })
+            .await;
+    });
+
+    let health = ox1_memory::daemon::fetch_daemon_health(port)
+        .await
+        .expect("mock stale daemon should answer /health");
+    assert_eq!(health.version.as_deref(), Some("0.2.3"));
+    assert!(ox1_memory::daemon::daemon_needs_upgrade(
+        health.version.as_deref(),
+        env!("CARGO_PKG_VERSION")
+    ));
+
+    let paths = ox1_memory::config::AppPaths {
+        data_dir: tmp.path().to_path_buf(),
+        db_path: tmp.path().join("memory.db"),
+        log_path: tmp.path().join("daemon.log"),
+        pid_path: tmp.path().join("daemon.pid"),
+        backups_dir: tmp.path().join("backups"),
+        models_dir: tmp.path().join("models"),
+    };
+    assert!(ox1_memory::daemon::stop_daemon(&paths, port).await.unwrap());
+    assert!(
+        ox1_memory::daemon::fetch_daemon_health(port)
+            .await
+            .is_none()
+    );
+}

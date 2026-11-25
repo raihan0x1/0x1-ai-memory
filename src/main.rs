@@ -3,8 +3,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use ox1_memory::config::{AppPaths, DEFAULT_PORT};
 use ox1_memory::connectors::ConnectorManager;
 use ox1_memory::daemon::{
-    AutoStartManager, daemon_is_healthy, fetch_onboarding_completed, format_pid_entry,
-    read_log_tail, spawn_background, stop_daemon,
+    AutoStartManager, daemon_is_healthy, daemon_needs_upgrade, fetch_daemon_health,
+    fetch_onboarding_completed, format_pid_entry, read_log_tail, spawn_background, stop_daemon,
 };
 use ox1_memory::db::MemoryDb;
 use ox1_memory::distill::spawn_distill_worker;
@@ -239,15 +239,26 @@ fn web_ui_url(base_url: &str, onboarding_done: bool) -> String {
 
 async fn run_start(paths: AppPaths, port: u16, open_browser: bool) -> Result<()> {
     let base_url = format!("http://127.0.0.1:{port}");
-    if daemon_is_healthy(port).await {
-        let onboarding_done = fetch_onboarding_completed(port).await.unwrap_or(true);
-        let open_url = web_ui_url(&base_url, onboarding_done);
-        println!("0x1-ai-memory Daemon is already running on {base_url}");
-        println!("  Web UI : {open_url}");
-        if open_browser {
-            open_in_browser(&open_url);
+    let current_ver = env!("CARGO_PKG_VERSION");
+    if let Some(health) = fetch_daemon_health(port).await {
+        if !daemon_needs_upgrade(health.version.as_deref(), current_ver) {
+            let onboarding_done = fetch_onboarding_completed(port).await.unwrap_or(true);
+            let open_url = web_ui_url(&base_url, onboarding_done);
+            println!("0x1-ai-memory Daemon v{current_ver} is already running on {base_url}");
+            println!("  Web UI : {open_url}");
+            if open_browser {
+                open_in_browser(&open_url);
+            }
+            return Ok(());
         }
-        return Ok(());
+        let old_ver = health.version.as_deref().unwrap_or("unknown");
+        println!("Upgrading running Daemon on {base_url} (v{old_ver} -> v{current_ver})...");
+        let _ = stop_daemon(&paths, port).await?;
+        if daemon_is_healthy(port).await {
+            anyhow::bail!(
+                "Daemon v{old_ver} is still listening on port {port} after stop attempt; run `0x1-memory stop` or kill its PID and retry"
+            );
+        }
     }
 
     let bin_path =
@@ -374,7 +385,14 @@ async fn run_serve(paths: AppPaths, port: u16, open_browser: bool) -> Result<()>
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => l,
         Err(bind_err) => {
-            if daemon_is_healthy(port).await {
+            if let Some(health) = fetch_daemon_health(port).await {
+                if daemon_needs_upgrade(health.version.as_deref(), env!("CARGO_PKG_VERSION")) {
+                    let old_ver = health.version.as_deref().unwrap_or("unknown");
+                    anyhow::bail!(
+                        "Another 0x1-ai-memory Daemon (v{old_ver}) is already listening on {base_url} while this binary is v{}. Run `0x1-memory restart` to reload.",
+                        env!("CARGO_PKG_VERSION")
+                    );
+                }
                 println!("0x1-ai-memory Daemon is already running on {base_url}");
                 if open_browser {
                     open_in_browser(&open_url);
@@ -550,12 +568,20 @@ async fn run_status(paths: AppPaths, port: u16) -> Result<()> {
     let autostart = AutoStartManager::for_current_os(home, bin_path, paths.log_path, port).status();
     let conns = mgr.inspect_all(&db)?;
 
-    let live = daemon_is_healthy(port).await;
+    let health = fetch_daemon_health(port).await;
+    let current_ver = env!("CARGO_PKG_VERSION");
+    let daemon_label = match health {
+        Some(ref h) if daemon_needs_upgrade(h.version.as_deref(), current_ver) => {
+            let old = h.version.as_deref().unwrap_or("unknown");
+            format!(
+                "RUNNING v{old} [OUTDATED: binary is v{current_ver} — run `0x1-memory restart`]"
+            )
+        }
+        Some(ref h) => format!("RUNNING v{}", h.version.as_deref().unwrap_or(current_ver)),
+        None => "STOPPED".to_string(),
+    };
 
-    println!(
-        "Daemon     : {} (http://127.0.0.1:{port})",
-        if live { "RUNNING" } else { "STOPPED" }
-    );
+    println!("Daemon     : {daemon_label} (http://127.0.0.1:{port})");
     println!(
         "Auto-Start : {}",
         if autostart.enabled {

@@ -169,6 +169,7 @@ async function ensureBinary() {
     }
 
     mkdirSync(binDir, { recursive: true });
+    const wasUpgrade = existsSync(binPath);
     const stagedPath = path.join(binDir, `${BIN_NAME}.tmp-${process.pid}`);
     writeFileSync(stagedPath, readFileSync(extracted));
     if (!IS_WIN) {
@@ -177,6 +178,12 @@ async function ensureBinary() {
     renameSync(stagedPath, binPath);
     writeFileSync(stampPath, `${VERSION}\n`);
     console.error(`Installed native Rust binary to ${binPath}`);
+    const subcmd = process.argv[2];
+    if (wasUpgrade && subcmd && subcmd !== 'start' && subcmd !== 'restart') {
+      console.error(
+        `Upgraded binary to v${VERSION}. Run '0x1-memory restart' if a Daemon is already running.`,
+      );
+    }
     return binPath;
   } finally {
     rmSync(tmpDir, { recursive: true, force: true });

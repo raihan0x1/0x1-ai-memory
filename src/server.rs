@@ -709,17 +709,32 @@ async fn static_ui_handler(uri: Uri) -> Response {
 
     if let Some(file) = UiAssets::get(path) {
         let mime = mime_guess::from_path(path).first_or_octet_stream();
+        let cache_control = if path.starts_with("assets/") {
+            "public, max-age=31536000, immutable"
+        } else {
+            "no-cache"
+        };
         return (
-            [(header::CONTENT_TYPE, mime.as_ref().to_string())],
+            [
+                (header::CONTENT_TYPE, mime.as_ref().to_string()),
+                (header::CACHE_CONTROL, cache_control.to_string()),
+            ],
             file.data.into_owned(),
         )
             .into_response();
     }
 
+    if path.starts_with("assets/") {
+        return (StatusCode::NOT_FOUND, "Asset not found").into_response();
+    }
+
     // SPA fallback to index.html for client-side routes (/memories, /connections, /engine)
     if let Some(index) = UiAssets::get("index.html") {
         return (
-            [(header::CONTENT_TYPE, "text/html; charset=utf-8".to_string())],
+            [
+                (header::CONTENT_TYPE, "text/html; charset=utf-8".to_string()),
+                (header::CACHE_CONTROL, "no-cache".to_string()),
+            ],
             index.data.into_owned(),
         )
             .into_response();
