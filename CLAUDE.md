@@ -3,8 +3,8 @@
 Single Rust binary (`0x1-memory`) with an embedded React/Vite Web UI (`ui/dist/`).
 
 - **Build order**: Run `cd ui && pnpm build` before `cargo build` / `cargo test` after fresh clone or any `ui/` edit (`src/server.rs` embeds `ui/dist/` via `rust-embed`).
-- **Verification**: Run `./scripts/check.sh` before committing.
-- **Release**: Run `./scripts/release.sh` to bump version, run checks, tag `vX.Y.Z`, and push to trigger GitHub Release.
+- **Verification**: Run `./scripts/check.sh` before committing, and activate tracked git hooks once per clone via `git config core.hooksPath .githooks`. After pushing to `main`, run `./scripts/sonar-gate.sh --wait 240` to verify SonarCloud Quality Gate on the exact pushed SHA.
+- **Release**: Run `./scripts/release.sh` to run `check.sh`, push `main` and wait for SonarCloud Quality Gate before bumping version, tagging `vX.Y.Z`, and pushing to trigger GitHub Release (which also gates publish on `sonar-gate`).
 - **Pointers**:
   - Changing client hooks, MCP configs, or T3 watcher → read `docs/research/client-integrations.md` (Codex `timeoutSec`/no-`systemMessage`, Antigravity `injectSteps`/`PreInvocation` dedup, T3 `statev2.sqlite` dual-ID dedup).
   - Changing schema, distillation, budget caps, or privacy → read `docs/ARCHITECTURE.md`.

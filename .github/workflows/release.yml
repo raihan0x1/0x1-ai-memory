@@ -83,9 +83,18 @@ jobs:
           name: bin-${{ matrix.asset }}
           path: dist/${{ matrix.asset }}.${{ matrix.ext }}
 
+  sonar-gate:
+    name: SonarCloud Quality Gate
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Wait for SonarCloud Quality Gate
+        run: bash scripts/sonar-gate.sh --sha "${{ github.sha }}" --branch main --wait 240
+
   publish:
     name: Publish GitHub Release
-    needs: build-binary
+    needs: [build-binary, sonar-gate]
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write

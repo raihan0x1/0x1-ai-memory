@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+python3 scripts/sonar-guard.py
+
+if [[ "${OX1_SKIP_SONAR_GATE:-0}" == "1" ]]; then
+  exit 0
+fi
+
+while read -r local_ref local_sha _remote_ref _remote_sha; do
+  if [[ "$local_ref" == refs/tags/v* ]] && [[ -n "$local_sha" ]]; then
+    echo "==> Verifying SonarCloud Quality Gate before pushing release tag ${local_ref#refs/tags/}"
+    ./scripts/sonar-gate.sh --sha "$local_sha" --branch main
+  fi
+done

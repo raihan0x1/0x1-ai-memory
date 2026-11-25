@@ -642,7 +642,7 @@ impl UpdateManager {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            tokio::fs::set_permissions(&extracted, std::fs::Permissions::from_mode(0o755)).await?;
+            tokio::fs::set_permissions(&extracted, std::fs::Permissions::from_mode(0o700)).await?;
         }
 
         self.set_runtime_stage("smoke_testing", Some(&target.version))
@@ -686,7 +686,7 @@ impl UpdateManager {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            tokio::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755)).await?;
+            tokio::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o700)).await?;
         }
 
         if let Err(err) = replace_binary_file(&staged, &self.exe_path).await {
@@ -903,7 +903,7 @@ async fn resolve_system_bin_async(candidates: &[&str]) -> Result<PathBuf> {
 async fn extract_archive_async(archive_path: &Path, dest_dir: &Path) -> Result<()> {
     let name = archive_path
         .file_name()
-        .and_then(|s| s.to_str())
+        .and_then(std::ffi::OsStr::to_str)
         .unwrap_or("");
     if name.ends_with(".tar.gz") {
         let tar_bin = resolve_system_bin_async(&["/usr/bin/tar", "/bin/tar"]).await?;

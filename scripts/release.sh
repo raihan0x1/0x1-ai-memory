@@ -28,7 +28,7 @@ Options:
 EOF
 }
 
-while [ "$#" -gt 0 ]; do
+while [[ "$#" -gt 0 ]]; do
   case "$1" in
     --dry-run) DRY_RUN=1 ;;
     --skip-checks) SKIP_CHECKS=1 ;;
@@ -44,7 +44,7 @@ while [ "$#" -gt 0 ]; do
       exit 1
       ;;
     *)
-      if [ -n "$TARGET" ]; then
+      if [[ -n "$TARGET" ]]; then
         echo "Unexpected extra argument: $1" >&2
         usage >&2
         exit 1
@@ -56,12 +56,12 @@ while [ "$#" -gt 0 ]; do
 done
 
 BRANCH="$(git rev-parse --abbrev-ref HEAD)"
-if [ "$BRANCH" != "main" ] && [ "$ALLOW_NON_MAIN" -eq 0 ]; then
+if [[ "$BRANCH" != "main" ]] && [[ "$ALLOW_NON_MAIN" -eq 0 ]]; then
   echo "ERROR: Current branch is '${BRANCH}'. Switch to 'main' or pass --allow-non-main." >&2
   exit 1
 fi
 
-if [ -n "$(git status --porcelain)" ]; then
+if [[ -n "$(git status --porcelain)" ]]; then
   echo "ERROR: Working tree has uncommitted changes. Commit or stash them first." >&2
   git status -s >&2
   exit 1
@@ -70,56 +70,14 @@ fi
 echo "==> Syncing tags from origin"
 git fetch --tags origin --quiet
 
+AHEAD=0
 if git rev-parse --verify "origin/${BRANCH}" >/dev/null 2>&1; then
   BEHIND="$(git rev-list --count "HEAD..origin/${BRANCH}")"
-  if [ "$BEHIND" -gt 0 ]; then
+  if [[ "$BEHIND" -gt 0 ]]; then
     echo "ERROR: Local '${BRANCH}' is ${BEHIND} commit(s) behind origin/${BRANCH}. Pull/rebase first." >&2
     exit 1
   fi
-fi
-
-if [[ "$SKIP_CHECKS" -eq 0 ]]; then
-  echo "==> Checking SonarCloud Quality Gate on ${BRANCH}"
-  HEAD_SHA="$(git rev-parse HEAD)"
-  python3 - "$HEAD_SHA" <<'PY'
-import json, sys, urllib.request
-
-head_sha = sys.argv[1]
-base = "https://sonarcloud.io/api"
-qg_url = f"{base}/qualitygates/project_status?projectKey=raihan0x1_0x1-ai-memory&branch=main"
-ana_url = f"{base}/project_analyses/search?project=raihan0x1_0x1-ai-memory&branch=main&ps=1"
-
-try:
-    with urllib.request.urlopen(qg_url, timeout=5) as r:
-        qg = json.loads(r.read().decode())["projectStatus"]
-    with urllib.request.urlopen(ana_url, timeout=5) as r:
-        analyses = json.loads(r.read().decode()).get("analyses", [])
-except Exception as exc:
-    print(f"WARNING: Could not query SonarCloud Quality Gate ({exc}); continuing.")
-    sys.exit(0)
-
-status = qg.get("status")
-analyzed_rev = analyses[0].get("revision", "") if analyses else ""
-
-if status == "OK":
-    print(f"SonarCloud Quality Gate: OK (rev={analyzed_rev[:7]})")
-    sys.exit(0)
-
-failing = [
-    f"{c.get('metricKey')}={c.get('actualValue')} (threshold {c.get('errorThreshold')})"
-    for c in qg.get("conditions", [])
-    if c.get("status") != "OK"
-]
-if analyzed_rev == head_sha:
-    print(f"ERROR: SonarCloud Quality Gate failed on HEAD ({head_sha[:7]}): {', '.join(failing)}", file=sys.stderr)
-    print("See: https://sonarcloud.io/dashboard?id=raihan0x1_0x1-ai-memory&branch=main", file=sys.stderr)
-    sys.exit(1)
-
-print(
-    f"WARNING: Latest SonarCloud analysis ({analyzed_rev[:7]}) has status={status} "
-    f"({', '.join(failing)}), while HEAD is {head_sha[:7]} (unpushed local commits). Proceeding..."
-)
-PY
+  AHEAD="$(git rev-list --count "origin/${BRANCH}..HEAD")"
 fi
 
 CURRENT_VER="$(python3 -c '
@@ -144,13 +102,13 @@ if git rev-parse -q --verify "refs/tags/v${CURRENT_VER}" >/dev/null 2>&1; then
   CURRENT_TAG_EXISTS=1
 fi
 
-if [ -z "$TARGET" ]; then
+if [[ -z "$TARGET" ]]; then
   echo ""
   echo "Current version : ${CURRENT_VER}"
   echo "Latest git tag  : ${LATEST_TAG:-none}"
   echo ""
   echo "Choose release version:"
-  if [ "$CURRENT_TAG_EXISTS" -eq 0 ]; then
+  if [[ "$CURRENT_TAG_EXISTS" -eq 0 ]]; then
     echo "  1) current  -> v${CURRENT_VER}  (tag current version without bumping)"
     echo "  2) patch    -> v${NEXT_PATCH}"
     echo "  3) minor    -> v${NEXT_MINOR}"
@@ -215,14 +173,20 @@ if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null 2>&1; then
 fi
 
 NEEDS_BUMP=1
-if [ "$NEXT_VER" = "$CURRENT_VER" ]; then
+if [[ "$NEXT_VER" == "$CURRENT_VER" ]]; then
   NEEDS_BUMP=0
 fi
 
-if [ "$SKIP_CHECKS" -eq 1 ]; then
+if [[ "$SKIP_CHECKS" -eq 1 ]]; then
   CHECKS_LABEL="skipped (--skip-checks)"
+  SONAR_LABEL="skipped (--skip-checks)"
 else
   CHECKS_LABEL="./scripts/check.sh"
+  if [[ "$AHEAD" -gt 0 ]]; then
+    SONAR_LABEL="push ${AHEAD} commit(s) to origin/${BRANCH} -> ./scripts/sonar-gate.sh --wait 240"
+  else
+    SONAR_LABEL="./scripts/sonar-gate.sh --wait 240 on HEAD"
+  fi
 fi
 
 echo ""
@@ -230,22 +194,23 @@ echo "Release plan:"
 echo "  Branch  : ${BRANCH}"
 echo "  Version : ${CURRENT_VER} -> ${NEXT_VER}"
 echo "  Tag     : ${TAG}"
-if [ "$NEEDS_BUMP" -eq 1 ]; then
+if [[ "$NEEDS_BUMP" -eq 1 ]]; then
   echo "  Files   : Cargo.toml, Cargo.lock, ui/package.json, npm/package.json"
   echo "  Commit  : chore(release): ${TAG}"
 else
   echo "  Files   : unchanged (tagging current version)"
 fi
 echo "  Checks  : ${CHECKS_LABEL}"
+echo "  Sonar   : ${SONAR_LABEL}"
 echo "  Push    : git push origin ${BRANCH} ${TAG}"
 echo ""
 
-if [ "$DRY_RUN" -eq 1 ]; then
+if [[ "$DRY_RUN" -eq 1 ]]; then
   echo "[dry-run] No changes made."
   exit 0
 fi
 
-if [ "$AUTO_YES" -eq 0 ]; then
+if [[ "$AUTO_YES" -eq 0 ]]; then
   printf "Proceed to release %s and trigger GitHub Release? [y/N]: " "$TAG"
   read -r CONFIRM
   case "$CONFIRM" in
@@ -257,7 +222,18 @@ if [ "$AUTO_YES" -eq 0 ]; then
   esac
 fi
 
-if [ "$NEEDS_BUMP" -eq 1 ]; then
+if [[ "$SKIP_CHECKS" -eq 0 ]]; then
+  ./scripts/check.sh
+  CODE_HEAD_SHA="$(git rev-parse HEAD)"
+  if [[ "$AHEAD" -gt 0 ]]; then
+    echo "==> Pushing ${AHEAD} commit(s) to origin/${BRANCH} for SonarCloud analysis"
+    git push origin "$BRANCH"
+  fi
+  echo "==> Waiting for SonarCloud Quality Gate on ${CODE_HEAD_SHA:0:7}"
+  ./scripts/sonar-gate.sh --sha "$CODE_HEAD_SHA" --branch "$BRANCH" --wait 240
+fi
+
+if [[ "$NEEDS_BUMP" -eq 1 ]]; then
   echo "==> Updating version to ${NEXT_VER}"
   python3 - "$NEXT_VER" <<'PY'
 import json, pathlib, re, sys
@@ -285,13 +261,9 @@ PY
   cargo update --workspace --offline
 fi
 
-if [ "$SKIP_CHECKS" -eq 0 ]; then
-  ./scripts/check.sh
-fi
-
-if [ "$NEEDS_BUMP" -eq 1 ]; then
+if [[ "$NEEDS_BUMP" -eq 1 ]]; then
   git add Cargo.toml Cargo.lock ui/package.json npm/package.json
-  if [ "$SKIP_CHECKS" -eq 0 ]; then
+  if [[ "$SKIP_CHECKS" -eq 0 ]]; then
     git commit --no-verify -m "chore(release): ${TAG}"
   else
     git commit -m "chore(release): ${TAG}"
@@ -299,7 +271,7 @@ if [ "$NEEDS_BUMP" -eq 1 ]; then
 fi
 
 git tag -a "$TAG" -m "Release ${TAG}"
-git push origin "$BRANCH" "$TAG"
+OX1_SKIP_SONAR_GATE=1 git push origin "$BRANCH" "$TAG"
 
 REPO_URL="$(git remote get-url origin | sed -E 's#\.git$##; s#^git@github\.com:#https://github.com/#')"
 echo ""

@@ -18,8 +18,10 @@ jobs:
       - name: Shell syntax & ShellCheck
         run: |
           sh -n install.sh
-          bash -n scripts/*.sh
-          shellcheck install.sh scripts/*.sh
+          bash -n scripts/*.sh .githooks/*
+          shellcheck install.sh scripts/*.sh .githooks/*
+      - name: Run Sonar static guardrails
+        run: python3 scripts/sonar-guard.py
       - name: Check installer & npm launcher asset parity
         run: |
           while IFS= read -r asset; do

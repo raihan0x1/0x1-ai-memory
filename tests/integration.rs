@@ -75,7 +75,7 @@ async fn body_json(resp: axum::response::Response) -> Value {
 async fn end_to_end_cross_client_mcp_hooks_ui_and_budget_guard() {
     let tmp = tempdir().unwrap();
     let repo_dir = tmp.path().join("demo-repo");
-    std::fs::create_dir_all(&repo_dir).unwrap();
+    tokio::fs::create_dir_all(&repo_dir).await.unwrap();
     let state = test_state(tmp.path());
     let app = build_router(state.clone());
 
@@ -583,7 +583,7 @@ async fn engine_test_uses_unsaved_draft_without_mutating_saved_settings() {
 async fn sessions_raw_events_graph_context_and_recall_apis_work() {
     let tmp = tempdir().unwrap();
     let repo_dir = tmp.path().join("graph-repo");
-    std::fs::create_dir_all(&repo_dir).unwrap();
+    tokio::fs::create_dir_all(&repo_dir).await.unwrap();
     let state = test_state(tmp.path());
     let app = build_router(state.clone());
 
@@ -1200,13 +1200,15 @@ async fn updater_checks_etag_dismisses_seeds_whats_new_and_verifies_swap() {
 
     let tmp = tempdir().unwrap();
     let bin_dir = tmp.path().join("bin");
-    std::fs::create_dir_all(&bin_dir).unwrap();
+    tokio::fs::create_dir_all(&bin_dir).await.unwrap();
     let exe_path = bin_dir.join(if cfg!(windows) {
         "0x1-memory.exe"
     } else {
         "0x1-memory"
     });
-    std::fs::write(&exe_path, b"old-binary-bytes").unwrap();
+    tokio::fs::write(&exe_path, b"old-binary-bytes")
+        .await
+        .unwrap();
 
     // Prepare mock archive + SHA256SUMS.txt (real tar.gz on Unix; bogus bytes for cross-platform failure check)
     let asset = platform_asset_name().unwrap_or("0x1-memory-darwin-arm64.tar.gz");
@@ -1214,13 +1216,17 @@ async fn updater_checks_etag_dismisses_seeds_whats_new_and_verifies_swap() {
         #[cfg(unix)]
         {
             let stage_dir = tmp.path().join("pkg");
-            std::fs::create_dir_all(&stage_dir).unwrap();
+            tokio::fs::create_dir_all(&stage_dir).await.unwrap();
             let mock_bin = stage_dir.join("0x1-memory");
-            std::fs::write(&mock_bin, "#!/bin/sh\necho \"0x1-memory 9.9.9\"\n").unwrap();
+            tokio::fs::write(&mock_bin, "#!/bin/sh\necho \"0x1-memory 9.9.9\"\n")
+                .await
+                .unwrap();
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&mock_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            tokio::fs::set_permissions(&mock_bin, std::fs::Permissions::from_mode(0o700))
+                .await
+                .unwrap();
             let archive_file = tmp.path().join("pkg.tar.gz");
-            let status = std::process::Command::new("/usr/bin/tar")
+            let status = tokio::process::Command::new("/usr/bin/tar")
                 .args([
                     "-czf",
                     archive_file.to_str().unwrap(),
@@ -1229,9 +1235,10 @@ async fn updater_checks_etag_dismisses_seeds_whats_new_and_verifies_swap() {
                     "0x1-memory",
                 ])
                 .status()
+                .await
                 .unwrap();
             assert!(status.success());
-            std::fs::read(archive_file).unwrap()
+            tokio::fs::read(archive_file).await.unwrap()
         }
         #[cfg(not(unix))]
         {
@@ -1452,7 +1459,10 @@ async fn updater_checks_etag_dismisses_seeds_whats_new_and_verifies_swap() {
     *sums_payload.write().await = bad_sums;
     let fail_res = updater.stage_verify_and_swap(&target, asset).await;
     assert!(fail_res.is_err());
-    assert_eq!(std::fs::read(&exe_path).unwrap(), b"old-binary-bytes");
+    assert_eq!(
+        tokio::fs::read(&exe_path).await.unwrap(),
+        b"old-binary-bytes"
+    );
 
     // 5. Valid checksum + --version smoke check swaps binary, updates .version stamp, and caches notes
     #[cfg(unix)]
@@ -1462,9 +1472,19 @@ async fn updater_checks_etag_dismisses_seeds_whats_new_and_verifies_swap() {
             .stage_verify_and_swap(&target, asset)
             .await
             .expect("valid archive & checksum should swap binary");
-        let swapped = std::fs::read_to_string(&exe_path).unwrap();
+        let swapped = tokio::fs::read_to_string(&exe_path).await.unwrap();
         assert!(swapped.contains("0x1-memory 9.9.9"));
-        let stamp = std::fs::read_to_string(bin_dir.join(".version")).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let swapped_mode = tokio::fs::metadata(&exe_path)
+            .await
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(swapped_mode, 0o700);
+        let stamp = tokio::fs::read_to_string(bin_dir.join(".version"))
+            .await
+            .unwrap();
         assert_eq!(stamp.trim(), "9.9.9");
         let cached_notes = state
             .db

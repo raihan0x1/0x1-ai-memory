@@ -15,12 +15,12 @@ for arg in "$@"; do
   esac
 done
 
-echo "==> Checking shell scripts and npm launcher"
+echo "==> Checking shell scripts, git hooks, and npm launcher"
 sh -n install.sh
-bash -n scripts/*.sh
+bash -n scripts/*.sh .githooks/*
 node --check npm/bin/0x1-memory.mjs
 if command -v shellcheck >/dev/null 2>&1; then
-  shellcheck install.sh scripts/*.sh
+  shellcheck install.sh scripts/*.sh .githooks/*
 else
   echo "  (shellcheck not installed locally; syntax verified with sh/bash -n)"
 fi
@@ -76,6 +76,9 @@ for path in sorted(pathlib.Path("ui/src/pages").glob("*.tsx")):
                 if step_v > 1 and (min_v % step_v) != 0:
                     raise SystemExit(f"HTML5 stepMismatch trap in {path}: min={min_v}, step={step_v}")
 PY
+
+echo "==> Checking SonarCloud static guardrails"
+python3 scripts/sonar-guard.py
 
 if [[ "$SKIP_UI" -eq 0 ]]; then
   echo "==> Linting & building embedded UI"

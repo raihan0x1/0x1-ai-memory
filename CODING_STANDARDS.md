@@ -36,7 +36,10 @@ The daemon binds exclusively to `127.0.0.1`. Keep both CORS origin filtering and
 
 ## 6. Async I/O & Supply-Chain Hardening (SonarCloud Quality Gate)
 
-- Inside Rust `async fn`, never call blocking `std::fs` directly — use `tokio::fs` or `tokio::task::spawn_blocking`.
+Enforced locally by `scripts/sonar-guard.py` (inside `./scripts/check.sh`, `.githooks/pre-push`, and CI) and verified against SonarCloud by `./scripts/sonar-gate.sh`:
+
+- **No blocking I/O in async Rust (`rust:S7487`)**: Inside any Rust `async fn` (including `#[tokio::test]` integration tests), never call blocking `std::fs`, `std::process::Command`, or `std::thread::sleep` directly — use `tokio::fs`, `tokio::process::Command`, or `tokio::task::spawn_blocking`.
+- **No loose POSIX permissions (`rust:S2612`)**: Never pass world-accessible or group-writable modes (`0o755`, `0o644`, `0o775`) to `Permissions::from_mode` / `set_mode`; use owner-only modes (`0o700` for executables/dirs, `0o600` for files).
 - In shell installers (`install.sh`), enforce HTTPS on `curl` (`--proto '=https' --tlsv1.2`).
 - In GitHub Actions workflows (`.github/workflows/`), pin third-party actions to full 40-char commit SHAs, scope `permissions: contents: write` to the specific job that needs it, and pass `--locked` to `cargo build --release`.
 - In the Node launcher (`npm/bin/0x1-memory.mjs`), invoke archive tools (`tar`, `unzip`, `powershell.exe`) via fixed system directories instead of bare `PATH` lookup; in `ui/src/api.ts`, validate same-origin `/api/` paths before calling `fetch`.
