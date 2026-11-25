@@ -1008,6 +1008,20 @@ mod tests {
                 .unwrap()
         );
 
+        // Even after inspect_all persists passive t3-code (connected=1) from a prior run or restart,
+        // Onboarding must NOT be auto-skipped when no active client or memory exists.
+        let initial = mgr.inspect_all(&db).unwrap();
+        assert!(
+            initial
+                .iter()
+                .any(|c| c.client_id == "t3-code" && c.connected)
+        );
+        assert!(
+            !db.seed_onboarding_if_existing(mgr.has_explicit_client_config())
+                .unwrap()
+        );
+        assert!(!db.get_settings().unwrap().onboarding_completed);
+
         // Half-configured Claude Code (only MCP entry on old port, no hooks) still flags Port Mismatch
         std::fs::create_dir_all(home.join(".claude")).unwrap();
         std::fs::write(

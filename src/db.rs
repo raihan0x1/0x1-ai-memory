@@ -234,8 +234,9 @@ impl MemoryDb {
             conn.query_row("SELECT EXISTS(SELECT 1 FROM memories LIMIT 1)", [], |r| {
                 r.get::<_, i64>(0)
             })? != 0;
+        // Ignore passive t3-code (marked connected by default whenever T3 Code is installed).
         let has_prior_conn: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM client_connections WHERE connected = 1 LIMIT 1)",
+            "SELECT EXISTS(SELECT 1 FROM client_connections WHERE connected = 1 AND client_id != 't3-code' LIMIT 1)",
             [],
             |r| r.get::<_, i64>(0),
         )? != 0;
