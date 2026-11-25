@@ -282,9 +282,9 @@ export function StreamPage({
               <button
                 type="button"
                 className="btn btn-primary"
-                onClick={() => onNavigate('connections')}
+                onClick={() => onNavigate('onboarding')}
               >
-                Open setup wizard
+                Open onboarding
               </button>
               <button type="button" className="btn" onClick={() => setSaveOpen(true)}>
                 Save first memory

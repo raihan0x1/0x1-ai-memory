@@ -101,7 +101,11 @@ export const api = {
       method: 'PATCH',
       body: JSON.stringify(patch),
     }),
-  testEngine: () => req<ConnectionTestResult>('/api/engine/test', { method: 'POST' }),
+  testEngine: (draft?: Record<string, unknown>) =>
+    req<ConnectionTestResult>('/api/engine/test', {
+      method: 'POST',
+      ...(draft ? { body: JSON.stringify(draft) } : {}),
+    }),
   connections: () => req<{ connections: ClientConnection[] }>('/api/connections'),
   universalSnippets: () => req<UniversalMcpSnippets>('/api/connections/universal'),
   previewConnect: (client: string) =>

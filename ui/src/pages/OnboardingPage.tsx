@@ -102,7 +102,7 @@ export function OnboardingPage({
   const [baseUrl, setBaseUrl] = useState(settings?.base_url ?? '');
   const [apiKeyInput, setApiKeyInput] = useState('');
   const [showKey, setShowKey] = useState(false);
-  const [dailyCostCap, setDailyCostCap] = useState(settings?.daily_cost_cap_usd ?? 0.5);
+  const [dailyCostCap, setDailyCostCap] = useState(String(settings?.daily_cost_cap_usd ?? 0.5));
   const [engineInitialized, setEngineInitialized] = useState(false);
   const [engineDirty, setEngineDirty] = useState(false);
   const [savingEngine, setSavingEngine] = useState(false);
@@ -124,7 +124,7 @@ export function OnboardingPage({
       setProvider(settings.provider);
       setModel(settings.model);
       setBaseUrl(settings.base_url);
-      setDailyCostCap(settings.daily_cost_cap_usd);
+      setDailyCostCap(String(settings.daily_cost_cap_usd));
       setEngineInitialized(true);
     }
   }, [settings, engineInitialized]);
@@ -259,12 +259,21 @@ export function OnboardingPage({
 
   async function handleTestEngine() {
     setTestingEngine(true);
+    setEngineFeedback(null);
     setTestResult(null);
     try {
-      const saved = await saveEngineConfig();
-      if (!saved) return;
-      const res = await api.testEngine();
+      const draft: Record<string, unknown> = {
+        provider,
+        model,
+        base_url: baseUrl,
+      };
+      if (apiKeyInput.trim() !== '') {
+        draft.api_key = apiKeyInput.trim();
+      }
+      const res = await api.testEngine(draft);
       setTestResult(res);
+    } catch (e) {
+      setEngineFeedback(e instanceof Error ? e.message : 'Failed to test connection');
     } finally {
       setTestingEngine(false);
     }
@@ -676,12 +685,12 @@ export function OnboardingPage({
                       name="daily_cost_cap_usd"
                       type="number"
                       min={0}
-                      step={0.05}
+                      step="any"
                       required
                       className="input input--mono"
                       value={dailyCostCap}
                       onChange={(e) => {
-                        setDailyCostCap(Number(e.target.value));
+                        setDailyCostCap(e.target.value);
                         setEngineDirty(true);
                       }}
                     />
@@ -788,7 +797,9 @@ export function OnboardingPage({
               <div className="metric-cell">
                 <span className="metric-label">Memory engine</span>
                 <span className="metric-value">{provider}</span>
-                <span className="metric-sub measure">Cap ${dailyCostCap.toFixed(2)}/day</span>
+                <span className="metric-sub measure">
+                  Cap ${Number(dailyCostCap || 0).toFixed(2)}/day
+                </span>
               </div>
               <div className="metric-cell">
                 <span className="metric-label">Auto-Start</span>

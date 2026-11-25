@@ -54,11 +54,28 @@ if len(set(versions.values())) != 1:
     raise SystemExit(f"Version mismatch across manifests: {versions}")
 PY
 
-echo "==> Checking Rim UI guardrails (no raw <select in pages)"
+echo "==> Checking Rim UI guardrails (no raw <select, valid number input steps)"
 if grep -rnE '<select([[:space:]]|>)' ui/src/pages/; then
   echo "ERROR: Use <RimSelect /> instead of native <select> in ui/src/pages/" >&2
   exit 1
 fi
+python3 - <<'PY'
+import pathlib, re
+for path in sorted(pathlib.Path("ui/src/pages").glob("*.tsx")):
+    text = path.read_text()
+    for m in re.finditer(r'<input\b[\s\S]*?/>', text):
+        tag = m.group(0)
+        if 'type="number"' not in tag:
+            continue
+        min_m = re.search(r'\bmin=\{([^}]+)\}', tag)
+        step_m = re.search(r'\bstep=(?:\{([^}]+)\}|"([^"]+)")', tag)
+        if min_m and step_m:
+            raw_step = step_m.group(1) or step_m.group(2)
+            if raw_step != "any":
+                min_v, step_v = float(min_m.group(1)), float(raw_step)
+                if step_v > 1 and (min_v % step_v) != 0:
+                    raise SystemExit(f"HTML5 stepMismatch trap in {path}: min={min_v}, step={step_v}")
+PY
 
 if [ "$SKIP_UI" -eq 0 ]; then
   echo "==> Building embedded UI"

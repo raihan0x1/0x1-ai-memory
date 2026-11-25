@@ -426,3 +426,143 @@ async fn daemon_stop_closes_open_sse_and_exits_cleanly_plus_autostart_api() {
 
     drop(sse_resp);
 }
+
+#[tokio::test]
+async fn engine_test_uses_unsaved_draft_without_mutating_saved_settings() {
+    use axum::{Router, extract::Request as AxumRequest, routing::post};
+    use std::sync::{Arc, Mutex};
+
+    let captured = Arc::new(Mutex::new(Vec::<(Option<String>, Value)>::new()));
+    let captured_srv = captured.clone();
+    let mock_router = Router::new().route(
+        "/v1/chat/completions",
+        post(move |req: AxumRequest| {
+            let captured_srv = captured_srv.clone();
+            async move {
+                let auth = req
+                    .headers()
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
+                let bytes = req.into_body().collect().await.unwrap().to_bytes();
+                let payload: Value = serde_json::from_slice(&bytes).unwrap_or_default();
+                captured_srv.lock().unwrap().push((auth, payload));
+                axum::Json(json!({
+                    "choices": [{ "message": { "content": "{\"ok\":true}" } }],
+                    "usage": { "prompt_tokens": 12, "completion_tokens": 4, "cost": 0.00001 }
+                }))
+            }
+        }),
+    );
+
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+    let mock_task = tokio::spawn(async move {
+        let _ = axum::serve(mock_listener, mock_router).await;
+    });
+
+    let tmp = tempdir().unwrap();
+    let state = test_state(tmp.path());
+    let app = build_router(state.clone());
+
+    // 1. Legacy empty-body POST still tests saved Zero-LLM settings
+    let empty_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/engine/test")
+                .header("content-type", "application/json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(empty_resp.status(), StatusCode::OK);
+    let empty_json = body_json(empty_resp).await;
+    assert_eq!(empty_json["ok"], true);
+    assert_eq!(empty_json["provider"], "none");
+
+    // 2. Unsaved draft payload tests OpenRouter directly without mutating saved DB settings
+    let draft_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/engine/test")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "provider": "openrouter",
+                        "model": "deepseek/deepseek-v4.1-flash-1017",
+                        "base_url": format!("http://{mock_addr}/v1"),
+                        "api_key": "sk-test-unsaved"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(draft_resp.status(), StatusCode::OK);
+    let draft_json = body_json(draft_resp).await;
+    assert_eq!(draft_json["ok"], true);
+    assert_eq!(draft_json["provider"], "openrouter");
+    assert_eq!(draft_json["model"], "deepseek/deepseek-v4.1-flash-1017");
+    assert_eq!(draft_json["input_tokens"], 12);
+    assert_eq!(draft_json["output_tokens"], 4);
+
+    // Saved DB settings remain untouched (still Zero-LLM with empty key)
+    let saved_after = state.db.get_settings().unwrap();
+    assert_eq!(saved_after.provider, "none");
+    assert_eq!(saved_after.api_key, "");
+
+    // 3. Omitting api_key in draft falls back to the stored api_key
+    let mut stored = state.db.get_settings().unwrap();
+    stored.api_key = "sk-stored-key".into();
+    state.db.save_settings(&stored).unwrap();
+
+    let stored_key_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/engine/test")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "provider": "openrouter",
+                        "model": "google/gemini-2.5-flash-lite",
+                        "base_url": format!("http://{mock_addr}/v1")
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stored_key_resp.status(), StatusCode::OK);
+    {
+        let calls = captured.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0.as_deref(), Some("Bearer sk-test-unsaved"));
+        assert_eq!(calls[0].1["model"], "deepseek/deepseek-v4.1-flash-1017");
+        assert_eq!(calls[1].0.as_deref(), Some("Bearer sk-stored-key"));
+    }
+
+    // 4. Malformed JSON returns 400 BAD_REQUEST
+    let bad_resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/engine/test")
+                .header("content-type", "application/json")
+                .body(Body::from("{not-json"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bad_resp.status(), StatusCode::BAD_REQUEST);
+
+    mock_task.abort();
+}

@@ -102,13 +102,13 @@ export function EnginePage({
   const [model, setModel] = useState('');
   const [baseUrl, setBaseUrl] = useState('');
   const [apiKeyInput, setApiKeyInput] = useState('');
-  const [dailyTokenCap, setDailyTokenCap] = useState(250000);
-  const [dailyCostCap, setDailyCostCap] = useState(0.5);
-  const [sessionBudget, setSessionBudget] = useState(450);
+  const [dailyTokenCap, setDailyTokenCap] = useState('250000');
+  const [dailyCostCap, setDailyCostCap] = useState('0.5');
+  const [sessionBudget, setSessionBudget] = useState('450');
   const [embeddingMode, setEmbeddingMode] = useState('local_onnx');
   const [embeddingModel, setEmbeddingModel] = useState('all-MiniLM-L6-v2');
-  const [retentionDays, setRetentionDays] = useState(14);
-  const [idleSeconds, setIdleSeconds] = useState(120);
+  const [retentionDays, setRetentionDays] = useState('14');
+  const [idleSeconds, setIdleSeconds] = useState('120');
 
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
@@ -121,6 +121,19 @@ export function EnginePage({
   const [confirmStopOpen, setConfirmStopOpen] = useState(false);
   const [stopping, setStopping] = useState(false);
 
+  function syncFormFromSettings(s: SettingsView) {
+    setProvider(s.provider);
+    setModel(s.model);
+    setBaseUrl(s.base_url);
+    setDailyTokenCap(String(s.daily_token_cap));
+    setDailyCostCap(String(s.daily_cost_cap_usd));
+    setSessionBudget(String(s.session_start_token_budget));
+    setEmbeddingMode(s.embedding_mode);
+    setEmbeddingModel(s.embedding_model);
+    setRetentionDays(String(s.raw_event_retention_days));
+    setIdleSeconds(String(s.distill_idle_seconds));
+  }
+
   async function load() {
     setLoading(true);
     setError(null);
@@ -128,16 +141,7 @@ export function EnginePage({
       const [s, u] = await Promise.all([api.settings(), api.usageHistory()]);
       setSettings(s);
       setUsage(u.usage);
-      setProvider(s.provider);
-      setModel(s.model);
-      setBaseUrl(s.base_url);
-      setDailyTokenCap(s.daily_token_cap);
-      setDailyCostCap(s.daily_cost_cap_usd);
-      setSessionBudget(s.session_start_token_budget);
-      setEmbeddingMode(s.embedding_mode);
-      setEmbeddingModel(s.embedding_model);
-      setRetentionDays(s.raw_event_retention_days);
-      setIdleSeconds(s.distill_idle_seconds);
+      syncFormFromSettings(s);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to load settings');
     } finally {
@@ -151,6 +155,9 @@ export function EnginePage({
 
   function onProviderChange(next: string) {
     setProvider(next);
+    setTestResult(null);
+    setSaveNotice(null);
+    setError(null);
     const preset = PROVIDER_PRESETS[next];
     if (preset) {
       setModel(preset.model);
@@ -161,6 +168,7 @@ export function EnginePage({
   async function handleSave(e: FormEvent) {
     e.preventDefault();
     setSaving(true);
+    setError(null);
     setSaveNotice(null);
     try {
       const patch: Record<string, unknown> = {
@@ -180,9 +188,12 @@ export function EnginePage({
       }
       const updated = await api.patchSettings(patch);
       setSettings(updated);
+      syncFormFromSettings(updated);
       setApiKeyInput('');
       setSaveNotice('Settings saved.');
       await onSaved();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to save settings');
     } finally {
       setSaving(false);
     }
@@ -190,11 +201,23 @@ export function EnginePage({
 
   async function handleTest() {
     setTesting(true);
+    setError(null);
     setTestResult(null);
     try {
-      const res = await api.testEngine();
+      const draft: Record<string, unknown> = {
+        provider,
+        model,
+        base_url: baseUrl,
+      };
+      if (apiKeyInput.trim() !== '') {
+        draft.api_key = apiKeyInput.trim();
+      }
+      const res = await api.testEngine(draft);
       setTestResult(res);
-      await Promise.all([load(), onSaved()]);
+      const [u] = await Promise.all([api.usageHistory(), onSaved()]);
+      setUsage(u.usage);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to test connection');
     } finally {
       setTesting(false);
     }
@@ -366,11 +389,11 @@ export function EnginePage({
                 id="eng-tok"
                 type="number"
                 min={1000}
-                step={10000}
+                step={1}
                 required
                 className="input input--mono"
                 value={dailyTokenCap}
-                onChange={(e) => setDailyTokenCap(Number(e.target.value))}
+                onChange={(e) => setDailyTokenCap(e.target.value)}
               />
             </div>
             <div className="field">
@@ -380,11 +403,11 @@ export function EnginePage({
                 id="eng-cost"
                 type="number"
                 min={0}
-                step={0.05}
+                step="any"
                 required
                 className="input input--mono"
                 value={dailyCostCap}
-                onChange={(e) => setDailyCostCap(Number(e.target.value))}
+                onChange={(e) => setDailyCostCap(e.target.value)}
               />
             </div>
           </div>
@@ -409,10 +432,11 @@ export function EnginePage({
                 type="number"
                 min={100}
                 max={2000}
+                step={1}
                 required
                 className="input input--mono"
                 value={sessionBudget}
-                onChange={(e) => setSessionBudget(Number(e.target.value))}
+                onChange={(e) => setSessionBudget(e.target.value)}
               />
             </div>
           </div>
@@ -441,10 +465,11 @@ export function EnginePage({
                 type="number"
                 min={1}
                 max={365}
+                step={1}
                 required
                 className="input input--mono"
                 value={retentionDays}
-                onChange={(e) => setRetentionDays(Number(e.target.value))}
+                onChange={(e) => setRetentionDays(e.target.value)}
               />
             </div>
             <div className="field">
@@ -454,10 +479,11 @@ export function EnginePage({
                 type="number"
                 min={15}
                 max={3600}
+                step={1}
                 required
                 className="input input--mono"
                 value={idleSeconds}
-                onChange={(e) => setIdleSeconds(Number(e.target.value))}
+                onChange={(e) => setIdleSeconds(e.target.value)}
               />
             </div>
           </div>

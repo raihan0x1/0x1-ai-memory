@@ -216,17 +216,45 @@ pub fn normalize_privacy_mode(raw: &str) -> &'static str {
 }
 
 pub fn normalize_client(raw: Option<&str>) -> String {
-    match raw
+    let lower = raw
         .map(|s| s.trim().to_ascii_lowercase())
-        .as_deref()
-        .unwrap_or("mcp")
+        .unwrap_or_default();
+    if lower.is_empty() {
+        return "mcp".into();
+    }
+    if lower == "claude" || lower.starts_with("claude-") || lower.starts_with("claude_") {
+        return "claude-code".into();
+    }
+    if lower == "codex" || lower.starts_with("codex-") || lower.starts_with("codex_") {
+        return "codex".into();
+    }
+    if lower == "antigravity"
+        || lower.starts_with("antigravity-")
+        || lower == "agy"
+        || lower == "gemini"
     {
-        "claude" | "claude-code" | "claude_code" => "claude-code".into(),
-        "codex" | "codex-cli" | "codex-app" => "codex".into(),
-        "antigravity" | "agy" | "gemini" => "antigravity".into(),
-        "t3" | "t3-code" | "t3code" => "t3-code".into(),
-        "ui" | "user" => "ui".into(),
-        other if !other.is_empty() => other.to_string(),
-        _ => "mcp".into(),
+        return "antigravity".into();
+    }
+    if lower == "t3" || lower == "t3code" || lower.starts_with("t3-") {
+        return "t3-code".into();
+    }
+    if lower == "ui" || lower == "user" {
+        return "ui".into();
+    }
+    lower
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_mcp_client_names_to_canonical_ids() {
+        assert_eq!(normalize_client(Some("codex-mcp-client")), "codex");
+        assert_eq!(normalize_client(Some("antigravity-client")), "antigravity");
+        assert_eq!(normalize_client(Some("claude-code/1.2.3")), "claude-code");
+        assert_eq!(normalize_client(Some("t3-code-desktop")), "t3-code");
+        assert_eq!(normalize_client(Some("cursor")), "cursor");
+        assert_eq!(normalize_client(None), "mcp");
     }
 }

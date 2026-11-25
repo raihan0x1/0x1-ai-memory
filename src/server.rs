@@ -10,6 +10,7 @@ use crate::mcp::handle_rpc;
 use crate::models::{NewMemoryInput, SearchFilter, StreamEvent, UpdateMemoryInput};
 use axum::{
     Json, Router,
+    body::Bytes,
     extract::{Path as AxumPath, Query, Request, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header},
     middleware::{self, Next},
@@ -454,8 +455,20 @@ async fn api_patch_settings(
     ))
 }
 
-async fn api_test_engine(State(st): State<AppState>) -> Result<Json<Value>, (StatusCode, String)> {
-    let settings = st.db.get_settings().map_err(internal_err)?;
+async fn api_test_engine(
+    State(st): State<AppState>,
+    body: Bytes,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let mut settings = st.db.get_settings().map_err(internal_err)?;
+    if !body.iter().all(|b| b.is_ascii_whitespace()) {
+        let patch: SettingsPatch = serde_json::from_slice(&body).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Invalid test settings payload: {e}"),
+            )
+        })?;
+        settings.apply_patch(patch);
+    }
     let result = st.llm.test_connection(&settings).await;
     let _ = st.db.record_usage(
         &result.provider,
