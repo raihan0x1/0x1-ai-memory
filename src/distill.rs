@@ -2,6 +2,7 @@ use crate::db::MemoryDb;
 use crate::embed::Embedder;
 use crate::llm::MemoryLlmClient;
 use crate::models::{NewMemoryInput, SearchFilter, StreamEvent};
+use crate::scrub::redact_secrets;
 use chrono::Utc;
 use serde_json::json;
 use std::time::Duration;
@@ -66,15 +67,14 @@ pub async fn distill_session_once(
     };
 
     // Respect per-project privacy mode before touching any external LLM API
-    let project = db.get_project(&project_id).ok().flatten();
-    let project_name = project
-        .as_ref()
-        .map(|p| p.name.clone())
-        .unwrap_or_else(|| project_id.clone());
-    let privacy_mode = project
-        .as_ref()
-        .map(|p| p.privacy_mode.as_str())
-        .unwrap_or("full");
+    let Ok(Some(project)) = db.get_project(&project_id) else {
+        tracing::warn!(
+            session_id,
+            "Distillation postponed because project privacy could not be read"
+        );
+        return;
+    };
+    let privacy_mode = project.privacy_mode.as_str();
 
     if privacy_mode == "paused" {
         let _ = db.mark_events_distilled(&event_ids);
@@ -89,7 +89,7 @@ pub async fn distill_session_once(
 
     if privacy_mode == "local_only" && settings.is_external_destination() {
         tracing::info!(
-            project = %project_name,
+            project = %project.name,
             provider = %settings.provider,
             "Skipping off-machine LLM distillation for local_only project"
         );
@@ -97,11 +97,15 @@ pub async fn distill_session_once(
         return;
     }
 
-    // Hard budget guardrail check BEFORE calling LLM
     let emb_status = embedder.status_label(&settings);
-    if let Ok(summary) = db.usage_summary(&settings, emb_status)
-        && summary.budget_exhausted
-    {
+    let summary = match db.usage_summary(&settings, emb_status) {
+        Ok(summary) => summary,
+        Err(error) => {
+            tracing::warn!(session_id, %error, "Distillation postponed because usage could not be read");
+            return;
+        }
+    };
+    if summary.budget_exhausted {
         let _ = db.record_usage(
             &settings.provider,
             &settings.model,
@@ -133,31 +137,40 @@ pub async fn distill_session_once(
         )
         .unwrap_or_default();
 
-    match llm
+    let (memories, input_tokens, output_tokens, cost_usd) = match llm
         .distill_turn(
             &settings,
-            &project_name,
+            &project.name,
             &source_client,
             &events,
             &existing_recent,
         )
         .await
     {
-        Ok(result) => {
+        Ok(result) => (
+            result.memories,
+            result.input_tokens,
+            result.output_tokens,
+            result.estimated_cost_usd,
+        ),
+        Err(error) => (Err(redact_secrets(&error.to_string())), 0, 0, 0.0),
+    };
+    match memories {
+        Ok(memories) => {
             let _ = db.record_usage(
                 &settings.provider,
                 &settings.model,
                 "distill",
-                result.input_tokens,
-                result.output_tokens,
-                result.estimated_cost_usd,
+                input_tokens,
+                output_tokens,
+                cost_usd,
                 Some(session_id),
                 "ok",
                 None,
             );
             let _ = db.mark_events_distilled(&event_ids);
 
-            for item in result.memories.into_iter().take(3) {
+            for item in memories.into_iter().take(3) {
                 if item.title.trim().is_empty() || item.summary.trim().is_empty() {
                     continue;
                 }
@@ -198,23 +211,22 @@ pub async fn distill_session_once(
                 timestamp: Utc::now().to_rfc3339(),
                 payload: json!({
                     "status": "ok",
-                    "input_tokens": result.input_tokens,
-                    "output_tokens": result.output_tokens,
-                    "cost_usd": result.estimated_cost_usd,
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "cost_usd": cost_usd,
                 }),
             });
         }
-        Err(e) => {
+        Err(msg) => {
             // Strict zero-silent-fallback: record error and mark events so we don't spin-loop burn.
-            let msg = e.to_string();
             tracing::warn!(session_id, error = %msg, "Distillation failed (zero silent fallback)");
             let _ = db.record_usage(
                 &settings.provider,
                 &settings.model,
                 "distill",
-                0,
-                0,
-                0.0,
+                input_tokens,
+                output_tokens,
+                cost_usd,
                 Some(session_id),
                 "error",
                 Some(&msg),

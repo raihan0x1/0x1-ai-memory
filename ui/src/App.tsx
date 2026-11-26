@@ -20,11 +20,11 @@ import type {
 export type Tab = 'stream' | 'memories' | 'connections' | 'engine' | 'onboarding';
 
 const TAB_TITLES: Record<Tab, string> = {
-  stream: 'Live Stream | 0x1-ai-memory',
-  memories: 'Memories | 0x1-ai-memory',
-  connections: 'Connections | 0x1-ai-memory',
-  engine: 'Engine & Budget | 0x1-ai-memory',
-  onboarding: 'Onboarding | 0x1-ai-memory',
+  stream: 'Live Stream | AI Memory',
+  memories: 'Memories | AI Memory',
+  connections: 'Connections | AI Memory',
+  engine: 'Engine & Budget | AI Memory',
+  onboarding: 'Onboarding | AI Memory',
 };
 
 const ROUTE_TABS = new Set<Tab>(['memories', 'connections', 'engine', 'onboarding']);
@@ -148,6 +148,7 @@ function parseSseItem(kind: LiveStreamItem['kind'], raw: string, seq: number): L
 
 export function App() {
   const [tab, setTabState] = useState<Tab>(readTabFromUrl);
+  const [engineVisited, setEngineVisited] = useState(tab === 'engine');
   const [summary, setSummary] = useState<UsageSummary | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
   const [connections, setConnections] = useState<ClientConnection[]>([]);
@@ -197,6 +198,7 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    if (tab === 'engine') setEngineVisited(true);
     if (tab !== 'onboarding') {
       document.title = TAB_TITLES[tab];
     }
@@ -369,7 +371,7 @@ export function App() {
           <div className="topbar-inner">
             <span className="brand">
               <span className="brand-mark">0x1</span>
-              <span>0x1-ai-memory</span>
+              <span>AI Memory</span>
             </span>
             <div className="topbar-meta" role="status">
               <span className="telemetry-status">
@@ -386,7 +388,7 @@ export function App() {
               <div>
                 <h1 className="page-title">Daemon stopped</h1>
                 <p className="page-subtitle">
-                  0x1-ai-memory shut down cleanly. Local hooks fail open so your coding agents are
+                  AI Memory shut down cleanly. Local hooks fail open so your coding agents are
                   never blocked.
                 </p>
               </div>
@@ -415,7 +417,7 @@ export function App() {
           <div className="topbar-inner">
             <span className="brand">
               <span className="brand-mark">0x1</span>
-              <span>0x1-ai-memory</span>
+              <span>AI Memory</span>
             </span>
 
             <div className="topbar-meta">
@@ -467,7 +469,7 @@ export function App() {
             }}
           >
             <span className="brand-mark">0x1</span>
-            <span>0x1-ai-memory</span>
+            <span>AI Memory</span>
           </a>
 
           <nav className="nav" aria-label="Primary">
@@ -535,7 +537,9 @@ export function App() {
                 <span className="topbar-sep" aria-hidden="true" />
               </>
             ) : null}
-            <span className="measure">${(summary?.today_cost_usd ?? 0).toFixed(4)} USD</span>
+            <span className="measure" title="Recorded cost today (UTC)">
+              ${(summary?.today_cost_usd ?? 0).toFixed(4)} USD
+            </span>
             <span className="topbar-sep" aria-hidden="true" />
             <span className="telemetry-status" role="status">
               <span
@@ -595,22 +599,26 @@ export function App() {
             onRunOnboarding={() => setTab('onboarding')}
           />
         ) : null}
-        {tab === 'engine' ? (
-          <EnginePage
-            daemon={daemon}
-            daemonLoading={loading}
-            updateStatus={updateStatus}
-            onCheckUpdates={handleCheckUpdates}
-            onOpenUpdateModal={() => setUpdateModalOpen(true)}
-            onOpenWhatsNew={() => void handleOpenWhatsNew()}
-            onSaved={refresh}
-            onDaemonStopped={() => {
-              setDaemonStopped(true);
-              setSseConnected(false);
-              setError(null);
-            }}
-            onRunOnboarding={() => setTab('onboarding')}
-          />
+        {tab === 'engine' || engineVisited ? (
+          <div hidden={tab !== 'engine'}>
+            <EnginePage
+              active={tab === 'engine'}
+              summary={summary}
+              daemon={daemon}
+              daemonLoading={loading}
+              updateStatus={updateStatus}
+              onCheckUpdates={handleCheckUpdates}
+              onOpenUpdateModal={() => setUpdateModalOpen(true)}
+              onOpenWhatsNew={() => void handleOpenWhatsNew()}
+              onSaved={refresh}
+              onDaemonStopped={() => {
+                setDaemonStopped(true);
+                setSseConnected(false);
+                setError(null);
+              }}
+              onRunOnboarding={() => setTab('onboarding')}
+            />
+          </div>
         ) : null}
       </main>
 

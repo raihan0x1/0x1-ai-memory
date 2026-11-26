@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, type FormEvent } from 'react';
+import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 import { api, formatUtcTime } from '../api';
 import { ModalDialog } from '../components/ModalDialog';
 import { PaginationBar } from '../components/PaginationBar';
@@ -9,6 +9,7 @@ import type {
   SettingsView,
   UpdateStatusResponse,
   UsageEntry,
+  UsageSummary,
 } from '../types';
 
 const PROVIDER_PRESETS: Record<
@@ -16,39 +17,39 @@ const PROVIDER_PRESETS: Record<
   { label: string; meta: string; model: string; baseUrl: string; note: string }
 > = {
   none: {
-    label: 'Zero-LLM safe mode',
-    meta: '$0',
+    label: 'Distillation off',
+    meta: 'manual',
     model: '',
     baseUrl: '',
-    note: 'No background LLM calls. Hybrid FTS5 and vector search plus explicit memory_save run at $0 cost.',
+    note: 'Save memories manually and search with the embedding mode selected below.',
   },
   openrouter: {
-    label: 'OpenRouter (recommended)',
+    label: 'OpenRouter',
     meta: 'API',
     model: 'google/gemini-2.5-flash-lite',
     baseUrl: 'https://openrouter.ai/api/v1',
-    note: 'Decoupled distillation via OpenRouter with reasoning disabled and exact cost tracking. Supports env:OPENROUTER_API_KEY.',
+    note: 'Uses the OpenRouter adapter and sends redacted turn activity to the Base URL below.',
   },
   gemini: {
     label: 'Google Gemini API',
     meta: 'API',
     model: 'gemini-2.5-flash-lite',
     baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
-    note: 'Direct JSON distillation via Gemini API. Supports env:GEMINI_API_KEY.',
+    note: 'Uses the Gemini adapter and sends redacted turn activity to the Base URL below.',
   },
   ollama: {
     label: 'Ollama (local LLM)',
     meta: 'local',
     model: 'qwen2.5-coder:7b',
     baseUrl: 'http://127.0.0.1:11434/v1',
-    note: 'Zero external traffic and $0 API cost using your local Ollama server.',
+    note: 'Use a loopback URL and a locally installed model for on-device distillation.',
   },
   openai_compatible: {
     label: 'OpenAI-compatible endpoint',
     meta: 'API',
     model: 'gpt-4.1-nano',
     baseUrl: 'https://api.openai.com/v1',
-    note: 'Works with OpenAI, LM Studio, DeepSeek, Groq, vLLM, or any /v1/chat/completions server.',
+    note: 'Redacted turn activity goes to the configured endpoint for distillation.',
   },
   cli_claude: {
     label: 'Claude CLI (claude -p)',
@@ -80,12 +81,29 @@ const PROVIDER_OPTIONS = Object.entries(PROVIDER_PRESETS).map(([value, p]) => ({
 }));
 
 const EMBEDDING_OPTIONS = [
-  { value: 'local_onnx', label: 'Local ONNX (fastembed, free and offline)', meta: '384d' },
-  { value: 'fts_only', label: 'FTS5 BM25 only (zero model download)', meta: 'BM25' },
-  { value: 'api', label: 'API embeddings (uses configured base URL)', meta: 'API' },
+  { value: 'local_onnx', label: 'Local ONNX', meta: '384d' },
+  { value: 'fts_only', label: 'Keyword search only', meta: 'FTS5' },
+  { value: 'api', label: 'API embeddings', meta: 'API' },
 ];
 
+const EMBEDDING_HINTS: Record<string, string> = {
+  local_onnx: 'Keyword and meaning-based search. The model downloads once and runs on this device.',
+  fts_only: 'Matches keywords without downloading or running an embedding model.',
+  api: 'Sends global search queries and eligible memory content to the API below. Changing models requires re-embedding existing memory vectors for accurate results.',
+};
+
+function effectiveBaseUrl(provider: string, baseUrl: string) {
+  const trimmed = baseUrl.trim();
+  let end = trimmed.length;
+  while (trimmed.endsWith('/', end)) {
+    end -= 1;
+  }
+  return trimmed.slice(0, end) || PROVIDER_PRESETS[provider]?.baseUrl || 'https://api.openai.com/v1';
+}
+
 interface EnginePageProps {
+  active: boolean;
+  summary: UsageSummary | null;
   daemon: DaemonInfo | null;
   daemonLoading?: boolean;
   updateStatus: UpdateStatusResponse | null;
@@ -98,6 +116,8 @@ interface EnginePageProps {
 }
 
 export function EnginePage({
+  active,
+  summary,
   daemon,
   daemonLoading = false,
   updateStatus,
@@ -115,7 +135,9 @@ export function EnginePage({
   const [usagePageSize, setUsagePageSize] = useState(20);
   const [usageLoading, setUsageLoading] = useState(true);
   const [usageError, setUsageError] = useState<string | null>(null);
+  const usageVersion = useRef(0);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const [provider, setProvider] = useState('none');
@@ -134,6 +156,7 @@ export function EnginePage({
   const [testing, setTesting] = useState(false);
   const [saveNotice, setSaveNotice] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<ConnectionTestResult | null>(null);
+  const testVersion = useRef(0);
   const [autostartBusy, setAutostartBusy] = useState(false);
   const [checkingUpdates, setCheckingUpdates] = useState(false);
   const [autoCheckBusy, setAutoCheckBusy] = useState(false);
@@ -158,19 +181,20 @@ export function EnginePage({
 
   const loadSettings = useCallback(async () => {
     setLoading(true);
-    setError(null);
+    setLoadError(null);
     try {
       const s = await api.settings();
       setSettings(s);
       syncFormFromSettings(s);
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to load settings');
+      setLoadError(e instanceof Error ? e.message : 'Failed to load settings');
     } finally {
       setLoading(false);
     }
   }, [syncFormFromSettings]);
 
   const loadUsage = useCallback(async () => {
+    const version = ++usageVersion.current;
     setUsageLoading(true);
     setUsageError(null);
     try {
@@ -178,6 +202,7 @@ export function EnginePage({
         limit: usagePageSize,
         offset: (usagePage - 1) * usagePageSize,
       });
+      if (version !== usageVersion.current) return;
       if (u.total > 0 && (usagePage - 1) * usagePageSize >= u.total) {
         setUsagePage(Math.max(1, Math.ceil(u.total / usagePageSize)));
         return;
@@ -185,29 +210,33 @@ export function EnginePage({
       setUsage(u.usage);
       setUsageTotal(u.total);
     } catch (e) {
-      setUsageError(e instanceof Error ? e.message : 'Failed to load usage ledger');
+      if (version === usageVersion.current) {
+        setUsageError(e instanceof Error ? e.message : 'Failed to load usage ledger');
+      }
     } finally {
-      setUsageLoading(false);
+      if (version === usageVersion.current) setUsageLoading(false);
     }
   }, [usagePage, usagePageSize]);
-
-  const load = useCallback(async () => {
-    await Promise.all([loadSettings(), loadUsage()]);
-  }, [loadSettings, loadUsage]);
 
   useEffect(() => {
     void loadSettings();
   }, [loadSettings]);
 
   useEffect(() => {
-    void loadUsage();
-  }, [loadUsage]);
+    if (active) void loadUsage();
+  }, [active, loadUsage]);
+
+  function clearConnectionResult() {
+    testVersion.current += 1;
+    setTestResult(null);
+    setError(null);
+  }
 
   function onProviderChange(next: string) {
+    if (next === provider) return;
     setProvider(next);
-    setTestResult(null);
-    setSaveNotice(null);
-    setError(null);
+    setApiKeyInput('');
+    clearConnectionResult();
     const preset = PROVIDER_PRESETS[next];
     if (preset) {
       setModel(preset.model);
@@ -215,32 +244,49 @@ export function EnginePage({
     }
   }
 
-  async function handleSave(e: FormEvent) {
+  const connection = { provider, model, base_url: baseUrl };
+  const draft = {
+    ...connection,
+    daily_token_cap: Number(dailyTokenCap),
+    daily_cost_cap_usd: Number(dailyCostCap),
+    session_start_token_budget: Number(sessionBudget),
+    embedding_mode: embeddingMode,
+    embedding_model: embeddingModel,
+    raw_event_retention_days: Number(retentionDays),
+    distill_idle_seconds: Number(idleSeconds),
+  };
+  const patch = Object.fromEntries(
+    Object.entries(draft).filter(([key, value]) => settings?.[key as keyof SettingsView] !== value),
+  );
+  const destination = effectiveBaseUrl(provider, baseUrl);
+  const destinationChanged = provider !== settings?.provider ||
+    destination !== effectiveBaseUrl(provider, settings?.base_url ?? '');
+  const hasNewKey = apiKeyInput.trim() !== '';
+  if (destinationChanged || patch.model !== undefined || hasNewKey) Object.assign(patch, connection);
+  if (hasNewKey) patch.api_key = apiKeyInput.trim();
+  const dirty = !!settings && Object.keys(patch).length > 0;
+
+  async function handleSave(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
+    if (!dirty || saving || testing || autoCheckBusy) return;
+    if (draft.daily_token_cap > 0 && draft.daily_token_cap < 1000) {
+      const input = e.currentTarget.elements.namedItem('daily_token_cap');
+      if (input instanceof HTMLInputElement) {
+        input.setCustomValidity('Enter 0 for unlimited or at least 1,000 tokens.');
+        input.reportValidity();
+      }
+      return;
+    }
     setSaving(true);
     setError(null);
     setSaveNotice(null);
     try {
-      const patch: Record<string, unknown> = {
-        provider,
-        model,
-        base_url: baseUrl,
-        daily_token_cap: Number(dailyTokenCap),
-        daily_cost_cap_usd: Number(dailyCostCap),
-        session_start_token_budget: Number(sessionBudget),
-        embedding_mode: embeddingMode,
-        embedding_model: embeddingModel,
-        raw_event_retention_days: Number(retentionDays),
-        distill_idle_seconds: Number(idleSeconds),
-      };
-      if (apiKeyInput.trim() !== '') {
-        patch.api_key = apiKeyInput.trim();
-      }
       const updated = await api.patchSettings(patch);
       setSettings(updated);
       syncFormFromSettings(updated);
       setApiKeyInput('');
-      setSaveNotice('Settings saved.');
+      setTestResult(null);
+      setSaveNotice('Settings saved for new work.');
       await onSaved();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to save settings');
@@ -249,24 +295,33 @@ export function EnginePage({
     }
   }
 
+  function discardDraft(form: HTMLFormElement | null) {
+    if (!settings) return;
+    const tokenInput = form?.elements.namedItem('daily_token_cap');
+    if (tokenInput instanceof HTMLInputElement) tokenInput.setCustomValidity('');
+    syncFormFromSettings(settings);
+    setApiKeyInput('');
+    setSaveNotice(null);
+    clearConnectionResult();
+  }
+
   async function handleTest() {
+    if (!settings || testing || saving || provider === 'none') return;
+    const version = ++testVersion.current;
     setTesting(true);
     setError(null);
     setTestResult(null);
     try {
-      const draft: Record<string, unknown> = {
-        provider,
-        model,
-        base_url: baseUrl,
-      };
-      if (apiKeyInput.trim() !== '') {
-        draft.api_key = apiKeyInput.trim();
-      }
-      const res = await api.testEngine(draft);
-      setTestResult(res);
+      const res = await api.testEngine({
+        ...connection,
+        ...(hasNewKey ? { api_key: apiKeyInput.trim() } : {}),
+      });
+      if (version === testVersion.current) setTestResult(res);
       await Promise.all([loadUsage(), onSaved()]);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to test connection');
+      if (version === testVersion.current) {
+        setError(err instanceof Error ? err.message : 'Failed to test distillation');
+      }
     } finally {
       setTesting(false);
     }
@@ -350,233 +405,457 @@ export function EnginePage({
   }
 
   const preset = PROVIDER_PRESETS[provider];
+  const activePreset = summary ? PROVIDER_PRESETS[summary.active_provider] : undefined;
+  const connectionBusy = !settings || saving;
+  const keyHint = destinationChanged
+    ? 'Enter credentials for the new destination if it requires authentication.'
+    : settings?.has_api_key
+      ? `Blank keeps the current key (${settings.api_key_masked || 'from environment'}).`
+      : 'Enter an API key or an env:VAR reference if the endpoint requires authentication.';
 
   return (
     <div className="stack">
       <div className="page-head" style={{ marginBottom: 0 }}>
-        <div>
-          <h1 className="page-title">Memory engine and budget guard</h1>
-          <p className="page-subtitle">
-            Keep coding agents focused on coding. Distill turns using a cheap decoupled API or local
-            model with zero silent fallback.
-          </p>
-        </div>
-        <span className="tag ok">Zero silent fallback enforced</span>
+        <h1 className="page-title">Engine &amp; budget</h1>
       </div>
 
-      {error ? (
-        <div className="callout danger">
-          <span>Settings error: {error}</span>
-          <button type="button" className="btn btn-danger" onClick={() => void load()}>
-            Retry
-          </button>
-        </div>
-      ) : null}
-
-      <form className="panel" onSubmit={handleSave}>
+      <section className="panel" aria-labelledby="engine-usage">
         <div className="panel-header">
-          <h2 className="panel-title">Distillation provider and hard caps</h2>
+          <div>
+            <h2 className="panel-title" id="engine-usage">Today’s usage</h2>
+            <p className="field-hint">Resets at 00:00 UTC</p>
+          </div>
+          {summary?.budget_exhausted ? <span className="tag warn">Daily limit reached</span> : null}
+        </div>
+        {summary ? (
+          <dl className="engine-usage-grid">
+            <div className="metric-cell">
+              <dt className="metric-label">Active distillation</dt>
+              <dd>
+                {activePreset?.label ?? summary.active_provider}
+                {summary.active_provider !== 'none' && summary.active_model ? (
+                  <div className="metric-sub measure engine-model">{summary.active_model}</div>
+                ) : null}
+              </dd>
+            </div>
+            <div className="metric-cell">
+              <dt className="metric-label">Tokens used</dt>
+              <dd>
+                <span className="measure">{summary.today_total_tokens.toLocaleString()}</span>
+                <span className="metric-sub"> / {summary.daily_token_cap > 0
+                  ? summary.daily_token_cap.toLocaleString()
+                  : 'Unlimited'}</span>
+              </dd>
+            </div>
+            <div className="metric-cell">
+              <dt className="metric-label">Recorded cost (USD)</dt>
+              <dd>
+                <span className="measure">${summary.today_cost_usd.toFixed(4)}</span>
+                <span className="metric-sub"> / {summary.daily_cost_cap_usd > 0
+                  ? `$${summary.daily_cost_cap_usd.toLocaleString('en-US', { maximumSignificantDigits: 8 })}`
+                  : 'Unlimited'}</span>
+              </dd>
+            </div>
+          </dl>
+        ) : (
+          <div className="panel-body field-hint" role="status">
+            {daemonLoading ? 'Loading usage…' : 'Usage is currently unavailable.'}
+          </div>
+        )}
+        {summary && summary.today_blocked > 0 ? (
+          <p className="engine-usage-note field-hint">
+            Blocked requests today: {summary.today_blocked.toLocaleString()}. Skipped distillation
+            batches stay in raw activity until they expire and are excluded from recovery.
+          </p>
+        ) : null}
+      </section>
+
+      <form className="panel" aria-labelledby="engine-settings" method="post" onSubmit={handleSave}>
+        <div className="panel-header">
+          <div>
+            <h2 className="panel-title" id="engine-settings">Engine settings</h2>
+            {dirty ? <p className="field-hint">Unsaved changes</p> : null}
+          </div>
           <div className="head-actions">
-            <button
-              type="button"
-              className="btn"
-              disabled={testing || loading}
-              aria-busy={testing}
-              onClick={() => void handleTest()}
-            >
-              {testing ? 'Testing...' : 'Test connection'}
-            </button>
+            {dirty ? (
+              <button
+                type="button"
+                className="btn"
+                disabled={saving}
+                onClick={(e) => discardDraft(e.currentTarget.form)}
+              >
+                Discard changes
+              </button>
+            ) : null}
+            {provider !== 'none' ? (
+              <button
+                type="button"
+                className="btn"
+                disabled={testing || connectionBusy}
+                aria-busy={testing}
+                aria-describedby="eng-test-hint"
+                onClick={() => void handleTest()}
+              >
+                {testing ? 'Testing…' : 'Test distillation'}
+              </button>
+            ) : null}
             <button
               type="submit"
               className="btn btn-primary"
-              disabled={saving || loading}
+              disabled={!dirty || saving || testing || autoCheckBusy}
               aria-busy={saving}
             >
-              {saving ? 'Saving...' : 'Save settings'}
+              {saving ? 'Saving…' : 'Save settings'}
             </button>
           </div>
         </div>
 
         <div className="panel-body stack">
-          {saveNotice ? <div className="callout ok">{saveNotice}</div> : null}
+          {loading ? <div className="field-hint" role="status">Loading settings…</div> : null}
+          {loadError ? (
+            <div className="callout danger" role="alert">
+              <span>Could not load settings. {loadError}</span>
+              <button type="button" className="btn" onClick={() => void loadSettings()}>
+                Retry loading
+              </button>
+            </div>
+          ) : null}
+          {error ? <div className="callout danger" role="alert">{error}</div> : null}
+          {saveNotice && !dirty ? <div className="callout ok" role="status">{saveNotice}</div> : null}
           {testResult ? (
-            <div className={`callout ${testResult.ok ? 'ok' : 'danger'}`}>
+            <div
+              className={`callout ${testResult.status === 'budget_blocked' ? 'warn' : testResult.ok ? 'ok' : 'danger'}`}
+              role="status"
+            >
               <span>{testResult.message}</span>
-              <span className="measure">{testResult.latency_ms} ms</span>
-            </div>
-          ) : null}
-
-          <div className="grid-2">
-            <div className="field">
-              <label htmlFor="eng-provider">Memory LLM provider</label>
-              <RimSelect
-                id="eng-provider"
-                ariaLabel="Memory LLM provider"
-                fullWidth
-                value={provider}
-                options={PROVIDER_OPTIONS}
-                onChange={onProviderChange}
-              />
-            </div>
-
-            <div className="field">
-              <label htmlFor="eng-model">Model</label>
-              <input
-                id="eng-model"
-                className="input input--mono"
-                placeholder="google/gemini-2.5-flash-lite"
-                value={model}
-                onChange={(e) => setModel(e.target.value)}
-              />
-            </div>
-          </div>
-
-          {preset ? (
-            <div className={`callout ${provider.startsWith('cli_') ? 'warn' : ''}`}>
-              {preset.note}
-            </div>
-          ) : null}
-
-          {provider !== 'none' && !provider.startsWith('cli_') ? (
-            <div className="grid-2">
-              <div className="field">
-                <label htmlFor="eng-url">Base URL</label>
-                <input
-                  id="eng-url"
-                  className="input input--mono"
-                  value={baseUrl}
-                  onChange={(e) => setBaseUrl(e.target.value)}
-                />
-              </div>
-              <div className="field">
-                <label htmlFor="eng-key">
-                  API key{' '}
-                  {settings?.has_api_key
-                    ? `(configured: ${settings.api_key_masked || 'from env'})`
-                    : '(or env:OPENROUTER_API_KEY)'}
-                </label>
-                <input
-                  id="eng-key"
-                  type="password"
-                  className="input input--mono"
-                  autoComplete="off"
-                  placeholder="Blank to keep current, or enter key / env:VAR"
-                  value={apiKeyInput}
-                  onChange={(e) => setApiKeyInput(e.target.value)}
-                />
-              </div>
-            </div>
-          ) : null}
-
-          <div className="grid-2">
-            <div className="field">
-              <label htmlFor="eng-tok">Hard daily token cap</label>
-              <span className="field-hint">Blocks distillation automatically once reached</span>
-              <input
-                id="eng-tok"
-                type="number"
-                min={1000}
-                step={1}
-                required
-                className="input input--mono"
-                value={dailyTokenCap}
-                onChange={(e) => setDailyTokenCap(e.target.value)}
-              />
-            </div>
-            <div className="field">
-              <label htmlFor="eng-cost">Hard daily cost cap (USD)</label>
-              <span className="field-hint">Recommended: $0.25 to $1.00 per day</span>
-              <input
-                id="eng-cost"
-                type="number"
-                min={0}
-                step="any"
-                required
-                className="input input--mono"
-                value={dailyCostCap}
-                onChange={(e) => setDailyCostCap(e.target.value)}
-              />
-            </div>
-          </div>
-
-          <div className="grid-2">
-            <div className="field">
-              <label htmlFor="eng-emb">Embeddings mode (1 runtime, no Python)</label>
-              <span className="field-hint">Local fastembed ONNX runs offline at $0</span>
-              <RimSelect
-                id="eng-emb"
-                ariaLabel="Embeddings mode"
-                fullWidth
-                value={embeddingMode}
-                options={EMBEDDING_OPTIONS}
-                onChange={setEmbeddingMode}
-              />
-            </div>
-            <div className="field">
-              <label htmlFor="eng-brief">SessionStart briefing budget (tokens)</label>
-              <span className="field-hint">Default 450 tokens for lean progressive disclosure</span>
-              <input
-                id="eng-brief"
-                type="number"
-                min={100}
-                max={2000}
-                step={1}
-                required
-                className="input input--mono"
-                value={sessionBudget}
-                onChange={(e) => setSessionBudget(e.target.value)}
-              />
-            </div>
-          </div>
-
-          {embeddingMode === 'api' ? (
-            <div className="field">
-              <label htmlFor="eng-emb-model">API embedding model</label>
-              <span className="field-hint">
-                e.g. text-embedding-3-small (OpenAI/OpenRouter), text-embedding-004 (Gemini), or
-                all-minilm (Ollama)
+              <span className="measure">
+                {testResult.latency_ms} ms
+                {testResult.estimated_cost_usd > 0
+                  ? ` · $${testResult.estimated_cost_usd.toPrecision(3)}`
+                  : ''}
               </span>
-              <input
-                id="eng-emb-model"
-                className="input input--mono"
-                value={embeddingModel}
-                onChange={(e) => setEmbeddingModel(e.target.value)}
-              />
             </div>
           ) : null}
 
-          <div className="grid-2">
-            <div className="field">
-              <label htmlFor="eng-ret">Raw event retention (days)</label>
-              <input
-                id="eng-ret"
-                type="number"
-                min={1}
-                max={365}
-                step={1}
-                required
-                className="input input--mono"
-                value={retentionDays}
-                onChange={(e) => setRetentionDays(e.target.value)}
-              />
-            </div>
-            <div className="field">
-              <label htmlFor="eng-idle">Crash-recovery idle sweep (seconds)</label>
-              <input
-                id="eng-idle"
-                type="number"
-                min={15}
-                max={3600}
-                step={1}
-                required
-                className="input input--mono"
-                value={idleSeconds}
-                onChange={(e) => setIdleSeconds(e.target.value)}
-              />
-            </div>
-          </div>
+          {settings ? (
+            <>
+              <fieldset className="engine-fieldset stack-sm" disabled={saving}>
+                <legend>Distillation</legend>
+                <div className="grid-2">
+                  <div className="field">
+                    <label htmlFor="eng-provider">Memory LLM provider</label>
+                    <RimSelect
+                      id="eng-provider"
+                      ariaLabel="Memory LLM provider"
+                      fullWidth
+                      disabled={saving}
+                      value={provider}
+                      options={PROVIDER_OPTIONS}
+                      onChange={onProviderChange}
+                    />
+                  </div>
+                  {provider !== 'none' ? (
+                    <div className="field">
+                      <label htmlFor="eng-model">Model</label>
+                      <input
+                        id="eng-model"
+                        name="model"
+                        className="input input--mono"
+                        placeholder={preset?.model || undefined}
+                        spellCheck={false}
+                        autoCapitalize="none"
+                        value={model}
+                        onChange={(e) => {
+                          setModel(e.target.value);
+                          clearConnectionResult();
+                        }}
+                      />
+                    </div>
+                  ) : null}
+                </div>
+                {preset ? <p className="field-hint">{preset.note}</p> : null}
+                {provider !== 'none' && !provider.startsWith('cli_') ? (
+                  <div className="grid-2">
+                    <div className="field">
+                      <label htmlFor="eng-url">Base URL</label>
+                      <input
+                        id="eng-url"
+                        name="base_url"
+                        type="url"
+                        className="input input--mono"
+                        placeholder={preset?.baseUrl}
+                        spellCheck={false}
+                        autoCapitalize="none"
+                        value={baseUrl}
+                        onChange={(e) => {
+                          setBaseUrl(e.target.value);
+                          setApiKeyInput('');
+                          clearConnectionResult();
+                        }}
+                      />
+                    </div>
+                    <div className="field">
+                      <label htmlFor="eng-key">API key</label>
+                      <input
+                        id="eng-key"
+                        name="api_key"
+                        type="password"
+                        className="input input--mono"
+                        autoComplete="off"
+                        aria-describedby="eng-key-hint"
+                        value={apiKeyInput}
+                        onChange={(e) => {
+                          setApiKeyInput(e.target.value);
+                          clearConnectionResult();
+                        }}
+                      />
+                      <span className="field-hint" id="eng-key-hint">{keyHint}</span>
+                    </div>
+                  </div>
+                ) : null}
+                {provider !== 'none' ? (
+                  <p id="eng-test-hint" className="field-hint">
+                    Uses the draft provider, saved daily limits, and a small sample that can use
+                    provider credits.
+                  </p>
+                ) : null}
+              </fieldset>
+
+              <fieldset className="engine-fieldset stack-sm" disabled={saving}>
+                <legend>Daily budget</legend>
+                <div className="grid-2">
+                  <div className="field">
+                    <label htmlFor="eng-tok">Token limit</label>
+                    <input
+                      id="eng-tok"
+                      name="daily_token_cap"
+                      type="number"
+                      min={0}
+                      step={1}
+                      required
+                      aria-describedby="eng-tok-hint"
+                      className="input input--mono"
+                      value={dailyTokenCap}
+                      onChange={(e) => {
+                        e.currentTarget.setCustomValidity('');
+                        setDailyTokenCap(e.target.value);
+                      }}
+                    />
+                    <span className="field-hint" id="eng-tok-hint">0 = Unlimited. Otherwise enter 1,000 or more.</span>
+                  </div>
+                  <div className="field">
+                    <label htmlFor="eng-cost">Cost limit (USD)</label>
+                    <input
+                      id="eng-cost"
+                      name="daily_cost_cap_usd"
+                      type="number"
+                      min={0}
+                      step="any"
+                      required
+                      aria-describedby="eng-cost-hint"
+                      className="input input--mono"
+                      value={dailyCostCap}
+                      onChange={(e) => setDailyCostCap(e.target.value)}
+                    />
+                    <span className="field-hint" id="eng-cost-hint">0 = Unlimited. Provider limits still apply.</span>
+                  </div>
+                </div>
+                <p className="field-hint">
+                  A reached limit blocks new calls. A call already in progress can exceed the limit.
+                </p>
+              </fieldset>
+
+              <fieldset className="engine-fieldset stack-sm" disabled={saving}>
+                <legend>Search &amp; briefing</legend>
+                <div className="grid-2">
+                  <div className="field">
+                    <label htmlFor="eng-emb">Search mode</label>
+                    <RimSelect
+                      id="eng-emb"
+                      ariaLabel="Search mode"
+                      fullWidth
+                      disabled={saving}
+                      value={embeddingMode}
+                      options={EMBEDDING_OPTIONS}
+                      onChange={setEmbeddingMode}
+                    />
+                    <span className="field-hint">{EMBEDDING_HINTS[embeddingMode]}</span>
+                    {summary?.embedding_status ? (
+                      <span className="field-hint">Active: {summary.embedding_status}</span>
+                    ) : null}
+                  </div>
+                  <div className="field">
+                    <label htmlFor="eng-brief">Session briefing (tokens)</label>
+                    <input
+                      id="eng-brief"
+                      name="session_start_token_budget"
+                      type="number"
+                      min={100}
+                      max={2000}
+                      step={1}
+                      required
+                      aria-describedby="eng-brief-hint"
+                      className="input input--mono"
+                      value={sessionBudget}
+                      onChange={(e) => setSessionBudget(e.target.value)}
+                    />
+                    <span className="field-hint" id="eng-brief-hint">
+                      Approximate size of the memory summary sent to an agent at session start.
+                      Default 450.
+                    </span>
+                  </div>
+                </div>
+                {embeddingMode === 'api' ? (
+                  <div className="field">
+                    <label htmlFor="eng-emb-model">API embedding model</label>
+                    <input
+                      id="eng-emb-model"
+                      name="embedding_model"
+                      className="input input--mono"
+                      aria-describedby="eng-emb-model-hint"
+                      value={embeddingModel}
+                      spellCheck={false}
+                      onChange={(e) => setEmbeddingModel(e.target.value)}
+                    />
+                    <span className="field-hint" id="eng-emb-model-hint">
+                      Endpoint <span className="measure engine-model">{destination}</span>.
+                      The vector index stores 384 dimensions.
+                    </span>
+                  </div>
+                ) : null}
+              </fieldset>
+
+              <details className="engine-advanced">
+                <summary>Storage &amp; recovery</summary>
+                <fieldset className="engine-fieldset grid-2" aria-label="Storage and recovery" disabled={saving}>
+                  <div className="field">
+                    <label htmlFor="eng-ret">Raw activity retention (days)</label>
+                    <input
+                      id="eng-ret"
+                      name="raw_event_retention_days"
+                      type="number"
+                      min={1}
+                      max={365}
+                      step={1}
+                      required
+                      aria-describedby="eng-ret-hint"
+                      className="input input--mono"
+                      value={retentionDays}
+                      onChange={(e) => setRetentionDays(e.target.value)}
+                    />
+                    <span className="field-hint" id="eng-ret-hint">
+                      Processed activity expires after this many days. Pending activity can stay
+                      twice as long. Saved memories have separate lifetimes.
+                    </span>
+                  </div>
+                  <div className="field">
+                    <label htmlFor="eng-idle">Idle time before recovery (seconds)</label>
+                    <input
+                      id="eng-idle"
+                      name="distill_idle_seconds"
+                      type="number"
+                      min={15}
+                      max={3600}
+                      step={1}
+                      required
+                      aria-describedby="eng-idle-hint"
+                      className="input input--mono"
+                      value={idleSeconds}
+                      onChange={(e) => setIdleSeconds(e.target.value)}
+                    />
+                    <span className="field-hint" id="eng-idle-hint">
+                      Makes pending activity eligible for distillation if a session goes quiet
+                      without a turn-end signal. The worker checks every 30 seconds.
+                    </span>
+                  </div>
+                </fieldset>
+              </details>
+            </>
+          ) : null}
         </div>
       </form>
+
+      <section className="panel">
+        <div className="panel-header">
+          <h2 className="panel-title">
+            Usage ledger ({usageTotal} {usageTotal === 1 ? 'entry' : 'entries'})
+          </h2>
+          <span className="field-hint">Distillation, API embeddings, and tests</span>
+        </div>
+        {usageError ? (
+          <div className="callout danger" style={{ margin: 'var(--space-sm)' }}>
+            <span>{usageError}</span>
+            <button type="button" className="btn btn-danger" onClick={() => void loadUsage()}>
+              Retry
+            </button>
+          </div>
+        ) : null}
+        <div className="table-wrap">
+          {usageLoading && usage.length === 0 ? (
+            <div className="skeleton-row">
+              <div className="skeleton-bar skeleton-bar--wide" />
+            </div>
+          ) : usageError && usage.length === 0 ? null : usage.length === 0 ? (
+            <div className="empty-state">
+              <p>No usage recorded yet.</p>
+            </div>
+          ) : (
+            <table>
+              <thead>
+                <tr>
+                  <th>Time (UTC)</th>
+                  <th>Provider</th>
+                  <th>Model</th>
+                  <th>Operation</th>
+                  <th>Tokens (in / out)</th>
+                  <th>Estimated cost</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                {usage.map((u) => (
+                  <tr key={u.id}>
+                    <td className="measure">{formatUtcTime(u.created_at)}</td>
+                    <td className="measure">{u.provider}</td>
+                    <td className="measure">{u.model || 'none'}</td>
+                    <td>{u.operation}</td>
+                    <td className="measure">
+                      {u.input_tokens} / {u.output_tokens}
+                    </td>
+                    <td className="measure">${u.estimated_cost_usd.toFixed(5)}</td>
+                    <td>
+                      <span
+                        className={`tag ${
+                          u.status === 'ok'
+                            ? 'ok'
+                            : u.status === 'budget_blocked'
+                              ? 'warn'
+                              : 'danger'
+                        }`}
+                        title={u.error_message ?? undefined}
+                      >
+                        {u.status}
+                      </span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+        <PaginationBar
+          label="Usage ledger pages"
+          page={usagePage}
+          pageSize={usagePageSize}
+          total={usageTotal}
+          pageSizeOptions={[10, 20, 50]}
+          onPageChange={setUsagePage}
+          onPageSizeChange={(nextSize) => {
+            setUsagePageSize(nextSize);
+            setUsagePage(1);
+          }}
+        />
+      </section>
 
       <section className="panel">
         <div className="panel-header">
@@ -587,7 +866,13 @@ export function EnginePage({
             </p>
           </div>
           <div className="head-actions">
-            <button type="button" className="btn" onClick={onRunOnboarding}>
+            <button
+              type="button"
+              className="btn"
+              disabled={dirty || saving}
+              title={dirty ? 'Save or discard your Engine settings first' : undefined}
+              onClick={onRunOnboarding}
+            >
               Run onboarding
             </button>
             <button
@@ -682,7 +967,7 @@ export function EnginePage({
                     type="checkbox"
                     className="rim-check"
                     checked={settings?.auto_update_check ?? true}
-                    disabled={autoCheckBusy}
+                    disabled={autoCheckBusy || saving || !settings}
                     onChange={(e) => void handleAutoUpdateToggle(e.target.checked)}
                   />
                   <span>Automatically check for updates every 6 hours</span>
@@ -712,86 +997,6 @@ export function EnginePage({
             </div>
           )}
         </div>
-      </section>
-
-      <section className="panel">
-        <div className="panel-header">
-          <h2 className="panel-title">Usage ledger ({usageTotal} calls)</h2>
-          <span className="field-hint">Every background LLM call is logged with UTC time</span>
-        </div>
-        {usageError ? (
-          <div className="callout danger" style={{ margin: 'var(--space-sm)' }}>
-            <span>{usageError}</span>
-            <button type="button" className="btn btn-danger" onClick={() => void loadUsage()}>
-              Retry
-            </button>
-          </div>
-        ) : null}
-        <div className="table-wrap">
-          {usageLoading && usage.length === 0 ? (
-            <div className="skeleton-row">
-              <div className="skeleton-bar skeleton-bar--wide" />
-            </div>
-          ) : usage.length === 0 ? (
-            <div className="empty-state">
-              <p>No background LLM calls recorded yet ($0.0000 USD spent).</p>
-            </div>
-          ) : (
-            <table>
-              <thead>
-                <tr>
-                  <th>Time (UTC)</th>
-                  <th>Provider</th>
-                  <th>Model</th>
-                  <th>Operation</th>
-                  <th>Tokens (in / out)</th>
-                  <th>Estimated cost</th>
-                  <th>Status</th>
-                </tr>
-              </thead>
-              <tbody>
-                {usage.map((u) => (
-                  <tr key={u.id}>
-                    <td className="measure">{formatUtcTime(u.created_at)}</td>
-                    <td className="measure">{u.provider}</td>
-                    <td className="measure">{u.model || 'none'}</td>
-                    <td>{u.operation}</td>
-                    <td className="measure">
-                      {u.input_tokens} / {u.output_tokens}
-                    </td>
-                    <td className="measure">${u.estimated_cost_usd.toFixed(5)}</td>
-                    <td>
-                      <span
-                        className={`tag ${
-                          u.status === 'ok'
-                            ? 'ok'
-                            : u.status === 'budget_blocked'
-                              ? 'warn'
-                              : 'danger'
-                        }`}
-                        title={u.error_message ?? undefined}
-                      >
-                        {u.status}
-                      </span>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          )}
-        </div>
-        <PaginationBar
-          label="Usage ledger pages"
-          page={usagePage}
-          pageSize={usagePageSize}
-          total={usageTotal}
-          pageSizeOptions={[10, 20, 50]}
-          onPageChange={setUsagePage}
-          onPageSizeChange={(nextSize) => {
-            setUsagePageSize(nextSize);
-            setUsagePage(1);
-          }}
-        />
       </section>
 
       <ModalDialog

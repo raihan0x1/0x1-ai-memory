@@ -1,4 +1,4 @@
-use crate::config::Settings;
+use crate::config::{ProviderHttp, Settings};
 use crate::models::{MemoryHit, RawEvent};
 use crate::scrub::{redact_secrets, truncate_head_tail};
 use anyhow::{Context, Result, bail};
@@ -30,7 +30,7 @@ pub struct ExtractionEnvelope {
 
 #[derive(Debug, Clone)]
 pub struct LlmCallResult {
-    pub memories: Vec<ExtractedMemory>,
+    pub memories: Result<Vec<ExtractedMemory>, String>,
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub estimated_cost_usd: f64,
@@ -39,17 +39,19 @@ pub struct LlmCallResult {
 #[derive(Debug, Clone, Serialize)]
 pub struct ConnectionTestResult {
     pub ok: bool,
+    pub status: &'static str,
     pub provider: String,
     pub model: String,
     pub latency_ms: u64,
     pub input_tokens: i64,
     pub output_tokens: i64,
+    pub estimated_cost_usd: f64,
     pub message: String,
 }
 
 #[derive(Clone)]
 pub struct MemoryLlmClient {
-    http: reqwest::Client,
+    http: ProviderHttp,
 }
 
 impl Default for MemoryLlmClient {
@@ -61,10 +63,7 @@ impl Default for MemoryLlmClient {
 impl MemoryLlmClient {
     pub fn new() -> Self {
         Self {
-            http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(45))
-                .build()
-                .unwrap_or_default(),
+            http: ProviderHttp::new(Duration::from_secs(45)),
         }
     }
 
@@ -84,63 +83,71 @@ impl MemoryLlmClient {
             build_distill_prompts(project_name, source_client, events, existing_recent);
 
         let raw = self
-            .complete_json(settings, &system_prompt, &user_prompt)
+            .complete_json(settings, &system_prompt, &user_prompt, 900)
             .await?;
 
-        let envelope = parse_extraction_json(&raw.text)?;
         Ok(LlmCallResult {
-            memories: envelope.memories,
+            memories: parse_extraction_json(&raw.text)
+                .map(|envelope| envelope.memories)
+                .map_err(|_| "The model response did not contain a valid memory extraction".into()),
             input_tokens: raw.input_tokens,
             output_tokens: raw.output_tokens,
             estimated_cost_usd: raw.cost_usd,
         })
     }
 
-    /// Minimal connectivity verification call for the Web UI & CLI Setup Wizard.
+    /// Check the provider with a synthetic extraction and preserve the usage it reports.
     pub async fn test_connection(&self, settings: &Settings) -> ConnectionTestResult {
-        let start = std::time::Instant::now();
         if settings.provider == "none" {
             return ConnectionTestResult {
                 ok: true,
+                status: "ok",
                 provider: "none".into(),
                 model: "zero-llm".into(),
                 latency_ms: 0,
                 input_tokens: 0,
                 output_tokens: 0,
-                message: "Zero-LLM mode active. FTS5/vector search and explicit memory_save work at $0 cost.".into(),
+                estimated_cost_usd: 0.0,
+                message: "Distillation is off. No model request was sent.".into(),
             };
         }
-        match self
+        let start = std::time::Instant::now();
+        let ((input_tokens, output_tokens, estimated_cost_usd), error) = match self
             .complete_json(
                 settings,
-                "Reply strictly with JSON: {\"ok\": true}",
-                "Ping check. Reply {\"ok\": true}.",
+                r#"Return one memory as JSON in this shape: {"memories":[{"scope":"project","type":"bugfix","title":"...","summary":"...","content":"..."}]}."#,
+                "Extract one memory from this synthetic example: The application now validates its inputs before writing a file.",
+                256,
             )
             .await
         {
-            Ok(res) => ConnectionTestResult {
-                ok: true,
-                provider: settings.provider.clone(),
-                model: settings.model.clone(),
-                latency_ms: start.elapsed().as_millis() as u64,
-                input_tokens: res.input_tokens,
-                output_tokens: res.output_tokens,
-                message: format!(
-                    "Connected to {} ({}) in {}ms",
-                    settings.provider,
-                    settings.model,
-                    start.elapsed().as_millis()
-                ),
-            },
-            Err(e) => ConnectionTestResult {
-                ok: false,
-                provider: settings.provider.clone(),
-                model: settings.model.clone(),
-                latency_ms: start.elapsed().as_millis() as u64,
-                input_tokens: 0,
-                output_tokens: 0,
-                message: format!("Connection failed (no silent fallback used): {e}"),
-            },
+            Ok(raw) => {
+                let valid = parse_extraction_json(&raw.text).is_ok_and(|envelope| {
+                    envelope.memories.iter().take(3).any(|memory| {
+                        !memory.title.trim().is_empty() && !memory.summary.trim().is_empty()
+                    })
+                });
+                let error = (!valid).then(|| {
+                    "The model responded but could not produce a valid sample memory.".into()
+                });
+                ((raw.input_tokens, raw.output_tokens, raw.cost_usd), error)
+            }
+            Err(e) => (
+                (0, 0, 0.0),
+                Some(format!("Connection failed: {}", redact_secrets(&e.to_string()))),
+            ),
+        };
+        let ok = error.is_none();
+        ConnectionTestResult {
+            ok,
+            status: if ok { "ok" } else { "error" },
+            provider: settings.provider.clone(),
+            model: settings.model.clone(),
+            latency_ms: start.elapsed().as_millis() as u64,
+            input_tokens,
+            output_tokens,
+            estimated_cost_usd,
+            message: error.unwrap_or_else(|| "The model returned a valid sample memory.".into()),
         }
     }
 
@@ -149,18 +156,18 @@ impl MemoryLlmClient {
         settings: &Settings,
         system_prompt: &str,
         user_prompt: &str,
+        max_output_tokens: i64,
     ) -> Result<RawCompletion> {
         // Guardrail: exact dispatch by configured provider; NEVER silently fall back to coding subscriptions.
         match settings.provider.as_str() {
-            "openrouter" => {
-                self.call_openai_compat(settings, system_prompt, user_prompt, true)
+            "openrouter" | "openai_compatible" | "ollama" => {
+                self.call_openai_compat(settings, system_prompt, user_prompt, max_output_tokens)
                     .await
             }
-            "openai_compatible" | "ollama" => {
-                self.call_openai_compat(settings, system_prompt, user_prompt, false)
+            "gemini" => {
+                self.call_gemini(settings, system_prompt, user_prompt, max_output_tokens)
                     .await
             }
-            "gemini" => self.call_gemini(settings, system_prompt, user_prompt).await,
             "cli_claude" => {
                 self.call_cli_claude(settings, system_prompt, user_prompt)
                     .await
@@ -182,8 +189,9 @@ impl MemoryLlmClient {
         settings: &Settings,
         system_prompt: &str,
         user_prompt: &str,
-        is_openrouter: bool,
+        max_output_tokens: i64,
     ) -> Result<RawCompletion> {
+        let is_openrouter = settings.provider == "openrouter";
         let base = settings.effective_base_url();
         let url = format!("{base}/chat/completions");
         let api_key = settings.resolve_api_key();
@@ -203,7 +211,7 @@ impl MemoryLlmClient {
         let mut body = json!({
             "model": model,
             "temperature": 0.1,
-            "max_tokens": 900,
+            "max_tokens": max_output_tokens,
             "response_format": { "type": "json_object" },
             "messages": [
                 { "role": "system", "content": system_prompt },
@@ -216,7 +224,7 @@ impl MemoryLlmClient {
             body["usage"] = json!({ "include": true });
         }
 
-        let mut req = self.http.post(&url).json(&body);
+        let mut req = self.http.for_settings(settings).post(&url).json(&body);
         if let Some(key) = api_key {
             req = req.bearer_auth(key);
         }
@@ -228,25 +236,20 @@ impl MemoryLlmClient {
 
         let resp = req.send().await.context("HTTP LLM request failed")?;
         let status = resp.status();
-        let resp_text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
-            bail!(
-                "Provider {} returned HTTP {}: {}",
-                settings.provider,
-                status,
-                truncate_head_tail(&resp_text, 400)
-            );
+            bail!("Provider {} returned HTTP {}", settings.provider, status);
         }
 
+        let resp_text = resp.text().await.context("Failed to read LLM response")?;
         let v: serde_json::Value =
             serde_json::from_str(&resp_text).context("Invalid JSON from LLM provider")?;
         let text = v["choices"][0]["message"]["content"]
             .as_str()
             .unwrap_or("")
             .to_string();
-        let input_tokens = v["usage"]["prompt_tokens"].as_i64().unwrap_or(0);
-        let output_tokens = v["usage"]["completion_tokens"].as_i64().unwrap_or(0);
-        let reported_cost = v["usage"]["cost"].as_f64();
+        let input_tokens = v["usage"]["prompt_tokens"].as_i64().unwrap_or(0).max(0);
+        let output_tokens = v["usage"]["completion_tokens"].as_i64().unwrap_or(0).max(0);
+        let reported_cost = v["usage"]["cost"].as_f64().filter(|cost| *cost >= 0.0);
         let cost_usd = reported_cost.unwrap_or_else(|| {
             estimate_cost_usd(&settings.provider, &model, input_tokens, output_tokens)
         });
@@ -264,6 +267,7 @@ impl MemoryLlmClient {
         settings: &Settings,
         system_prompt: &str,
         user_prompt: &str,
+        max_output_tokens: i64,
     ) -> Result<RawCompletion> {
         let api_key = settings
             .resolve_api_key()
@@ -280,13 +284,14 @@ impl MemoryLlmClient {
             "contents": [{ "role": "user", "parts": [{ "text": user_prompt }] }],
             "generationConfig": {
                 "temperature": 0.1,
-                "maxOutputTokens": 900,
+                "maxOutputTokens": max_output_tokens,
                 "responseMimeType": "application/json"
             }
         });
 
         let resp = self
             .http
+            .for_settings(settings)
             .post(&url)
             .header("x-goog-api-key", api_key)
             .json(&body)
@@ -294,24 +299,27 @@ impl MemoryLlmClient {
             .await
             .context("Gemini request failed")?;
         let status = resp.status();
-        let resp_text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
-            bail!(
-                "Gemini returned HTTP {}: {}",
-                status,
-                truncate_head_tail(&resp_text, 400)
-            );
+            bail!("Gemini returned HTTP {status}");
         }
 
+        let resp_text = resp
+            .text()
+            .await
+            .context("Failed to read Gemini response")?;
         let v: serde_json::Value = serde_json::from_str(&resp_text)?;
         let text = v["candidates"][0]["content"]["parts"][0]["text"]
             .as_str()
             .unwrap_or("")
             .to_string();
-        let input_tokens = v["usageMetadata"]["promptTokenCount"].as_i64().unwrap_or(0);
+        let input_tokens = v["usageMetadata"]["promptTokenCount"]
+            .as_i64()
+            .unwrap_or(0)
+            .max(0);
         let output_tokens = v["usageMetadata"]["candidatesTokenCount"]
             .as_i64()
-            .unwrap_or(0);
+            .unwrap_or(0)
+            .max(0);
         let cost_usd = estimate_cost_usd("gemini", &model, input_tokens, output_tokens);
 
         Ok(RawCompletion {
@@ -359,10 +367,12 @@ impl MemoryLlmClient {
         let text = v["result"].as_str().unwrap_or(&stdout).to_string();
         let input_tokens = v["usage"]["input_tokens"]
             .as_i64()
-            .unwrap_or((combined.len() / 4) as i64);
+            .unwrap_or((combined.len() / 4) as i64)
+            .max(0);
         let output_tokens = v["usage"]["output_tokens"]
             .as_i64()
-            .unwrap_or((text.len() / 4) as i64);
+            .unwrap_or((text.len() / 4) as i64)
+            .max(0);
         Ok(RawCompletion {
             text,
             input_tokens,

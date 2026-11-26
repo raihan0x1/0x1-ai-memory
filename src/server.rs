@@ -5,7 +5,7 @@ use crate::db::MemoryDb;
 use crate::distill::DistillHandle;
 use crate::embed::Embedder;
 use crate::hooks::{HookState, handle_hook};
-use crate::llm::MemoryLlmClient;
+use crate::llm::{ConnectionTestResult, MemoryLlmClient};
 use crate::mcp::handle_rpc;
 use crate::models::{NewMemoryInput, SearchFilter, StreamEvent, UpdateMemoryInput};
 use crate::updater::UpdateManager;
@@ -610,8 +610,9 @@ async fn api_patch_settings(
 async fn api_test_engine(
     State(st): State<AppState>,
     body: Bytes,
-) -> Result<Json<Value>, (StatusCode, String)> {
-    let mut settings = st.db.get_settings().map_err(internal_err)?;
+) -> Result<Json<ConnectionTestResult>, (StatusCode, String)> {
+    let saved = st.db.get_settings().map_err(internal_err)?;
+    let mut settings = saved.clone();
     if !body.iter().all(|b| b.is_ascii_whitespace()) {
         let patch: SettingsPatch = serde_json::from_slice(&body).map_err(|e| {
             (
@@ -621,23 +622,41 @@ async fn api_test_engine(
         })?;
         settings.apply_patch(patch);
     }
-    let result = st.llm.test_connection(&settings).await;
-    let _ = st.db.record_usage(
-        &result.provider,
-        &result.model,
-        "test",
-        result.input_tokens,
-        result.output_tokens,
-        0.0,
-        None,
-        if result.ok { "ok" } else { "error" },
-        if result.ok {
-            None
-        } else {
-            Some(&result.message)
-        },
-    );
-    Ok(Json(serde_json::to_value(result).unwrap_or_default()))
+    let result = if settings.provider != "none"
+        && st
+            .db
+            .usage_summary(&saved, st.embedder.status_label(&saved))
+            .map_err(internal_err)?
+            .budget_exhausted
+    {
+        ConnectionTestResult {
+            ok: false,
+            status: "budget_blocked",
+            provider: settings.provider,
+            model: settings.model,
+            latency_ms: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            estimated_cost_usd: 0.0,
+            message: "Today's saved token or USD limit was reached. Wait for the UTC reset or update the limit.".into(),
+        }
+    } else {
+        st.llm.test_connection(&settings).await
+    };
+    st.db
+        .record_usage(
+            &result.provider,
+            &result.model,
+            "test",
+            result.input_tokens,
+            result.output_tokens,
+            result.estimated_cost_usd,
+            None,
+            result.status,
+            (!result.ok).then_some(result.message.as_str()),
+        )
+        .map_err(internal_err)?;
+    Ok(Json(result))
 }
 
 async fn api_list_connections(

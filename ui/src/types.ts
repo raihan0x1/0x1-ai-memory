@@ -305,6 +305,8 @@ export interface ConnectionTestResult {
   latency_ms: number;
   input_tokens: number;
   output_tokens: number;
+  estimated_cost_usd: number;
+  status: 'ok' | 'error' | 'budget_blocked';
   message: string;
 }
 

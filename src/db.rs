@@ -385,10 +385,12 @@ impl MemoryDb {
     }
 
     pub fn is_project_local_only(&self, project_id: Option<&str>) -> bool {
-        project_id
-            .and_then(|pid| self.get_project(pid).ok().flatten())
-            .map(|p| p.privacy_mode == "local_only")
-            .unwrap_or(false)
+        project_id.is_some_and(|pid| {
+            self.get_project(pid)
+                .ok()
+                .flatten()
+                .is_none_or(|p| p.privacy_mode == "local_only")
+        })
     }
 
     pub fn upsert_session(

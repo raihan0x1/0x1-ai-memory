@@ -367,6 +367,7 @@ export function StreamPage({
       ? Math.min(100, Math.round((summary.today_cost_usd / summary.daily_cost_cap_usd) * 100))
       : 0;
   const budgetPct = Math.max(tokenPct, costPct);
+  const hasDailyLimit = summary && (summary.daily_token_cap > 0 || summary.daily_cost_cap_usd > 0);
   const meterClass = budgetPct >= 90 ? 'danger' : budgetPct >= 70 ? 'warn' : '';
 
   const filtered = memHits;
@@ -550,11 +551,20 @@ export function StreamPage({
           </div>
           <div>
             <span className="metric-sub measure">
-              {(summary?.today_total_tokens ?? 0).toLocaleString()} /{' '}
-              {(summary?.daily_token_cap ?? 250000).toLocaleString()} tok (cap $
-              {(summary?.daily_cost_cap_usd ?? 0.5).toFixed(2)})
+              {summary ? (
+                <>
+                  {summary.today_total_tokens.toLocaleString()} tok /{' '}
+                  {summary.daily_token_cap > 0
+                    ? summary.daily_token_cap.toLocaleString()
+                    : 'Unlimited'}
+                  {' · USD limit '}
+                  {summary.daily_cost_cap_usd > 0
+                    ? `$${summary.daily_cost_cap_usd.toLocaleString('en-US', { maximumSignificantDigits: 8 })}`
+                    : 'Unlimited'}
+                </>
+              ) : 'Daily limits unavailable'}
             </span>
-            <div className="meter-row">
+            {hasDailyLimit ? <div className="meter-row">
               <div
                 className="meter-track"
                 role="progressbar"
@@ -566,7 +576,7 @@ export function StreamPage({
                 <div className={`meter-fill ${meterClass}`} style={{ width: `${budgetPct}%` }} />
               </div>
               <span className="meter-pct measure">{budgetPct}%</span>
-            </div>
+            </div> : null}
           </div>
         </div>
 

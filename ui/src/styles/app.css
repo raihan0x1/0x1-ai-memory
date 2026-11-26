@@ -948,6 +948,57 @@
   gap: var(--space-md);
 }
 
+.engine-usage-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin: 0;
+}
+
+.engine-usage-grid dd {
+  margin: 0;
+}
+
+.engine-model,
+.daemon-meta-item .measure {
+  overflow-wrap: anywhere;
+}
+
+.engine-usage-note {
+  border-top: var(--rule-hair) solid var(--color-rule-2);
+  padding: var(--space-sm) var(--space-md);
+}
+
+.engine-fieldset {
+  border: 0;
+  min-inline-size: 0;
+  margin: 0;
+  padding: 0;
+}
+
+.engine-fieldset legend,
+.engine-advanced summary {
+  font-size: var(--text-sm);
+  font-weight: var(--display-weight);
+}
+
+.engine-fieldset legend {
+  padding: 0;
+  margin-block-end: var(--space-xs);
+}
+
+.engine-advanced {
+  border-top: var(--rule-hair) solid var(--color-rule-2);
+}
+
+.engine-advanced summary {
+  cursor: pointer;
+  padding-block-start: var(--space-sm);
+}
+
+.engine-advanced .engine-fieldset {
+  margin-block-start: var(--space-sm);
+}
+
 .stack {
   display: flex;
   flex-direction: column;
@@ -1125,6 +1176,7 @@ dialog::backdrop {
 
 @media (max-width: 60rem) {
   .metrics-strip,
+  .engine-usage-grid,
   .grid-2 {
     grid-template-columns: minmax(0, 1fr);
   }

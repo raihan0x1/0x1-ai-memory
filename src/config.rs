@@ -173,7 +173,7 @@ impl Settings {
         m.insert("daily_token_cap".into(), self.daily_token_cap.to_string());
         m.insert(
             "daily_cost_cap_usd".into(),
-            format!("{:.4}", self.daily_cost_cap_usd),
+            self.daily_cost_cap_usd.to_string(),
         );
         m.insert(
             "session_start_token_budget".into(),
@@ -223,15 +223,19 @@ impl Settings {
         if !self.base_url.trim().is_empty() {
             return self.base_url.trim().trim_end_matches('/').to_string();
         }
+        self.default_base_url().to_string()
+    }
+
+    fn default_base_url(&self) -> &'static str {
         match self.provider.as_str() {
-            "openrouter" => "https://openrouter.ai/api/v1".into(),
-            "ollama" => "http://127.0.0.1:11434/v1".into(),
-            "gemini" => "https://generativelanguage.googleapis.com/v1beta".into(),
-            _ => "https://api.openai.com/v1".into(),
+            "openrouter" => "https://openrouter.ai/api/v1",
+            "ollama" => "http://127.0.0.1:11434/v1",
+            "gemini" => "https://generativelanguage.googleapis.com/v1beta",
+            _ => "https://api.openai.com/v1",
         }
     }
 
-    /// Resolves `env:VAR_NAME`, stored key, or standard provider env var.
+    /// Resolves an explicit key first. Implicit provider env keys apply only to the default endpoint.
     pub fn resolve_api_key(&self) -> Option<String> {
         let raw = self.api_key.trim();
         if let Some(env_name) = raw.strip_prefix("env:") {
@@ -241,6 +245,9 @@ impl Settings {
         }
         if !raw.is_empty() {
             return Some(raw.to_string());
+        }
+        if self.effective_base_url() != self.default_base_url() {
+            return None;
         }
         let fallback_env = match self.provider.as_str() {
             "openrouter" => Some("OPENROUTER_API_KEY"),
@@ -270,14 +277,17 @@ impl Settings {
     /// True if dispatching to the active provider sends data off-machine (APIs or CLI tools).
     pub fn is_external_destination(&self) -> bool {
         match self.provider.as_str() {
-            "none" | "ollama" => false,
-            "openai_compatible" => !is_localhost_url(&self.effective_base_url()),
+            "none" => false,
+            "ollama" | "openai_compatible" => !self.is_local_base_url(),
             _ => true,
         }
     }
 
     pub fn is_local_base_url(&self) -> bool {
-        is_localhost_url(&self.effective_base_url())
+        reqwest::Url::parse(&self.effective_base_url()).is_ok_and(|url| {
+            matches!(url.scheme(), "http" | "https")
+                && matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))
+        })
     }
 
     pub fn redacted(&self) -> SettingsView {
@@ -348,7 +358,7 @@ pub struct SettingsPatch {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub base_url: Option<String>,
-    /// Omitted or `None` keeps existing key; empty string clears stored key.
+    /// Empty clears the key. Omission keeps it only when the provider and endpoint stay the same.
     pub api_key: Option<String>,
     pub daily_token_cap: Option<i64>,
     pub daily_cost_cap_usd: Option<f64>,
@@ -364,6 +374,11 @@ pub struct SettingsPatch {
 
 impl Settings {
     pub fn apply_patch(&mut self, patch: SettingsPatch) {
+        let provider_changed = patch
+            .provider
+            .as_deref()
+            .is_some_and(|provider| provider != self.provider);
+        let previous_base_url = patch.base_url.as_ref().map(|_| self.effective_base_url());
         if let Some(v) = patch.provider {
             self.provider = v;
         }
@@ -375,9 +390,13 @@ impl Settings {
         }
         if let Some(v) = patch.api_key {
             self.api_key = v;
+        } else if provider_changed
+            || previous_base_url.is_some_and(|previous| previous != self.effective_base_url())
+        {
+            self.api_key.clear();
         }
         if let Some(v) = patch.daily_token_cap {
-            self.daily_token_cap = v.max(1_000);
+            self.daily_token_cap = if v == 0 { 0 } else { v.max(1_000) };
         }
         if let Some(v) = patch.daily_cost_cap_usd {
             self.daily_cost_cap_usd = v.max(0.0);
@@ -407,6 +426,50 @@ impl Settings {
             self.auto_update_check = v;
         }
     }
+}
+
+#[derive(Clone)]
+pub(crate) struct ProviderHttp {
+    remote: reqwest::Client,
+    loopback: reqwest::Client,
+}
+
+impl ProviderHttp {
+    pub(crate) fn new(timeout: std::time::Duration) -> Self {
+        let builder = || {
+            reqwest::Client::builder()
+                .timeout(timeout)
+                .redirect(provider_redirect_policy())
+        };
+        Self {
+            remote: builder().build().expect("initialize provider HTTP client"),
+            loopback: builder()
+                .no_proxy()
+                .build()
+                .expect("initialize direct provider HTTP client"),
+        }
+    }
+
+    pub(crate) fn for_settings(&self, settings: &Settings) -> &reqwest::Client {
+        if settings.is_local_base_url() {
+            &self.loopback
+        } else {
+            &self.remote
+        }
+    }
+}
+
+fn provider_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt
+            .previous()
+            .last()
+            .is_some_and(|previous| previous.origin() != attempt.url().origin())
+        {
+            return attempt.error("Provider redirected the request to a different origin");
+        }
+        reqwest::redirect::Policy::default().redirect(attempt)
+    })
 }
 
 pub fn is_localhost_url(url: &str) -> bool {
@@ -444,6 +507,11 @@ mod tests {
         assert!(!s.is_external_destination());
         s.provider = "ollama".into();
         assert!(!s.is_external_destination());
+        s.base_url = "https://ollama.example/v1".into();
+        assert!(s.is_external_destination());
+        s.base_url = "http://localhost:11434@ollama.example/v1".into();
+        assert!(s.is_external_destination());
+        s.base_url = String::new();
         s.provider = "cli_claude".into();
         assert!(s.is_external_destination());
         s.provider = "openrouter".into();
@@ -451,6 +519,77 @@ mod tests {
         s.provider = "openai_compatible".into();
         s.base_url = "http://127.0.0.1:1234/v1".into();
         assert!(!s.is_external_destination());
+    }
+
+    #[test]
+    fn retains_saved_key_only_for_the_same_provider_and_endpoint() {
+        let mut settings = Settings {
+            provider: "openrouter".into(),
+            api_key: "env:MEMORY_OPENROUTER_KEY".into(),
+            ..Settings::default()
+        };
+        let patch = serde_json::from_value(serde_json::json!({
+            "model": "another-model",
+            "base_url": " https://openrouter.ai/api/v1/ "
+        }))
+        .unwrap();
+        settings.apply_patch(patch);
+        assert_eq!(settings.api_key, "env:MEMORY_OPENROUTER_KEY");
+
+        let patch = serde_json::from_value(serde_json::json!({
+            "base_url": "https://custom.example/v1"
+        }))
+        .unwrap();
+        settings.apply_patch(patch);
+        assert!(settings.api_key.is_empty());
+        assert!(settings.resolve_api_key().is_none());
+
+        let patch = serde_json::from_value(serde_json::json!({
+            "provider": "openai_compatible",
+            "api_key": "synthetic-custom-key"
+        }))
+        .unwrap();
+        settings.apply_patch(patch);
+        assert_eq!(settings.api_key, "synthetic-custom-key");
+
+        let patch = serde_json::from_value(serde_json::json!({ "provider": "ollama" })).unwrap();
+        settings.apply_patch(patch);
+        assert!(settings.api_key.is_empty());
+    }
+
+    #[tokio::test]
+    async fn provider_redirects_are_limited_to_the_same_origin() {
+        use axum::{Router, response::Redirect, routing::get};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let other_origin = format!("http://localhost:{}/answer", address.port());
+        let router = Router::new()
+            .route("/answer", get(|| async { "ok" }))
+            .route(
+                "/same-origin",
+                get(|| async { Redirect::temporary("/answer") }),
+            )
+            .route(
+                "/other-origin",
+                get(move || async move { Redirect::temporary(&other_origin) }),
+            );
+        let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .redirect(provider_redirect_policy())
+            .build()
+            .unwrap();
+        let url = format!("http://{address}");
+        let response = http.get(format!("{url}/same-origin")).send().await.unwrap();
+        assert_eq!(response.text().await.unwrap(), "ok");
+        let error = http
+            .get(format!("{url}/other-origin"))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(error.is_redirect());
+        task.abort();
     }
 
     #[test]

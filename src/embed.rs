@@ -1,4 +1,4 @@
-use crate::config::{EMBEDDING_DIM, Settings};
+use crate::config::{EMBEDDING_DIM, ProviderHttp, Settings};
 use crate::db::MemoryDb;
 use crate::scrub::redact_secrets;
 use anyhow::{Context, Result};
@@ -21,7 +21,7 @@ pub struct Embedder {
     models_dir: PathBuf,
     local_model: Arc<Mutex<Option<TextEmbedding>>>,
     local_state: Arc<Mutex<LocalModelState>>,
-    http: reqwest::Client,
+    http: ProviderHttp,
 }
 
 impl Embedder {
@@ -30,10 +30,7 @@ impl Embedder {
             models_dir,
             local_model: Arc::new(Mutex::new(None)),
             local_state: Arc::new(Mutex::new(LocalModelState::Idle)),
-            http: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(15))
-                .build()
-                .unwrap_or_default(),
+            http: ProviderHttp::new(std::time::Duration::from_secs(15)),
         }
     }
 
@@ -117,11 +114,15 @@ impl Embedder {
                     tracing::info!("Skipping external API embedding for local_only project");
                     return None;
                 }
-                if let Some(ledger_db) = db
-                    && let Ok(summary) =
-                        ledger_db.usage_summary(settings, self.status_label(settings))
-                    && summary.budget_exhausted
-                {
+                let ledger_db = db?;
+                let summary = match ledger_db.usage_summary(settings, self.status_label(settings)) {
+                    Ok(summary) => summary,
+                    Err(error) => {
+                        tracing::warn!(%error, "API embedding skipped because usage could not be read");
+                        return None;
+                    }
+                };
+                if summary.budget_exhausted {
                     let _ = ledger_db.record_usage(
                         &settings.provider,
                         &settings.embedding_model,
@@ -137,41 +138,37 @@ impl Embedder {
                 }
                 match self.embed_via_api(trimmed, settings).await {
                     Ok((vec, tokens)) => {
-                        if let Some(ledger_db) = db {
-                            let cost = if settings.is_local_base_url() {
-                                0.0
-                            } else {
-                                (tokens as f64 / 1_000_000.0) * 0.02
-                            };
-                            let _ = ledger_db.record_usage(
-                                &settings.provider,
-                                &settings.embedding_model,
-                                "embed",
-                                tokens,
-                                0,
-                                cost,
-                                None,
-                                "ok",
-                                None,
-                            );
-                        }
+                        let cost = if settings.is_local_base_url() {
+                            0.0
+                        } else {
+                            (tokens as f64 / 1_000_000.0) * 0.02
+                        };
+                        let _ = ledger_db.record_usage(
+                            &settings.provider,
+                            &settings.embedding_model,
+                            "embed",
+                            tokens,
+                            0,
+                            cost,
+                            None,
+                            "ok",
+                            None,
+                        );
                         Some(vec)
                     }
                     Err(e) => {
                         let msg = e.to_string();
-                        if let Some(ledger_db) = db {
-                            let _ = ledger_db.record_usage(
-                                &settings.provider,
-                                &settings.embedding_model,
-                                "embed",
-                                0,
-                                0,
-                                0.0,
-                                None,
-                                "error",
-                                Some(&msg),
-                            );
-                        }
+                        let _ = ledger_db.record_usage(
+                            &settings.provider,
+                            &settings.embedding_model,
+                            "embed",
+                            0,
+                            0,
+                            0.0,
+                            None,
+                            "error",
+                            Some(&msg),
+                        );
                         tracing::warn!(error = %msg, "API embedding failed; falling back to FTS5");
                         None
                     }
@@ -235,6 +232,7 @@ impl Embedder {
             });
             let resp = self
                 .http
+                .for_settings(settings)
                 .post(&url)
                 .header("x-goog-api-key", api_key)
                 .json(&body)
@@ -243,8 +241,7 @@ impl Embedder {
                 .context("Gemini embedding HTTP request failed")?;
             if !resp.status().is_success() {
                 let status = resp.status();
-                let err_body = resp.text().await.unwrap_or_default();
-                anyhow::bail!("Gemini Embedding API {status}: {err_body}");
+                anyhow::bail!("Gemini Embedding API returned HTTP {status}");
             }
             let val: serde_json::Value = resp.json().await?;
             let arr = val["embedding"]["values"]
@@ -272,21 +269,23 @@ impl Embedder {
         if model.contains("text-embedding-3") {
             body["dimensions"] = json!(EMBEDDING_DIM);
         }
-        let mut req = self.http.post(&url).json(&body);
+        let mut req = self.http.for_settings(settings).post(&url).json(&body);
         if let Some(key) = settings.resolve_api_key() {
             req = req.bearer_auth(key);
         }
         let resp = req.send().await.context("Embedding HTTP request failed")?;
         if !resp.status().is_success() {
             let status = resp.status();
-            let err_body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Embedding API {status}: {err_body}");
+            anyhow::bail!("Embedding API returned HTTP {status}");
         }
         let val: serde_json::Value = resp.json().await?;
         let arr = val["data"][0]["embedding"]
             .as_array()
             .context("Missing data[0].embedding in response")?;
-        let tokens = val["usage"]["total_tokens"].as_i64().unwrap_or(est_tokens);
+        let tokens = val["usage"]["total_tokens"]
+            .as_i64()
+            .filter(|tokens| *tokens >= 0)
+            .unwrap_or(est_tokens);
         let raw: Vec<f32> = arr
             .iter()
             .filter_map(|v| v.as_f64().map(|f| f as f32))

@@ -19,7 +19,7 @@ Primary research backing every integration detail:
    - Default providers: Direct API / Local LLM (**OpenRouter**, **Gemini**, **OpenAI-compatible / Ollama**).
    - **Zero-LLM Safe Mode:** Without any API key, raw capture, hybrid search (FTS5 + local ONNX), and explicit `memory_save` work seamlessly.
    - **Opt-In CLI Passthrough:** `claude -p`, `codex exec`, and `agy -p` are strictly opt-in with mandatory recursion guard (`OX1_MEMORY_INTERNAL=1`) and isolation flags (`--no-session-persistence` / `--ephemeral`, hooks & MCP disabled).
-   - **Hard Invariant:** Never silently fall back to a user's Claude/Codex/Antigravity coding subscription when an API provider errors or hits rate limits. Every LLM call is tracked in `usage_ledger` and gated by hard daily token & USD budget caps.
+   - **Hard Invariant:** Never silently fall back to a user's Claude/Codex/Antigravity coding subscription when an API provider errors or hits rate limits. Distillation, API embeddings, and provider tests check recorded UTC-day usage before dispatch and record the attempt in `usage_ledger`. Each limit can be disabled with `0`. An in-flight call can exceed the threshold.
 4. **Ultra-Lean Progressive Disclosure Recall:**
    - `SessionStart` injects a compact **~300–500 token briefing** (pinned memories + 5–8 recent cross-AI headlines for this project + global user preferences).
    - Exactly **5 compact MCP tools**: `memory_search`, `memory_get`, `memory_timeline`, `memory_save`, `memory_update`.
@@ -29,7 +29,7 @@ Primary research backing every integration detail:
    - Cross-client sharing is **ON by default**; every memory carries `source_client` (`claude-code` | `codex` | `antigravity` | `t3-code` | `mcp`) and lifecycle status (`active` | `pinned` | `superseded` | `archived`).
 6. **Security & Privacy at the Boundary:**
    - Deterministic secret redaction (API keys, Bearer tokens, `.env` assignments, JWTs, PEM private keys, `<private>...</private>` blocks) runs **before** persistence or LLM dispatch.
-   - Per-project `privacy_mode`: `full` (local DB + external LLM distillation), `local_only` (local DB + local embeddings only, never leaves machine), or `paused` (no capture).
+   - Per-project `privacy_mode`: `full` (local DB + configured providers), `local_only` (local DB, on-device embeddings, and eligible loopback providers), or `paused` (no capture). Use trusted loopback servers that perform inference on-device for `local_only`.
 
 ---
 
@@ -70,7 +70,7 @@ Designed to stay clean and cloud-sync-ready (UUIDv7/ULID-friendly string IDs, ex
 
 1. **`projects`**: `id`, `name`, `remote_url`, `root_paths_json`, `privacy_mode` (`full|local_only|paused`), `created_at`, `updated_at`.
 2. **`sessions`**: `id`, `project_id`, `source_client`, `external_session_id` (unique per client, used for T3 dedup), `branch`, `started_at`, `ended_at`, `last_turn_at`, `status` (`active|ended`).
-3. **`raw_events`**: `id`, `session_id`, `project_id`, `source_client`, `event_type` (`prompt|tool_use|tool_error|turn_stop|t3_message`), `tool_name`, `payload_json` (redacted & truncated), `distilled` (`0|1`), `created_at`. Auto-pruned after `raw_event_retention_days` (default 14).
+3. **`raw_events`**: `id`, `session_id`, `project_id`, `source_client`, `event_type` (`prompt|tool_use|tool_error|turn_stop|t3_message`), `tool_name`, `payload_json` (redacted & truncated), `distilled` (`0|1`), `created_at`. Processed events expire after `raw_event_retention_days` (default 14). Pending events can stay for twice that duration.
 4. **`memories`**: `id`, `scope` (`project|global`), `project_id`, `session_id`, `source_client`, `memory_type` (`decision|bugfix|architecture|preference|pattern|session_summary`), `title`, `summary`, `content`, `files_json`, `tags_json`, `status` (`active|pinned|superseded|archived`), `superseded_by`, `created_at`, `updated_at`.
    - **`memories_fts`**: FTS5 (`unicode61`) virtual table synced via triggers on `title`, `summary`, `content`, `tags_json`, `files_json`.
    - **`memories_vec`**: `sqlite-vec` `vec0` virtual table storing `float[384]` embeddings (`AllMiniLML6V2Q` / `BGESmallENV15Q` via `fastembed`, or API embeddings).
@@ -81,15 +81,15 @@ Designed to stay clean and cloud-sync-ready (UUIDv7/ULID-friendly string IDs, ex
    - `provider` (`none|openrouter|gemini|openai_compatible|ollama|cli_claude|cli_codex|cli_agy`)
    - `model` (e.g. `google/gemini-2.5-flash-lite` or `qwen2.5-coder:7b`)
    - `base_url`
-   - `api_key` (or `env:OPENROUTER_API_KEY` reference)
-   - `daily_token_cap` (default `250000`)
-   - `daily_cost_cap_usd` (default `0.50`)
-   - `session_start_token_budget` (default `450`)
+   - `api_key` (or an `env:VAR` reference), reused only for the same provider and endpoint
+   - `daily_token_cap` (default `250000`, `0` disables the token limit)
+   - `daily_cost_cap_usd` (default `0.50`, `0` disables the USD limit)
+   - `session_start_token_budget` (default `450`, approximate size of the memory briefing injected at session start)
    - `embedding_mode` (`local_onnx|fts_only|api`)
    - `embedding_model`
    - `raw_event_retention_days` (default `14`)
    - `t3_watcher_enabled` (`true|false`)
-   - `distill_idle_seconds` (default `120`)
+   - `distill_idle_seconds` (default `120`, pending sessions become eligible for recovery after this idle period without a turn-end signal)
    - `onboarding_completed` (`true|false`, auto-seeded `true` once for upgraded installs with existing data or client configs)
 8. **`memory_recall_stats`**: `memory_id`, `recall_count`, `last_recalled_at`, `clients_json` — lightweight cross-agent recall telemetry incremented only when `SessionStart`, `UserPromptSubmit`/`PreInvocation`, `memory_search`, or `memory_get` serves a memory.
 
@@ -127,7 +127,7 @@ Total tool definition footprint kept under ~550 tokens:
 1. **Live Stream (`/`)**: Split 2-column Activity Console — left column shows real-time SSE cross-agent memories grouped by Day/Session/Flat with clickable tags/files and drawer inspection + **Live Token & Cost Meter**; right collapsible **Pipeline Rail** shows active/recent sessions with 1-click `Distill now` / `Flush pending` and a pauseable, aggregated **Live Event Tail**.
 2. **Memories (`/memories`)**: True backend hybrid search (FTS5 + vector), multi-axis grouping (`Project` / `Type` / `Session` / `File` / `Tag` / `Flat`), recall-hit sorting, interactive Canvas 2D + `d3-force` **Graph Map** with zero-LLM derived edges, a unified **Right Inspector Drawer** (edit, supersession lineage, timeline, 1-hop SVG neighborhood), and a **Briefing Preview** modal with token budget breakdown and progressive disclosure savings.
 3. **Connections (`/connections`)**: Auto-detected client cards with live heartbeat status, Port Mismatch detection & 1-click Reconnect, dry-run diff preview before connect, 1-click Connect/Disconnect/Test Ping, Codex `/hooks` 1-step callout, T3 watcher toggle, and Universal MCP snippet.
-4. **Engine & Budget (`/engine`)**: Clean ~12-setting form for provider selection (OpenRouter / Gemini / Ollama / OpenAI-compatible / Zero-LLM / Opt-in CLI), API key & model config, Test Connection button, strict zero-silent-fallback status, hard daily token/USD caps, plus Local Daemon status, opt-in Auto-Start toggle, and confirmed Stop Daemon control.
+4. **Engine & Budget (`/engine`)**: Active provider and UTC-day usage, provider and model draft settings, a synthetic distillation test, independent limits, search and briefing controls, and storage and recovery settings. The usage ledger records distillation, API embeddings, and tests. Daemon controls cover updates, login Auto-Start, and confirmed shutdown.
 
 ---
 

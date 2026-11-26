@@ -13,7 +13,7 @@ import type {
 type StepIndex = 0 | 1 | 2 | 3;
 
 const STEPS: { index: StepIndex; num: string; label: string; title: string }[] = [
-  { index: 0, num: '01', label: 'Welcome', title: 'Welcome to 0x1-ai-memory' },
+  { index: 0, num: '01', label: 'Welcome', title: 'Welcome to AI Memory' },
   { index: 1, num: '02', label: 'AI Clients', title: 'Connect your AI coding clients' },
   { index: 2, num: '03', label: 'Memory Engine', title: 'Choose your memory distillation engine' },
   { index: 3, num: '04', label: 'Ready', title: 'Your local memory Daemon is ready' },
@@ -30,11 +30,11 @@ const ENGINE_CARDS: {
 }[] = [
   {
     id: 'none',
-    title: 'Zero-LLM safe mode',
-    badge: '$0 · default',
+    title: 'Distillation off',
+    badge: 'Default',
     model: '',
     baseUrl: '',
-    desc: 'Hybrid FTS5 + local ONNX vector search and explicit memory_save with zero API calls or quota usage.',
+    desc: 'Save memories manually. Search uses the embedding mode configured in Engine settings.',
     needsKey: false,
   },
   {
@@ -43,7 +43,7 @@ const ENGINE_CARDS: {
     badge: 'Recommended API',
     model: 'google/gemini-2.5-flash-lite',
     baseUrl: 'https://openrouter.ai/api/v1',
-    desc: 'Automatic per-turn distillation via a cheap decoupled model with strict daily USD caps.',
+    desc: 'Automatic per-turn distillation with a separate model and configurable daily limits.',
     needsKey: true,
   },
   {
@@ -61,7 +61,7 @@ const ENGINE_CARDS: {
     badge: '$0 · offline',
     model: 'qwen2.5-coder:7b',
     baseUrl: 'http://127.0.0.1:11434/v1',
-    desc: 'Zero external traffic using your local Ollama server on 127.0.0.1:11434.',
+    desc: 'Runs on-device with a locally installed model on 127.0.0.1:11434.',
     needsKey: false,
   },
 ];
@@ -149,7 +149,7 @@ export function OnboardingPage({
 
   useEffect(() => {
     const current = STEPS[step];
-    document.title = `Onboarding (${current.num}): ${current.label} | 0x1-ai-memory`;
+    document.title = `Onboarding (${current.num}): ${current.label} | AI Memory`;
     if (didMountRef.current) {
       headingRef.current?.focus();
     } else {
@@ -217,7 +217,10 @@ export function OnboardingPage({
   }
 
   function selectEngineCard(cardId: string) {
+    if (cardId === provider) return;
     setProvider(cardId);
+    setApiKeyInput('');
+    setShowKey(false);
     setEngineDirty(true);
     setTestResult(null);
     setEngineFeedback(null);
@@ -229,6 +232,7 @@ export function OnboardingPage({
   }
 
   async function saveEngineConfig(): Promise<boolean> {
+    if (testingEngine || savingEngine) return false;
     if (!engineDirty) {
       return true;
     }
@@ -608,8 +612,8 @@ export function OnboardingPage({
                 {STEPS[2].title}
               </h1>
               <p className="page-subtitle">
-                Start free with Zero-LLM safe mode ($0), or plug in a cheap decoupled API or local
-                Ollama model for automatic per-turn memory distillation.
+                Choose an API or a local Ollama model to save memories automatically after each
+                turn. You can also save memories manually.
               </p>
             </div>
 
@@ -621,7 +625,12 @@ export function OnboardingPage({
             {testResult ? (
               <div className={`callout ${testResult.ok ? 'ok' : 'danger'}`} role="status">
                 <span>{testResult.message}</span>
-                <span className="measure">{testResult.latency_ms} ms</span>
+                <span className="measure">
+                  {testResult.latency_ms} ms
+                  {testResult.estimated_cost_usd > 0
+                    ? ` · $${testResult.estimated_cost_usd.toPrecision(3)}`
+                    : ''}
+                </span>
               </div>
             ) : null}
 
@@ -634,7 +643,7 @@ export function OnboardingPage({
               </div>
             ) : null}
 
-            <fieldset className="onboarding-fieldset">
+            <fieldset className="onboarding-fieldset" disabled={testingEngine || savingEngine}>
               <legend className="onboarding-legend">Distillation mode</legend>
               <div className="radio-grid">
                 {ENGINE_CARDS.map((card) => (
@@ -672,14 +681,16 @@ export function OnboardingPage({
                       autoCapitalize="none"
                       spellCheck={false}
                       value={model}
+                      disabled={testingEngine || savingEngine}
                       onChange={(e) => {
                         setModel(e.target.value);
+                        setTestResult(null);
                         setEngineDirty(true);
                       }}
                     />
                   </div>
                   <div className="field">
-                    <label htmlFor="onb-cost-cap">Hard daily cost cap (USD)</label>
+                    <label htmlFor="onb-cost-cap">Daily cost limit (USD)</label>
                     <input
                       id="onb-cost-cap"
                       name="daily_cost_cap_usd"
@@ -687,6 +698,7 @@ export function OnboardingPage({
                       min={0}
                       step="any"
                       required
+                      aria-describedby="onb-cost-hint"
                       className="input input--mono"
                       value={dailyCostCap}
                       onChange={(e) => {
@@ -694,6 +706,7 @@ export function OnboardingPage({
                         setEngineDirty(true);
                       }}
                     />
+                    <span id="onb-cost-hint" className="field-hint">0 = Unlimited</span>
                   </div>
                 </div>
 
@@ -701,7 +714,7 @@ export function OnboardingPage({
                   <div className="field">
                     <label htmlFor="onb-api-key">
                       API key{' '}
-                      {settings?.has_api_key
+                      {settings?.has_api_key && settings.provider === provider && settings.base_url === baseUrl
                         ? `(configured: ${settings.api_key_masked || 'from env'})`
                         : '(or env:OPENROUTER_API_KEY / env:GEMINI_API_KEY)'}
                     </label>
@@ -718,8 +731,10 @@ export function OnboardingPage({
                         aria-describedby="onb-key-hint"
                         placeholder="Paste key or env:VAR_NAME (optional now)"
                         value={apiKeyInput}
+                        disabled={testingEngine || savingEngine}
                         onChange={(e) => {
                           setApiKeyInput(e.target.value);
+                          setTestResult(null);
                           setEngineDirty(true);
                         }}
                       />
@@ -747,8 +762,11 @@ export function OnboardingPage({
                     aria-busy={testingEngine}
                     onClick={() => void handleTestEngine()}
                   >
-                    {testingEngine ? 'Testing...' : 'Test connection'}
+                    {testingEngine ? 'Testing...' : 'Test distillation'}
                   </button>
+                  <p className="field-hint">
+                    Uses saved daily limits and a small sample that can use provider credits.
+                  </p>
                 </div>
               </div>
             ) : null}
@@ -760,7 +778,7 @@ export function OnboardingPage({
               <button
                 type="submit"
                 className="btn btn-primary"
-                disabled={savingEngine}
+                disabled={savingEngine || testingEngine}
                 aria-busy={savingEngine}
               >
                 {savingEngine ? 'Saving...' : 'Save and continue'}

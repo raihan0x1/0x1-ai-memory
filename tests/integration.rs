@@ -72,6 +72,67 @@ async fn body_json(resp: axum::response::Response) -> Value {
 }
 
 #[tokio::test]
+async fn daily_caps_can_be_disabled_independently() {
+    let tmp = tempdir().unwrap();
+    let state = test_state(tmp.path());
+    state
+        .db
+        .record_usage(
+            "openrouter",
+            "test-model",
+            "distill",
+            900,
+            200,
+            0.75,
+            None,
+            "ok",
+            None,
+        )
+        .unwrap();
+    let app = build_router(state);
+
+    for (token_cap, saved_token_cap, usd_cap, exhausted) in [
+        (0, 0, 0.50, true),
+        (1, 1_000, 0.0, true),
+        (0, 0, 0.0, false),
+        (0, 0, 0.00001, true),
+    ] {
+        let save = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/settings")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({ "daily_token_cap": token_cap, "daily_cost_cap_usd": usd_cap })
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(save.status(), StatusCode::OK);
+
+        let summary = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/summary")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(summary.status(), StatusCode::OK);
+        let summary = body_json(summary).await;
+        assert_eq!(summary["daily_token_cap"], saved_token_cap);
+        assert_eq!(summary["daily_cost_cap_usd"], usd_cap);
+        assert_eq!(summary["budget_exhausted"], exhausted);
+    }
+}
+
+#[tokio::test]
 async fn end_to_end_cross_client_mcp_hooks_ui_and_budget_guard() {
     let tmp = tempdir().unwrap();
     let repo_dir = tmp.path().join("demo-repo");
@@ -96,8 +157,29 @@ async fn end_to_end_cross_client_mcp_hooks_ui_and_budget_guard() {
             .to_vec(),
     )
     .unwrap();
-    assert!(html.contains("0x1-ai-memory"));
+    assert!(html.contains("<title>AI Memory</title>"));
     assert!(html.contains("/assets/"));
+    assert!(html.contains("href=\"/favicon.ico\""));
+
+    let favicon = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/favicon.ico")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(favicon.status(), StatusCode::OK);
+    assert!(
+        favicon.headers()[axum::http::header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("image/")
+    );
+    let icon = favicon.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(icon.as_ref(), include_bytes!("../ui/public/favicon.ico"));
 
     // 2. Claude Code saves a memory via Streamable HTTP MCP
     let save_resp = app
@@ -350,6 +432,36 @@ async fn end_to_end_cross_client_mcp_hooks_ui_and_budget_guard() {
     )
     .await;
     assert_eq!(state.db.recent_usage(20).unwrap().len(), usage_before);
+
+    // A ledger read failure defers distillation and preserves the raw events.
+    state.db.set_project_privacy(&proj_id, "full").unwrap();
+    settings.provider = "openai_compatible".into();
+    settings.base_url = "http://127.0.0.1:0/v1".into();
+    state.db.save_settings(&settings).unwrap();
+    state
+        .db
+        .insert_raw_event(&sess.id, &proj_id, "claude-code", "prompt", None, "{}")
+        .unwrap();
+    rusqlite::Connection::open(tmp.path().join("memory.db"))
+        .unwrap()
+        .execute_batch("DROP TABLE usage_ledger")
+        .unwrap();
+    distill_session_once(
+        &state.db,
+        &state.embedder,
+        &state.llm,
+        &state.events_tx,
+        &sess.id,
+    )
+    .await;
+    assert_eq!(
+        state
+            .db
+            .pending_events_for_session(&sess.id, 10)
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -458,9 +570,20 @@ async fn engine_test_uses_unsaved_draft_without_mutating_saved_settings() {
                     .map(str::to_string);
                 let bytes = req.into_body().collect().await.unwrap().to_bytes();
                 let payload: Value = serde_json::from_slice(&bytes).unwrap_or_default();
+                let content = if payload["model"] == "invalid-output" {
+                    json!({"ok": true})
+                } else {
+                    json!({"memories": [{
+                        "scope": "project",
+                        "type": "bugfix",
+                        "title": "Validate inputs",
+                        "summary": "Validate inputs before writing",
+                        "content": "The test application now validates inputs before writing a file."
+                    }]})
+                };
                 captured_srv.lock().unwrap().push((auth, payload));
                 axum::Json(json!({
-                    "choices": [{ "message": { "content": "{\"ok\":true}" } }],
+                    "choices": [{ "message": { "content": content.to_string() } }],
                     "usage": { "prompt_tokens": 12, "completion_tokens": 4, "cost": 0.00001 }
                 }))
             }
@@ -523,14 +646,22 @@ async fn engine_test_uses_unsaved_draft_without_mutating_saved_settings() {
     assert_eq!(draft_json["model"], "deepseek/deepseek-v4.1-flash-1017");
     assert_eq!(draft_json["input_tokens"], 12);
     assert_eq!(draft_json["output_tokens"], 4);
+    assert_eq!(draft_json["estimated_cost_usd"], 0.00001);
+    assert_eq!(draft_json["status"], "ok");
+    assert_eq!(
+        state.db.recent_usage(1).unwrap()[0].estimated_cost_usd,
+        0.00001
+    );
 
     // Saved DB settings remain untouched (still Zero-LLM with empty key)
     let saved_after = state.db.get_settings().unwrap();
     assert_eq!(saved_after.provider, "none");
     assert_eq!(saved_after.api_key, "");
 
-    // 3. Omitting api_key in draft falls back to the stored api_key
+    // A model-only draft keeps the key for the saved endpoint.
     let mut stored = state.db.get_settings().unwrap();
+    stored.provider = "openrouter".into();
+    stored.base_url = format!("http://{mock_addr}/v1");
     stored.api_key = "sk-stored-key".into();
     state.db.save_settings(&stored).unwrap();
 
@@ -544,7 +675,7 @@ async fn engine_test_uses_unsaved_draft_without_mutating_saved_settings() {
                 .body(Body::from(
                     json!({
                         "provider": "openrouter",
-                        "model": "google/gemini-2.5-flash-lite",
+                        "model": "invalid-output",
                         "base_url": format!("http://{mock_addr}/v1")
                     })
                     .to_string(),
@@ -554,6 +685,38 @@ async fn engine_test_uses_unsaved_draft_without_mutating_saved_settings() {
         .await
         .unwrap();
     assert_eq!(stored_key_resp.status(), StatusCode::OK);
+    let invalid = body_json(stored_key_resp).await;
+    assert_eq!(invalid["ok"], false);
+    assert_eq!(invalid["status"], "error");
+    assert_eq!(invalid["input_tokens"], 12);
+    assert_eq!(invalid["output_tokens"], 4);
+    assert_eq!(invalid["estimated_cost_usd"], 0.00001);
+    let ledger = &state.db.recent_usage(1).unwrap()[0];
+    assert_eq!(ledger.status, "error");
+    assert_eq!(ledger.estimated_cost_usd, 0.00001);
+
+    stored.daily_cost_cap_usd = 0.00002;
+    state.db.save_settings(&stored).unwrap();
+    let blocked_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/engine/test")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"daily_cost_cap_usd":0}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(blocked_resp.status(), StatusCode::OK);
+    let blocked = body_json(blocked_resp).await;
+    assert_eq!(blocked["ok"], false);
+    assert_eq!(blocked["status"], "budget_blocked");
+    assert_eq!(
+        state.db.recent_usage(1).unwrap()[0].status,
+        "budget_blocked"
+    );
     {
         let calls = captured.lock().unwrap();
         assert_eq!(calls.len(), 2);

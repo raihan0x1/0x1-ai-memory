@@ -655,12 +655,19 @@ async fn run_status(paths: AppPaths, port: u16) -> Result<()> {
         "Memories   : {} active across {} project(s) | {} pending raw events",
         summary.total_memories, summary.total_projects, summary.pending_raw_events
     );
+    let token_cap = if summary.daily_token_cap > 0 {
+        format!("{} tok", summary.daily_token_cap)
+    } else {
+        "Unlimited tokens".into()
+    };
+    let cost_cap = if summary.daily_cost_cap_usd > 0.0 {
+        format!("${}", summary.daily_cost_cap_usd)
+    } else {
+        "Unlimited USD".into()
+    };
     println!(
-        "Today Cost : {} tokens / ${:.4} (cap: {} tok / ${:.2})",
-        summary.today_total_tokens,
-        summary.today_cost_usd,
-        summary.daily_token_cap,
-        summary.daily_cost_cap_usd
+        "Today Cost : {} tokens / ${:.4} (caps: {token_cap} / {cost_cap}, UTC)",
+        summary.today_total_tokens, summary.today_cost_usd
     );
     println!("\nClients:");
     let mut has_mismatch = false;
