@@ -1,6 +1,6 @@
 {
   "name": "0x1-ai-memory",
-  "version": "0.3.4",
+  "version": "0.3.5",
   "description": "Local-first, anti-drain cross-agent AI memory engine (Claude Code, Codex, Antigravity, T3 Code)",
   "license": "MIT",
   "type": "module",
