@@ -24,3 +24,35 @@ _Avoid_: Outdated config, stale port
 The opt-in OS login service configuration that starts the Daemon automatically after a machine reboot without blocking explicit stops.
 _Avoid_: Startup script, background daemon, login hook
 
+**Client**:
+An AI coding agent whose hooks the Daemon receives and into which it injects memories, such as Claude Code, Codex or Antigravity.
+_Avoid_: Provider, host, app
+
+**Host**:
+The application that launches a Client, such as T3 Code, Orca or a terminal; the Daemon records it but never captures from it directly.
+_Avoid_: Client, harness, wrapper
+
+**Active Session**:
+A session that has not ended and has had activity within the last 30 minutes; any other unended session is idle.
+_Avoid_: Open session, live session
+
+**Turn End**:
+The agent's final message at the close of one turn.
+_Avoid_: Turn stop, Distill
+
+**Distillation**:
+The Daemon's background process that turns a session's captured activity into memories.
+_Avoid_: Summarization, extraction
+
+**Briefing**:
+The set of memories the Daemon gives a new session before its first prompt.
+_Avoid_: Session-start context, preamble
+
+**Handoff**:
+The part of a Briefing that tells a new session what other recent sessions in the same project were doing, and how long ago.
+_Avoid_: Continuation, context transfer, resume
+
+**Recall**:
+One instance of the Daemon placing a stored memory into an agent's context, either as part of a Briefing or in response to a prompt.
+_Avoid_: Injection, retrieval, hit
+
