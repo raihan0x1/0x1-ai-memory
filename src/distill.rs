@@ -1,7 +1,7 @@
 use crate::db::MemoryDb;
 use crate::embed::Embedder;
 use crate::llm::{MemoryLlmClient, distill_events_block};
-use crate::models::{NewMemoryInput, SearchFilter, StreamEvent};
+use crate::models::{NewMemoryInput, RawEvent, SearchFilter, StreamEvent};
 use crate::scrub::redact_secrets;
 use chrono::Utc;
 use serde_json::json;
@@ -174,6 +174,7 @@ pub async fn distill_session_once(
             );
             let _ = db.mark_events_distilled(event_ids);
 
+            let mut created = 0;
             for item in memories.into_iter().take(3) {
                 if item.title.trim().is_empty() || item.summary.trim().is_empty() {
                     continue;
@@ -202,6 +203,7 @@ pub async fn distill_session_once(
                     supersedes_id: item.supersedes_id,
                 };
                 if let Ok(mem) = db.create_memory(input, vec.as_deref()) {
+                    created += 1;
                     let _ = events_tx.send(StreamEvent {
                         kind: "memory_created".into(),
                         timestamp: Utc::now().to_rfc3339(),
@@ -209,6 +211,12 @@ pub async fn distill_session_once(
                     });
                 }
             }
+            record_distill_result(
+                db,
+                events_tx,
+                events,
+                json!({ "status": "ok", "memories_created": created, "events": events.len() }),
+            );
 
             let _ = events_tx.send(StreamEvent {
                 kind: "usage_recorded".into(),
@@ -236,6 +244,12 @@ pub async fn distill_session_once(
                 Some(&msg),
             );
             let _ = db.mark_events_distilled(event_ids);
+            record_distill_result(
+                db,
+                events_tx,
+                events,
+                json!({ "status": "error", "error": msg, "events": events.len() }),
+            );
             let _ = events_tx.send(StreamEvent {
                 kind: "usage_recorded".into(),
                 timestamp: Utc::now().to_rfc3339(),
@@ -248,6 +262,29 @@ pub async fn distill_session_once(
                 }),
             });
         }
+    }
+}
+
+/// Stores one Distillation pass as a `distill_result` event so the Stream tail keeps it.
+fn record_distill_result(
+    db: &MemoryDb,
+    events_tx: &broadcast::Sender<StreamEvent>,
+    events: &[RawEvent],
+    payload: serde_json::Value,
+) {
+    let first = &events[0];
+    if let Ok(ev) = db.insert_daemon_event(
+        &first.session_id,
+        &first.project_id,
+        &first.source_client,
+        "distill_result",
+        &payload.to_string(),
+    ) {
+        let _ = events_tx.send(StreamEvent {
+            kind: "raw_event".into(),
+            timestamp: Utc::now().to_rfc3339(),
+            payload: serde_json::to_value(&ev).unwrap_or_default(),
+        });
     }
 }
 

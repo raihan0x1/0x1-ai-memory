@@ -42,7 +42,9 @@ const SESSIONS_PAGE_SIZE = 6;
 const TAIL_PAGE_SIZE = 20;
 
 type StreamGroupMode = 'day' | 'session' | 'flat';
-type TailFilter = 'all' | 'prompts' | 'tools' | 'distill';
+type TailFilter = 'all' | 'prompts' | 'tools' | 'turn_end' | 'distill';
+
+const EVENT_LABELS: Record<string, string> = { turn_stop: 'Turn End', distill_result: 'Distill' };
 
 const CLIENT_OPTIONS = [
   { value: '', label: 'All AI clients' },
@@ -115,14 +117,8 @@ function matchesTailFilters(
   if (tailFilter === 'tools' && item.event_type !== 'tool_use' && item.event_type !== 'tool_error') {
     return false;
   }
-  if (
-    tailFilter === 'distill' &&
-    item.kind !== 'usage_recorded' &&
-    item.kind !== 'memory_created' &&
-    item.event_type !== 'turn_stop'
-  ) {
-    return false;
-  }
+  if (tailFilter === 'turn_end' && item.event_type !== 'turn_stop') return false;
+  if (tailFilter === 'distill' && item.event_type !== 'distill_result') return false;
   return true;
 }
 
@@ -1073,6 +1069,7 @@ export function StreamPage({
                       ['all', 'All'],
                       ['prompts', 'Prompts'],
                       ['tools', 'Tools'],
+                      ['turn_end', 'Turn End'],
                       ['distill', 'Distill'],
                     ] as const
                   ).map(([kind, label]) => (
@@ -1104,7 +1101,8 @@ export function StreamPage({
                     const isErr =
                       item.event_type === 'tool_error' ||
                       item.status === 'error' ||
-                      item.status === 'budget_blocked';
+                      item.status === 'budget_blocked' ||
+                      (item.event_type === 'distill_result' && item.preview?.startsWith('Failed:'));
                     const isGood =
                       item.kind === 'memory_created' ||
                       (item.kind === 'usage_recorded' && item.status === 'ok');
@@ -1118,7 +1116,9 @@ export function StreamPage({
                             <span
                               className={`tag ${isErr ? 'danger' : isGood ? 'ok' : ''}`}
                             >
-                              {item.tool_name ?? item.event_type}
+                              {item.tool_name ??
+                                EVENT_LABELS[item.event_type ?? ''] ??
+                                item.event_type}
                               {repeatCount > 1 ? ` x${repeatCount}` : ''}
                             </span>
                           </div>

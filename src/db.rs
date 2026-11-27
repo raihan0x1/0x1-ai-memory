@@ -522,6 +522,49 @@ impl MemoryDb {
         tool_name: Option<&str>,
         payload_json: &str,
     ) -> Result<RawEvent> {
+        self.insert_event(
+            session_id,
+            project_id,
+            source_client,
+            event_type,
+            tool_name,
+            payload_json,
+            false,
+        )
+    }
+
+    /// An event the Daemon produced itself (ADR 0003): stored already distilled, so it is never
+    /// Distillation input, and it never touches the session's last activity.
+    pub fn insert_daemon_event(
+        &self,
+        session_id: &str,
+        project_id: &str,
+        source_client: &str,
+        event_type: &str,
+        payload_json: &str,
+    ) -> Result<RawEvent> {
+        self.insert_event(
+            session_id,
+            project_id,
+            source_client,
+            event_type,
+            None,
+            payload_json,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_event(
+        &self,
+        session_id: &str,
+        project_id: &str,
+        source_client: &str,
+        event_type: &str,
+        tool_name: Option<&str>,
+        payload_json: &str,
+        daemon: bool,
+    ) -> Result<RawEvent> {
         let conn = self.conn.lock().unwrap();
         let id = format!("evt_{}", Uuid::now_v7().simple());
         let now = Utc::now().to_rfc3339();
@@ -529,13 +572,15 @@ impl MemoryDb {
         let clean_payload = scrub_and_truncate(payload_json, 6_000);
         conn.execute(
             "INSERT INTO raw_events(id, session_id, project_id, source_client, event_type, tool_name, payload_json, distilled, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8)",
-            params![id, session_id, project_id, client, event_type, tool_name, clean_payload, now],
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![id, session_id, project_id, client, event_type, tool_name, clean_payload, daemon, now],
         )?;
-        conn.execute(
-            "UPDATE sessions SET last_turn_at = ?2 WHERE id = ?1",
-            params![session_id, now],
-        )?;
+        if !daemon {
+            conn.execute(
+                "UPDATE sessions SET last_turn_at = ?2 WHERE id = ?1",
+                params![session_id, now],
+            )?;
+        }
         Ok(RawEvent {
             id,
             session_id: session_id.to_string(),
@@ -544,7 +589,7 @@ impl MemoryDb {
             event_type: event_type.to_string(),
             tool_name: tool_name.map(ToOwned::to_owned),
             payload_json: clean_payload,
-            distilled: false,
+            distilled: daemon,
             created_at: now,
         })
     }
@@ -618,7 +663,8 @@ impl MemoryDb {
         let kind_clause = match kind.map(str::trim) {
             Some("prompts") => "AND r.event_type = 'prompt'",
             Some("tools") => "AND r.event_type IN ('tool_use', 'tool_error')",
-            Some("distill") => "AND r.event_type = 'turn_stop'",
+            Some("turn_end") => "AND r.event_type = 'turn_stop'",
+            Some("distill") => "AND r.event_type = 'distill_result'",
             _ => "",
         };
         let conn = self.conn.lock().unwrap();
@@ -2453,6 +2499,20 @@ fn summarize_raw_payload(event_type: &str, tool_name: Option<&str>, payload_json
             .and_then(|v| v.as_str())
             .unwrap_or("Turn finished")
             .to_string(),
+        "distill_result" => {
+            let count = |key: &str, one: &str, many: &str| {
+                let n = parsed.get(key).and_then(|v| v.as_i64()).unwrap_or(0);
+                format!("{n} {}", if n == 1 { one } else { many })
+            };
+            match parsed.get("error").and_then(|v| v.as_str()) {
+                Some(err) => format!("Failed: {err}"),
+                None => format!(
+                    "{} from {}",
+                    count("memories_created", "memory", "memories"),
+                    count("events", "event", "events")
+                ),
+            }
+        }
         _ => {
             let input = parsed.get("input");
             let detail = input

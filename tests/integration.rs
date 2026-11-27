@@ -2429,3 +2429,124 @@ async fn briefing_recall_and_mcp_search_carry_generated_at_and_memory_ages() {
     }
     check(&lines.join("\n"), "this search");
 }
+
+#[tokio::test]
+async fn distill_results_are_stored_events_that_never_revive_a_session() {
+    use axum::{Router, routing::post};
+
+    let mock_router = Router::new().route(
+        "/v1/chat/completions",
+        post(|| async {
+            let content = json!({"memories": [{
+                "scope": "project", "type": "decision", "title": "Queue retries",
+                "summary": "Retries go through the queue", "content": "Details."
+            }]});
+            axum::Json(json!({
+                "choices": [{ "message": { "content": content.to_string() } }],
+                "usage": { "prompt_tokens": 12, "completion_tokens": 4, "cost": 0.0 }
+            }))
+        }),
+    );
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+    let mock_task = tokio::spawn(async move {
+        let _ = axum::serve(mock_listener, mock_router).await;
+    });
+
+    let tmp = tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    tokio::fs::create_dir_all(&repo).await.unwrap();
+    let state = test_state(tmp.path());
+    let app = build_router(state.clone());
+    let use_llm = |base_url: String| {
+        let mut settings = state.db.get_settings().unwrap();
+        settings.provider = "openai_compatible".into();
+        settings.base_url = base_url;
+        settings.model = "mock-model".into();
+        state.db.save_settings(&settings).unwrap();
+    };
+    let hook = |event: &'static str, extra: Value| {
+        let app = app.clone();
+        let mut body = json!({"cwd": repo, "session_id": "c-sess"});
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        async move {
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/v1/hooks/claude?event={event}"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+    };
+    let get = |uri: &'static str| {
+        let app = app.clone();
+        async move {
+            let resp = app
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            body_json(resp).await
+        }
+    };
+    let tool = || json!({"tool_name": "Bash", "tool_input": {"command": "cargo test"}, "tool_response": "ok"});
+    let sess = state
+        .db
+        .upsert_session(
+            &ox1_memory::project::resolve_project(&repo).id,
+            "claude-code",
+            "c-sess",
+            None,
+        )
+        .unwrap();
+    let distill = || {
+        distill_session_once(
+            &state.db,
+            &state.embedder,
+            &state.llm,
+            &state.events_tx,
+            &sess.id,
+        )
+    };
+
+    // One successful pass, then one failing pass (nothing listens on port 1).
+    use_llm(format!("http://{mock_addr}/v1"));
+    hook("PostToolUse", tool()).await;
+    distill().await;
+    use_llm("http://127.0.0.1:1/v1".into());
+    hook("PostToolUse", tool()).await;
+    let last_activity = get("/api/sessions?limit=5").await["sessions"][0]["last_turn_at"].clone();
+    distill().await;
+
+    let results = get("/api/raw-events?kind=distill").await;
+    assert_eq!(results["total"], 2, "{results}");
+    let rows = results["events"].as_array().unwrap();
+    assert!(rows.iter().all(|r| r["event_type"] == "distill_result"));
+    assert!(rows.iter().all(|r| r["distilled"] == true));
+    assert!(
+        rows[0]["preview"].as_str().unwrap().starts_with("Failed:"),
+        "{}",
+        rows[0]
+    );
+    assert_eq!(rows[1]["preview"], "1 memory from 1 event");
+
+    // Daemon rows are not Client activity: no pending work and no revived session.
+    let session = get("/api/sessions?limit=5").await["sessions"][0].clone();
+    assert_eq!(session["pending_events"], 0);
+    assert_eq!(session["last_turn_at"], last_activity);
+
+    hook("Stop", json!({"last_assistant_message": "All tests pass."})).await;
+    let turn_ends = get("/api/raw-events?kind=turn_end").await;
+    assert_eq!(turn_ends["total"], 1, "{turn_ends}");
+    assert_eq!(turn_ends["events"][0]["event_type"], "turn_stop");
+    assert_eq!(turn_ends["events"][0]["preview"], "All tests pass.");
+
+    mock_task.abort();
+}
