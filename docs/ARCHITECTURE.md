@@ -29,7 +29,8 @@ Primary research backing every integration detail:
    - **2-Tier Scope:** `project` (unified by normalized git remote URL or canonical repo path so worktrees & all 4 clients hit the same project) + `global` (personal coding style/preferences across repos).
    - Cross-client sharing is **ON by default**; every memory carries `source_client` (`claude-code` | `codex` | `antigravity` | `mcp`) and lifecycle status (`active` | `pinned` | `superseded` | `archived`).
 6. **Security & Privacy at the Boundary:**
-   - Deterministic secret redaction (API keys, Bearer tokens, `.env` assignments, JWTs, PEM private keys, `<private>...</private>` blocks) runs **before** persistence or LLM dispatch.
+   - Deterministic secret redaction (API keys, Bearer tokens, `.env` assignments, `*_TOKEN=` values of 16+ non-numeric characters, API-key style headers, passwords in URL userinfo, JWTs, PEM private keys, `<private>...</private>` blocks) runs **before** persistence or LLM dispatch. Raw-event payloads are truncated per field, so stored JSON stays valid.
+   - When rules are added, a one-time re-scrub (`rescrub_v1` meta flag) runs on open: it logs a dry-run count, writes `memory.db.pre-rescrub-<UTC>.backup` (mode 600) next to the database, then rewrites affected raw events and memories. FTS triggers keep search in sync; `updated_at` is left unchanged.
    - Per-project `privacy_mode`: `full` (local DB + configured providers), `local_only` (local DB, on-device embeddings, and eligible loopback providers), or `paused` (no capture). Use trusted loopback servers that perform inference on-device for `local_only`.
 
 ---

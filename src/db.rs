@@ -2,7 +2,7 @@ use crate::clock::{generated_at_line, memory_when};
 use crate::config::{EMBEDDING_DIM, Settings, ensure_parent_dir};
 use crate::models::*;
 use crate::project::ProjectIdentity;
-use crate::scrub::{redact_secrets, scrub_and_truncate};
+use crate::scrub::{redact_secrets, scrub_and_truncate, scrub_json_bounded, scrub_json_value};
 use anyhow::{Context, Result};
 use chrono::{Local, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -39,6 +39,7 @@ impl MemoryDb {
             conn: Arc::new(Mutex::new(conn)),
         };
         db.init_schema()?;
+        db.rescrub_once(path)?;
         Ok(db)
     }
 
@@ -206,6 +207,77 @@ impl MemoryDb {
             conn.execute("ALTER TABLE sessions ADD COLUMN host TEXT", [])?;
         }
         Ok(())
+    }
+
+    /// One-time re-scrub with redaction rules added after data was captured. Logs a dry-run
+    /// count first, then backs the database up next to itself before rewriting any row.
+    fn rescrub_once(&self, path: &Path) -> Result<()> {
+        const FLAG: &str = "rescrub_v1";
+        if self.get_meta(FLAG)?.is_some() {
+            return Ok(());
+        }
+        let conn = self.conn.lock().unwrap();
+        let mut events = Vec::new();
+        let mut stmt = conn.prepare("SELECT id, payload_json FROM raw_events")?;
+        for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
+            let (id, payload) = row?;
+            let clean = match serde_json::from_str::<serde_json::Value>(&payload) {
+                Ok(v) => scrub_json_value(&v, usize::MAX).to_string(),
+                Err(_) => redact_secrets(&payload),
+            };
+            if clean != payload {
+                events.push((id, clean));
+            }
+        }
+        drop(stmt);
+        let mut memories = Vec::new();
+        let mut stmt = conn.prepare("SELECT id, title, summary, content FROM memories")?;
+        for row in stmt.query_map([], |r| {
+            Ok([r.get::<_, String>(0)?, r.get(1)?, r.get(2)?, r.get(3)?])
+        })? {
+            let [id, title, summary, content] = row?;
+            let clean = [&title, &summary, &content].map(|t| redact_secrets(t));
+            if clean != [title, summary, content] {
+                memories.push((id, clean));
+            }
+        }
+        drop(stmt);
+        tracing::info!(
+            raw_events = events.len(),
+            memories = memories.len(),
+            "Re-scrub dry run: stored rows with newly redactable secrets"
+        );
+        if !events.is_empty() || !memories.is_empty() {
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            let backup = path.with_file_name(format!(
+                "{name}.pre-rescrub-{}.backup",
+                Utc::now().format("%Y%m%dT%H%M%SZ")
+            ));
+            conn.execute("VACUUM INTO ?1", params![backup.to_string_lossy()])?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&backup, std::fs::Permissions::from_mode(0o600))?;
+            }
+            // Memory updates fire the FTS triggers, so search drops the old text too.
+            let tx = conn.unchecked_transaction()?;
+            for (id, payload) in &events {
+                tx.execute(
+                    "UPDATE raw_events SET payload_json = ?2 WHERE id = ?1",
+                    params![id, payload],
+                )?;
+            }
+            for (id, [title, summary, content]) in &memories {
+                tx.execute(
+                    "UPDATE memories SET title = ?2, summary = ?3, content = ?4 WHERE id = ?1",
+                    params![id, title, summary, content],
+                )?;
+            }
+            tx.commit()?;
+            tracing::info!(backup = %backup.display(), "Re-scrub applied");
+        }
+        drop(conn);
+        self.set_meta(FLAG, &Utc::now().to_rfc3339())
     }
 
     // --- Settings ---
@@ -591,7 +663,11 @@ impl MemoryDb {
         let id = format!("evt_{}", Uuid::now_v7().simple());
         let now = Utc::now().to_rfc3339();
         let client = normalize_client(Some(source_client));
-        let clean_payload = scrub_and_truncate(payload_json, 6_000);
+        // Truncate per field so a stored payload stays valid JSON and previews keep working.
+        let clean_payload = match serde_json::from_str::<serde_json::Value>(payload_json) {
+            Ok(v) => scrub_json_bounded(&v, 6_000),
+            Err(_) => scrub_and_truncate(payload_json, 6_000),
+        };
         conn.execute(
             "INSERT INTO raw_events(id, session_id, project_id, source_client, event_type, tool_name, payload_json, distilled, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",

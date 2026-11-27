@@ -2701,3 +2701,155 @@ async fn hook_records_the_host_that_launched_the_client() {
         "{sessions}"
     );
 }
+
+fn rescrub_backups(dir: &std::path::Path) -> Vec<PathBuf> {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("memory.db.pre-rescrub-")
+        })
+        .map(|e| e.path())
+        .collect()
+}
+
+#[tokio::test]
+async fn one_time_rescrub_redacts_stored_secrets_keeps_search_in_sync_and_backs_up() {
+    let tmp = tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    tokio::fs::create_dir_all(&repo).await.unwrap();
+    let project = ox1_memory::project::resolve_project(&repo).id;
+    let send = |app: axum::Router, method: &'static str, uri: String, body: Option<Value>| async move {
+        let mut req = Request::builder().method(method).uri(uri);
+        if body.is_some() {
+            req = req.header("content-type", "application/json");
+        }
+        let resp = app
+            .oneshot(
+                req.body(body.map_or(Body::empty(), |b| Body::from(b.to_string())))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        body_json(resp).await
+    };
+    let leaked =
+        r#"curl -H "x-api-key: abcd1234efgh5678" https://admin:hunter2pass@api.example.com"#;
+    {
+        // A database written before the new rules existed: secrets stored in plain text.
+        let state = test_state(tmp.path());
+        let app = build_router(state.clone());
+        send(
+            app.clone(),
+            "POST",
+            "/v1/hooks/claude?event=PostToolUse".into(),
+            Some(
+                json!({"cwd": repo, "session_id": "old", "tool_name": "Bash",
+                        "tool_input": {"command": "echo placeholder"}, "tool_response": "ok"}),
+            ),
+        )
+        .await;
+        for title in ["Deploy uses the admin API", "Model limits"] {
+            send(
+                app.clone(),
+                "POST",
+                "/api/memories".into(),
+                Some(
+                    json!({"scope": "project", "project_id": project, "memory_type": "decision",
+                            "title": title, "summary": "s", "content": "placeholder"}),
+                ),
+            )
+            .await;
+        }
+        let raw = rusqlite::Connection::open(tmp.path().join("memory.db")).unwrap();
+        let payload = json!({"tool": "Bash", "input": {"command": leaked}, "output": "ok"});
+        raw.execute(
+            "UPDATE raw_events SET payload_json = ?1",
+            rusqlite::params![payload.to_string()],
+        )
+        .unwrap();
+        raw.execute(
+            "UPDATE memories SET content = ?1 WHERE title LIKE 'Deploy%'",
+            rusqlite::params![format!("Run {leaked} to deploy")],
+        )
+        .unwrap();
+        raw.execute(
+            "UPDATE memories SET content = 'Set MAX_TOKEN=4096 for the model' WHERE title = 'Model limits'",
+            [],
+        )
+        .unwrap();
+        raw.execute("DELETE FROM settings WHERE key LIKE '_meta:rescrub%'", [])
+            .unwrap();
+    }
+    let backups = || rescrub_backups(tmp.path());
+    assert!(backups().is_empty());
+
+    let state = test_state(tmp.path());
+    let app = build_router(state.clone());
+    let events = send(app.clone(), "GET", "/api/raw-events".into(), None).await;
+    let preview = events["events"][0]["preview"].as_str().unwrap();
+    assert!(preview.starts_with("Bash: curl"), "{preview}");
+    assert!(
+        !preview.contains("abcd1234efgh5678") && !preview.contains("hunter2pass"),
+        "{preview}"
+    );
+
+    let hidden = send(
+        app.clone(),
+        "GET",
+        "/api/memories?query=hunter2pass".into(),
+        None,
+    )
+    .await;
+    assert_eq!(
+        hidden["total"], 0,
+        "search index still holds the secret: {hidden}"
+    );
+    let found = send(
+        app.clone(),
+        "GET",
+        "/api/memories?query=deploy".into(),
+        None,
+    )
+    .await;
+    let id = found["memories"][0]["id"].as_str().unwrap().to_string();
+    let memory = send(app.clone(), "GET", format!("/api/memories/{id}"), None).await;
+    let content = memory["memory"]["content"].as_str().unwrap();
+    assert!(
+        content.contains("x-api-key: [REDACTED]") && !content.contains("hunter2pass"),
+        "{content}"
+    );
+    let limits = send(
+        app.clone(),
+        "GET",
+        "/api/memories?query=limits".into(),
+        None,
+    )
+    .await;
+    let id = limits["memories"][0]["id"].as_str().unwrap().to_string();
+    let memory = send(app.clone(), "GET", format!("/api/memories/{id}"), None).await;
+    assert_eq!(
+        memory["memory"]["content"],
+        "Set MAX_TOKEN=4096 for the model"
+    );
+
+    let made = backups();
+    assert_eq!(made.len(), 1, "{made:?}");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = tokio::fs::metadata(&made[0])
+            .await
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+    drop((app, state));
+    let _again = test_state(tmp.path());
+    assert_eq!(backups().len(), 1, "the re-scrub runs once");
+}
