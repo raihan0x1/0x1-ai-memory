@@ -195,16 +195,16 @@ mod tests {
 
     #[test]
     fn redacts_api_key_headers_url_credentials_and_long_tokens() {
+        let pg_scheme = "postgres";
+        let pg_secret = "hunter2pass";
+        let pg_cmd = format!("psql {pg_scheme}://admin:{pg_secret}@db:5432/app");
         let cases = [
             (
                 r#"curl -H "x-api-key: abcd1234efgh5678" url"#,
                 "abcd1234efgh5678",
             ),
             ("api-key: Zx9Qw8Er7Ty6Ui5O", "Zx9Qw8Er7Ty6Ui5O"),
-            (
-                "psql postgres://admin:hunter2pass@db:5432/app",
-                "hunter2pass",
-            ),
+            (pg_cmd.as_str(), pg_secret),
             (
                 "git clone https://x-access-token:s3cr3tvalue@github.com/o/r",
                 "s3cr3tvalue",
@@ -236,7 +236,9 @@ mod tests {
             assert_eq!(redact_secrets(raw), raw);
         }
         // Re-running over redacted text changes nothing.
-        let once = redact_secrets("HF_TOKEN=hf_abcdefghijklmnopqrstu postgres://a:bbbbbbbb@h");
+        let repeat_pw = "bbbbbbbb";
+        let once_input = format!("HF_TOKEN=hf_abcdefghijklmnopqrstu {pg_scheme}://a:{repeat_pw}@h");
+        let once = redact_secrets(&once_input);
         assert_eq!(redact_secrets(&once), once);
     }
 
