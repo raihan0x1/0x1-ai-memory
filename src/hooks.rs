@@ -100,6 +100,15 @@ pub async fn handle_hook(
                 return json!({});
             }
             let _ = db.record_memory_recalls(&included_ids, &client);
+            if let Ok(ev) = db.insert_daemon_event(
+                &session.id,
+                &project.id,
+                &client,
+                "recall",
+                &json!({ "trigger": "session_start", "memory_ids": included_ids }).to_string(),
+            ) {
+                let _ = events_tx.send(crate::db::raw_event_stream_event(&ev));
+            }
             format_context_injection(
                 &client,
                 "SessionStart",
@@ -155,6 +164,15 @@ pub async fn handle_hook(
                 {
                     let ids: Vec<String> = hits.iter().map(|h| h.id.clone()).collect();
                     let _ = db.record_memory_recalls(&ids, &client);
+                    if let Ok(ev) = db.insert_daemon_event(
+                        &session.id,
+                        &project.id,
+                        &client,
+                        "recall",
+                        &json!({ "trigger": "prompt", "memory_ids": ids }).to_string(),
+                    ) {
+                        let _ = events_tx.send(crate::db::raw_event_stream_event(&ev));
+                    }
                     let now = Local::now();
                     let mut lines = format!(
                         "Relevant cross-agent memories (call `memory_get([id])` if needed):\n{}\n",

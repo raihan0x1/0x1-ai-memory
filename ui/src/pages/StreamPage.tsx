@@ -48,7 +48,7 @@ function takeOver(ref: { current: AbortController | null }): AbortController {
 }
 
 type StreamGroupMode = 'day' | 'session' | 'flat';
-type TailFilter = 'signal' | 'all' | 'tools' | 'turn_end' | 'distill';
+type TailFilter = 'signal' | 'all' | 'tools' | 'turn_end' | 'distill' | 'recall';
 
 const EVENT_LABELS: Record<string, string> = {
   prompt: 'Prompt',
@@ -1053,6 +1053,7 @@ export function StreamPage({
                       ['tools', 'Tools'],
                       ['turn_end', 'Turn End'],
                       ['distill', 'Distill'],
+                      ['recall', 'Recall'],
                     ] as const
                   ).map(([kind, label]) => (
                     <button
@@ -1084,7 +1085,8 @@ export function StreamPage({
                       item.event_type === 'tool_error' ||
                       (item.event_type === 'distill_result' && item.preview.startsWith('Failed:'));
                     const isGood =
-                      item.event_type === 'distill_result' && !item.preview.startsWith('Failed:');
+                      item.event_type === 'recall' ||
+                      (item.event_type === 'distill_result' && !item.preview.startsWith('Failed:'));
                     return (
                       <li key={key} className="event-row">
                         <div className="event-row-top">

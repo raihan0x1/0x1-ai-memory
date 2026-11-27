@@ -2644,6 +2644,26 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
     }
 }
 
+pub fn display_client_name(id: &str) -> &str {
+    match id {
+        "claude-code" => "Claude Code",
+        "codex" => "Codex",
+        "antigravity" => "Antigravity",
+        "mcp" => "MCP",
+        "ui" => "Manual UI",
+        other => other,
+    }
+}
+
+pub fn display_host_name(host: &str) -> &str {
+    match host {
+        "t3-code" => "T3 Code",
+        "orca" => "Orca",
+        "terminal" => "terminal",
+        other => other,
+    }
+}
+
 /// Broadcasts a `raw_event` SSE message with a short server-built preview, never the raw payload.
 pub fn raw_event_stream_event(ev: &RawEvent) -> StreamEvent {
     let view = RawEventView {
@@ -2694,6 +2714,53 @@ pub fn summarize_raw_payload(
                     count("memories_created", "memory", "memories"),
                     count("events", "event", "events")
                 ),
+            }
+        }
+        "recall" => {
+            let mem_count = parsed
+                .get("memory_ids")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            let mem_label = format!(
+                "{mem_count} {}",
+                if mem_count == 1 { "memory" } else { "memories" }
+            );
+            let sources = parsed
+                .get("handoff_sources")
+                .and_then(|v| v.as_array())
+                .filter(|a| !a.is_empty());
+            if let Some(sources) = sources {
+                let first = &sources[0];
+                let client = first
+                    .get("client")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("mcp");
+                let via = first
+                    .get("host")
+                    .and_then(|v| v.as_str())
+                    .filter(|h| !h.is_empty())
+                    .map(|h| format!(" via {}", display_host_name(h)))
+                    .unwrap_or_default();
+                let extra = if sources.len() > 1 {
+                    format!(" (+{} more)", sources.len() - 1)
+                } else {
+                    String::new()
+                };
+                if mem_count > 0 {
+                    format!(
+                        "picked up from {}{via}{extra} · {mem_label}",
+                        display_client_name(client)
+                    )
+                } else {
+                    format!("picked up from {}{via}{extra}", display_client_name(client))
+                }
+            } else {
+                let prefix = match parsed.get("trigger").and_then(|v| v.as_str()) {
+                    Some("session_start") => "Briefing",
+                    _ => "Prompt recall",
+                };
+                format!("{prefix} · {mem_label}")
             }
         }
         _ => {

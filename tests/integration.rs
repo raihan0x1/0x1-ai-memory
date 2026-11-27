@@ -3075,3 +3075,112 @@ async fn tail_keyset_pages_signal_view_and_preview_only_sse() {
 
     mock_task.abort();
 }
+
+#[tokio::test]
+async fn recall_events_recorded_for_briefing_and_prompt_recall() {
+    let tmp = tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    tokio::fs::create_dir_all(&repo).await.unwrap();
+    let state = test_state(tmp.path());
+    let app = build_router(state.clone());
+    let proj = ox1_memory::project::resolve_project(&repo);
+    state.db.upsert_project(&proj).unwrap();
+
+    let create_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/memories")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "scope": "project",
+                        "project_id": proj.id,
+                        "memory_type": "decision",
+                        "title": "Use keyset pagination",
+                        "summary": "Keyset cursor prevents duplicate tail rows",
+                        "content": "Tail endpoint uses (created_at, id) keyset cursor."
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_resp.status(), StatusCode::OK);
+
+    let hook = |client: &'static str, event: &'static str, body: Value| {
+        let app = app.clone();
+        async move {
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/v1/hooks/{client}?event={event}"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+    };
+
+    hook(
+        "claude",
+        "SessionStart",
+        json!({"cwd": repo, "session_id": "rec-c1"}),
+    )
+    .await;
+    // Short prompt (<12 chars) should not trigger recall.
+    hook(
+        "claude",
+        "UserPromptSubmit",
+        json!({"cwd": repo, "session_id": "rec-c1", "prompt": "hi"}),
+    )
+    .await;
+    // Matching prompt (>=12 chars) triggers prompt recall.
+    hook(
+        "codex",
+        "UserPromptSubmit",
+        json!({"cwd": repo, "session_id": "rec-x1", "prompt": "How does keyset pagination work?"}),
+    )
+    .await;
+
+    let get = |uri: &'static str| {
+        let app = app.clone();
+        async move {
+            let resp = app
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            body_json(resp).await
+        }
+    };
+
+    let recalls = get("/api/raw-events?kind=recall").await;
+    assert_eq!(recalls["total"], 2, "{recalls}");
+    let rows = recalls["events"].as_array().unwrap();
+    assert!(rows.iter().all(|r| r["event_type"] == "recall"));
+    assert!(rows.iter().all(|r| r["distilled"] == true));
+    assert_eq!(rows[0]["preview"], "Prompt recall · 1 memory");
+    assert_eq!(rows[0]["source_client"], "codex");
+    assert_eq!(rows[1]["preview"], "Briefing · 1 memory");
+    assert_eq!(rows[1]["source_client"], "claude-code");
+
+    let codex_recalls = get("/api/raw-events?kind=recall&client=codex").await;
+    assert_eq!(codex_recalls["total"], 1, "{codex_recalls}");
+    let signal = get("/api/raw-events?kind=signal").await;
+    assert!(
+        signal["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["event_type"] == "recall")
+            .count()
+            == 2
+    );
+}
