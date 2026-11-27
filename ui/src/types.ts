@@ -62,29 +62,6 @@ export interface RawEventView {
   created_at: string;
 }
 
-export interface LiveStreamItem {
-  id: string;
-  kind:
-    | 'raw_event'
-    | 'usage_recorded'
-    | 'memory_created'
-    | 'memory_updated'
-    | 'memory_deleted'
-    | 'connection_changed';
-  timestamp: string;
-  source_client: string;
-  project_id: string | null;
-  project_name: string | null;
-  session_id: string | null;
-  event_type: string;
-  tool_name: string | null;
-  preview: string;
-  status?: string;
-  tokens?: number;
-  cost_usd?: number;
-  memory_id?: string;
-}
-
 export type GraphEdgeKind =
   | 'supersedes'
   | 'same_file'

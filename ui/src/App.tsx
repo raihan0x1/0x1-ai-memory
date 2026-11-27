@@ -10,7 +10,6 @@ import { StreamPage } from './pages/StreamPage';
 import type {
   ClientConnection,
   DaemonInfo,
-  LiveStreamItem,
   Project,
   SettingsView,
   UpdateStatusResponse,
@@ -37,115 +36,6 @@ function readTabFromUrl(): Tab {
   return 'stream';
 }
 
-function summarizeSsePayload(
-  eventType: string,
-  toolName: string | null,
-  payloadJson?: string,
-): string {
-  if (!payloadJson) return toolName ?? eventType;
-  try {
-    const p = JSON.parse(payloadJson) as Record<string, unknown>;
-    if (eventType === 'prompt' && typeof p.prompt === 'string') {
-      return p.prompt.replace(/\s+/g, ' ').slice(0, 120);
-    }
-    if (eventType === 'turn_stop' && typeof p.assistant === 'string') {
-      return p.assistant.replace(/\s+/g, ' ').slice(0, 120);
-    }
-    const input = p.input as Record<string, unknown> | undefined;
-    const detail =
-      input?.CommandLine ?? input?.command ?? input?.Path ?? input?.file_path ?? input?.TargetFile;
-    if (typeof detail === 'string' && detail.trim()) {
-      return `${toolName ?? 'tool'}: ${detail.replace(/\s+/g, ' ').slice(0, 100)}`;
-    }
-  } catch {
-    // ignore malformed payload preview
-  }
-  return toolName ?? eventType;
-}
-
-function parseSseItem(kind: LiveStreamItem['kind'], raw: string, seq: number): LiveStreamItem | null {
-  try {
-    const outer = JSON.parse(raw) as {
-      timestamp?: string;
-      payload?: Record<string, unknown>;
-    };
-    const ts = outer.timestamp ?? new Date().toISOString();
-    const p = outer.payload ?? {};
-
-    if (kind === 'raw_event') {
-      const evType = String(p.event_type ?? 'raw_event');
-      const toolName = typeof p.tool_name === 'string' ? p.tool_name : null;
-      return {
-        id: typeof p.id === 'string' ? p.id : `sse_${seq}`,
-        kind,
-        timestamp: typeof p.created_at === 'string' ? p.created_at : ts,
-        source_client: String(p.source_client ?? 'mcp'),
-        project_id: typeof p.project_id === 'string' ? p.project_id : null,
-        project_name: null,
-        session_id: typeof p.session_id === 'string' ? p.session_id : null,
-        event_type: evType,
-        tool_name: toolName,
-        preview: summarizeSsePayload(
-          evType,
-          toolName,
-          typeof p.payload_json === 'string' ? p.payload_json : undefined,
-        ),
-      };
-    }
-
-    if (kind === 'usage_recorded') {
-      const status = String(p.status ?? 'ok');
-      const inTok = Number(p.input_tokens ?? 0);
-      const outTok = Number(p.output_tokens ?? 0);
-      const cost = Number(p.cost_usd ?? 0);
-      const errMsg = typeof p.error_message === 'string' ? p.error_message : null;
-      return {
-        id: `sse_usg_${seq}`,
-        kind,
-        timestamp: ts,
-        source_client: 'distill',
-        project_id: null,
-        project_name: null,
-        session_id: typeof p.session_id === 'string' ? p.session_id : null,
-        event_type: `distill_${status}`,
-        tool_name: null,
-        status,
-        tokens: inTok + outTok,
-        cost_usd: cost,
-        preview:
-          status === 'ok'
-            ? `Distilled turn (${(inTok + outTok).toLocaleString()} tok · $${cost.toFixed(4)})`
-            : status === 'budget_blocked'
-              ? 'Blocked by daily budget cap (zero silent fallback)'
-              : `Distill error: ${errMsg ?? 'provider failure'}`,
-      };
-    }
-
-    if (kind === 'memory_created' || kind === 'memory_updated' || kind === 'memory_deleted') {
-      return {
-        id: `sse_mem_${seq}`,
-        kind,
-        timestamp: ts,
-        source_client: String(p.source_client ?? 'ui'),
-        project_id: typeof p.project_id === 'string' ? p.project_id : null,
-        project_name: typeof p.project_name === 'string' ? p.project_name : null,
-        session_id: typeof p.session_id === 'string' ? p.session_id : null,
-        event_type: kind,
-        tool_name: null,
-        memory_id: typeof p.id === 'string' ? p.id : undefined,
-        preview:
-          kind === 'memory_deleted'
-            ? `Deleted memory ${String(p.id ?? '')}`
-            : `${kind === 'memory_created' ? 'Created' : 'Updated'}: ${String(p.title ?? p.id ?? '')}`,
-      };
-    }
-
-    return null;
-  } catch {
-    return null;
-  }
-}
-
 export function App() {
   const [tab, setTabState] = useState<Tab>(readTabFromUrl);
   const [engineVisited, setEngineVisited] = useState(tab === 'engine');
@@ -155,7 +45,6 @@ export function App() {
   const [settings, setSettings] = useState<SettingsView | null>(null);
   const [daemon, setDaemon] = useState<DaemonInfo | null>(null);
   const [updateStatus, setUpdateStatus] = useState<UpdateStatusResponse | null>(null);
-  const [liveEvents, setLiveEvents] = useState<LiveStreamItem[]>([]);
   const [sseMemoryTick, setSseMemoryTick] = useState(0);
   const [sseSessionTick, setSseSessionTick] = useState(0);
   const [sseTailTick, setSseTailTick] = useState(0);
@@ -168,7 +57,6 @@ export function App() {
   const [whatsNewOpen, setWhatsNewOpen] = useState(false);
   const [whatsNewAuto, setWhatsNewAuto] = useState(false);
 
-  const sseSeqRef = useRef(0);
   const whatsNewAutoHandledRef = useRef(false);
 
   const setTab = useCallback(
@@ -287,23 +175,23 @@ export function App() {
     };
     es.onerror = () => setSseConnected(false);
 
-    const kinds: LiveStreamItem['kind'][] = [
+    const kinds = [
       'memory_created',
       'memory_updated',
       'memory_deleted',
       'usage_recorded',
       'connection_changed',
       'raw_event',
-    ];
+    ] as const;
     for (const kind of kinds) {
       es.addEventListener(kind, (ev) => {
-        let item: LiveStreamItem | null = null;
-        if (ev instanceof MessageEvent && typeof ev.data === 'string') {
-          sseSeqRef.current += 1;
-          item = parseSseItem(kind, ev.data, sseSeqRef.current);
-          const live = item;
-          if (live) {
-            setLiveEvents((prev) => [live, ...prev.filter((p) => p.id !== live.id)].slice(0, 80));
+        let isDistillResult = false;
+        if (kind === 'raw_event' && ev instanceof MessageEvent && typeof ev.data === 'string') {
+          try {
+            const outer = JSON.parse(ev.data) as { payload?: { event_type?: unknown } };
+            isDistillResult = outer.payload?.event_type === 'distill_result';
+          } catch {
+            // ignore malformed stream payload
           }
         }
         if (document.hidden) {
@@ -317,7 +205,7 @@ export function App() {
           setSseSessionTick((t) => t + 1);
           setSseTailTick((t) => t + 1);
         }
-        if (memoryKind || kind === 'usage_recorded' || item?.event_type === 'distill_result') {
+        if (memoryKind || kind === 'usage_recorded' || isDistillResult) {
           debounce('summary', () => {
             api.summary().then(setSummary, () => undefined);
           });
@@ -614,7 +502,6 @@ export function App() {
           <StreamPage
             summary={summary}
             projects={projects}
-            liveEvents={liveEvents}
             sseMemoryTick={sseMemoryTick}
             sseSessionTick={sseSessionTick}
             sseTailTick={sseTailTick}

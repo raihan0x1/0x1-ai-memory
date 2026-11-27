@@ -499,7 +499,7 @@ struct RawEventsQuery {
     client: Option<String>,
     kind: Option<String>,
     limit: Option<usize>,
-    offset: Option<usize>,
+    before: Option<String>,
 }
 
 async fn api_list_raw_events(
@@ -507,22 +507,21 @@ async fn api_list_raw_events(
     Query(q): Query<RawEventsQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let limit = q.limit.unwrap_or(50).clamp(1, 200);
-    let offset = q.offset.unwrap_or(0);
-    let (events, total) = st
+    let (events, total, next_cursor) = st
         .db
         .recent_raw_events_paged(
             q.project_id.as_deref().filter(|s| !s.is_empty()),
             q.client.as_deref().filter(|s| !s.is_empty()),
             q.kind.as_deref().filter(|s| !s.is_empty()),
             limit,
-            offset,
+            q.before.as_deref().filter(|s| !s.is_empty()),
         )
         .map_err(internal_err)?;
     Ok(Json(json!({
         "events": events,
         "total": total,
         "limit": limit,
-        "offset": offset,
+        "next_cursor": next_cursor,
     })))
 }
 

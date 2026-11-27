@@ -100,6 +100,7 @@ impl MemoryDb {
             );
             CREATE INDEX IF NOT EXISTS idx_raw_events_pending ON raw_events(distilled, session_id, created_at);
             CREATE INDEX IF NOT EXISTS idx_raw_events_created ON raw_events(created_at);
+            CREATE INDEX IF NOT EXISTS idx_raw_events_created_id ON raw_events(created_at DESC, id DESC);
 
             CREATE TABLE IF NOT EXISTS memories (
                 id TEXT PRIMARY KEY,
@@ -743,8 +744,8 @@ impl MemoryDb {
         client: Option<&str>,
         limit: usize,
     ) -> Result<Vec<RawEventView>> {
-        self.recent_raw_events_paged(project_id, client, None, limit.clamp(1, 100), 0)
-            .map(|(events, _)| events)
+        self.recent_raw_events_paged(project_id, client, None, limit.clamp(1, 100), None)
+            .map(|(events, _, _)| events)
     }
 
     pub fn recent_raw_events_paged(
@@ -753,19 +754,30 @@ impl MemoryDb {
         client: Option<&str>,
         kind: Option<&str>,
         limit: usize,
-        offset: usize,
-    ) -> Result<(Vec<RawEventView>, usize)> {
-        let limit = limit.clamp(1, 200) as i64;
-        let offset = offset as i64;
+        before: Option<&str>,
+    ) -> Result<(Vec<RawEventView>, usize, Option<String>)> {
+        let limit = limit.clamp(1, 200);
         let norm_client = client.map(|c| normalize_client(Some(c)));
+        let (before_ts, before_id) = match before
+            .and_then(|c| c.split_once('~'))
+            .filter(|(ts, id)| !ts.is_empty() && !id.is_empty())
+        {
+            Some((ts, id)) => (Some(ts), Some(id)),
+            None => (None, None),
+        };
         let kind_clause = match kind.map(str::trim) {
+            Some("signal") => {
+                "AND r.event_type IN ('prompt', 'turn_stop', 'tool_error', 'distill_result', 'recall')"
+            }
             Some("prompts") => "AND r.event_type = 'prompt'",
             Some("tools") => "AND r.event_type IN ('tool_use', 'tool_error')",
             Some("turn_end") => "AND r.event_type = 'turn_stop'",
             Some("distill") => "AND r.event_type = 'distill_result'",
+            Some("recall") => "AND r.event_type = 'recall'",
             _ => "",
         };
         let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
         let count_sql = format!(
             "SELECT COUNT(*) FROM raw_events r
              WHERE (?1 IS NULL OR r.project_id = ?1)
@@ -773,7 +785,7 @@ impl MemoryDb {
                {kind_clause}"
         );
         let total: i64 =
-            conn.query_row(&count_sql, params![project_id, norm_client], |r| r.get(0))?;
+            tx.query_row(&count_sql, params![project_id, norm_client], |r| r.get(0))?;
         let query_sql = format!(
             "SELECT r.id, r.session_id, r.project_id, p.name, r.source_client,
                     r.event_type, r.tool_name, r.payload_json, r.distilled, r.created_at
@@ -782,28 +794,56 @@ impl MemoryDb {
              WHERE (?1 IS NULL OR r.project_id = ?1)
                AND (?2 IS NULL OR r.source_client = ?2)
                {kind_clause}
-             ORDER BY r.created_at DESC
-             LIMIT ?3 OFFSET ?4"
+               AND (?3 IS NULL OR r.created_at < ?3 OR (r.created_at = ?3 AND r.id < ?4))
+             ORDER BY r.created_at DESC, r.id DESC
+             LIMIT ?5"
         );
-        let mut stmt = conn.prepare(&query_sql)?;
-        let rows = stmt.query_map(params![project_id, norm_client, limit, offset], |r| {
-            let event_type: String = r.get(5)?;
-            let tool_name: Option<String> = r.get(6)?;
-            let payload_json: String = r.get(7)?;
-            Ok(RawEventView {
-                id: r.get(0)?,
-                session_id: r.get(1)?,
-                project_id: r.get(2)?,
-                project_name: r.get(3)?,
-                source_client: r.get(4)?,
-                preview: summarize_raw_payload(&event_type, tool_name.as_deref(), &payload_json),
-                event_type,
-                tool_name,
-                distilled: r.get::<_, i64>(8)? != 0,
-                created_at: r.get(9)?,
-            })
-        })?;
-        Ok((rows.filter_map(Result::ok).collect(), total.max(0) as usize))
+        let mut items: Vec<RawEventView> = {
+            let mut stmt = tx.prepare(&query_sql)?;
+            stmt.query_map(
+                params![
+                    project_id,
+                    norm_client,
+                    before_ts,
+                    before_id,
+                    (limit + 1) as i64
+                ],
+                |r| {
+                    let event_type: String = r.get(5)?;
+                    let tool_name: Option<String> = r.get(6)?;
+                    let payload_json: String = r.get(7)?;
+                    Ok(RawEventView {
+                        id: r.get(0)?,
+                        session_id: r.get(1)?,
+                        project_id: r.get(2)?,
+                        project_name: r.get(3)?,
+                        source_client: r.get(4)?,
+                        preview: summarize_raw_payload(
+                            &event_type,
+                            tool_name.as_deref(),
+                            &payload_json,
+                        ),
+                        event_type,
+                        tool_name,
+                        distilled: r.get::<_, i64>(8)? != 0,
+                        created_at: r.get(9)?,
+                    })
+                },
+            )?
+            .filter_map(Result::ok)
+            .collect()
+        };
+        tx.commit()?;
+        let has_more = items.len() > limit;
+        if has_more {
+            items.truncate(limit);
+        }
+        let next_cursor = if has_more {
+            items.last().map(|r| format!("{}~{}", r.created_at, r.id))
+        } else {
+            None
+        };
+        Ok((items, total.max(0) as usize, next_cursor))
     }
 
     pub fn mark_events_distilled(&self, event_ids: &[String]) -> Result<()> {
@@ -2604,7 +2644,32 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
     }
 }
 
-fn summarize_raw_payload(event_type: &str, tool_name: Option<&str>, payload_json: &str) -> String {
+/// Broadcasts a `raw_event` SSE message with a short server-built preview, never the raw payload.
+pub fn raw_event_stream_event(ev: &RawEvent) -> StreamEvent {
+    let view = RawEventView {
+        id: ev.id.clone(),
+        session_id: ev.session_id.clone(),
+        project_id: ev.project_id.clone(),
+        project_name: None,
+        source_client: ev.source_client.clone(),
+        event_type: ev.event_type.clone(),
+        tool_name: ev.tool_name.clone(),
+        preview: summarize_raw_payload(&ev.event_type, ev.tool_name.as_deref(), &ev.payload_json),
+        distilled: ev.distilled,
+        created_at: ev.created_at.clone(),
+    };
+    StreamEvent {
+        kind: "raw_event".into(),
+        timestamp: Utc::now().to_rfc3339(),
+        payload: serde_json::to_value(view).unwrap_or_default(),
+    }
+}
+
+pub fn summarize_raw_payload(
+    event_type: &str,
+    tool_name: Option<&str>,
+    payload_json: &str,
+) -> String {
     let parsed: serde_json::Value = serde_json::from_str(payload_json).unwrap_or_default();
     let snippet = match event_type {
         "prompt" => parsed

@@ -83,10 +83,10 @@ export const api = {
       method: 'POST',
     }),
   rawEvents: (
-    params: { project_id?: string; client?: string; kind?: string; limit?: number; offset?: number } = {},
+    params: { project_id?: string; client?: string; kind?: string; limit?: number; before?: string } = {},
     signal?: AbortSignal,
   ) =>
-    req<{ events: RawEventView[]; total: number; limit: number; offset: number }>(
+    req<{ events: RawEventView[]; total: number; limit: number; next_cursor: string | null }>(
       `/api/raw-events${buildQuery(params)}`,
       { signal },
     ),

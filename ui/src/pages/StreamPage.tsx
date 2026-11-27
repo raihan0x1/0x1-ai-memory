@@ -15,7 +15,6 @@ import { ModalDialog } from '../components/ModalDialog';
 import { PaginationBar } from '../components/PaginationBar';
 import { RimSelect } from '../components/RimSelect';
 import type {
-  LiveStreamItem,
   MemoryHit,
   Project,
   RawEventView,
@@ -27,7 +26,6 @@ import type { Tab } from '../App';
 interface StreamPageProps {
   summary: UsageSummary | null;
   projects: Project[];
-  liveEvents: LiveStreamItem[];
   sseMemoryTick: number;
   sseSessionTick: number;
   sseTailTick: number;
@@ -50,9 +48,16 @@ function takeOver(ref: { current: AbortController | null }): AbortController {
 }
 
 type StreamGroupMode = 'day' | 'session' | 'flat';
-type TailFilter = 'all' | 'prompts' | 'tools' | 'turn_end' | 'distill';
+type TailFilter = 'signal' | 'all' | 'tools' | 'turn_end' | 'distill';
 
-const EVENT_LABELS: Record<string, string> = { turn_stop: 'Turn End', distill_result: 'Distill' };
+const EVENT_LABELS: Record<string, string> = {
+  prompt: 'Prompt',
+  turn_stop: 'Turn End',
+  tool_error: 'Tool Error',
+  tool_use: 'Tool',
+  distill_result: 'Distill',
+  recall: 'Recall',
+};
 
 const HOST_LABELS: Record<string, string> = { 't3-code': 'T3 Code', orca: 'Orca', terminal: 'terminal' };
 
@@ -89,11 +94,11 @@ const TYPE_OPTIONS = [
 
 interface AggregatedTailRow {
   key: string;
-  item: LiveStreamItem;
+  item: RawEventView;
   repeatCount: number;
 }
 
-function aggregateTail(items: LiveStreamItem[]): AggregatedTailRow[] {
+function aggregateTail(items: RawEventView[]): AggregatedTailRow[] {
   const out: AggregatedTailRow[] = [];
   for (const item of items) {
     const canAggregate =
@@ -113,25 +118,6 @@ function aggregateTail(items: LiveStreamItem[]): AggregatedTailRow[] {
     }
   }
   return out;
-}
-
-function matchesTailFilters(
-  item: LiveStreamItem,
-  projectFilter: string,
-  clientFilter: string,
-  tailFilter: TailFilter,
-): boolean {
-  if (projectFilter && item.project_id && item.project_id !== projectFilter) return false;
-  if (clientFilter && item.source_client !== 'distill' && item.source_client !== clientFilter) {
-    return false;
-  }
-  if (tailFilter === 'prompts' && item.event_type !== 'prompt') return false;
-  if (tailFilter === 'tools' && item.event_type !== 'tool_use' && item.event_type !== 'tool_error') {
-    return false;
-  }
-  if (tailFilter === 'turn_end' && item.event_type !== 'turn_stop') return false;
-  if (tailFilter === 'distill' && item.event_type !== 'distill_result') return false;
-  return true;
 }
 
 function NewItemsBanner({
@@ -159,7 +145,6 @@ function NewItemsBanner({
 export function StreamPage({
   summary,
   projects,
-  liveEvents,
   sseMemoryTick,
   sseSessionTick,
   sseTailTick,
@@ -186,14 +171,17 @@ export function StreamPage({
   const [sessionsError, setSessionsError] = useState<string | null>(null);
 
   const [rawEvents, setRawEvents] = useState<RawEventView[]>([]);
+  const [tailNextCursor, setTailNextCursor] = useState<string | null>(null);
   const [tailTotal, setTailTotal] = useState(0);
   const [tailLoading, setTailLoading] = useState(true);
+  const [tailLoadingMore, setTailLoadingMore] = useState(false);
   const [tailError, setTailError] = useState<string | null>(null);
+  const [tailOlderLoaded, setTailOlderLoaded] = useState(false);
 
   const [actionError, setActionError] = useState<string | null>(null);
   const [distillingId, setDistillingId] = useState<string | null>(null);
   const [flushing, setFlushing] = useState(false);
-  const [tailFilter, setTailFilter] = useState<TailFilter>('all');
+  const [tailFilter, setTailFilter] = useState<TailFilter>('signal');
 
   const memFilterKey = `${projectFilter}:${clientFilter}`;
   const [memPageState, setMemPageState] = useState({ key: memFilterKey, page: 1 });
@@ -208,16 +196,10 @@ export function StreamPage({
   const sessionsHasNew = sessNewState.key === sessFilterKey && sessNewState.value;
 
   const tailFilterKey = `${projectFilter}:${clientFilter}:${tailFilter}`;
-  const [tailPageState, setTailPageState] = useState({ key: tailFilterKey, page: 1 });
-  const tailPage = tailPageState.key === tailFilterKey ? tailPageState.page : 1;
   const [tailNewState, setTailNewState] = useState({ key: tailFilterKey, value: false });
   const tailHasNew = tailNewState.key === tailFilterKey && tailNewState.value;
-  const [pausedState, setPausedState] = useState<{
-    key: string;
-    rows: AggregatedTailRow[] | null;
-  }>({ key: tailFilterKey, rows: null });
-  const pausedSnapshot = pausedState.key === tailFilterKey ? pausedState.rows : null;
-  const tailPaused = pausedSnapshot !== null;
+  const [tailPausedState, setTailPausedState] = useState({ key: tailFilterKey, paused: false });
+  const tailPaused = tailPausedState.key === tailFilterKey && tailPausedState.paused;
 
   const prevMemTickRef = useRef(sseMemoryTick);
   const prevSessTickRef = useRef(sseSessionTick);
@@ -225,8 +207,6 @@ export function StreamPage({
   const memAbortRef = useRef<AbortController | null>(null);
   const sessAbortRef = useRef<AbortController | null>(null);
   const tailAbortRef = useRef<AbortController | null>(null);
-  const latestEventRef = useRef<LiveStreamItem | undefined>(liveEvents[0]);
-  latestEventRef.current = liveEvents[0];
 
   const [saveOpen, setSaveOpen] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -294,31 +274,56 @@ export function StreamPage({
   const loadTail = useCallback(async () => {
     const ctl = takeOver(tailAbortRef);
     setTailLoading(true);
+    setTailLoadingMore(false);
     setTailError(null);
     try {
       const rRes = await api.rawEvents({
         project_id: projectFilter || undefined,
         client: clientFilter || undefined,
-        kind: tailFilter === 'all' ? undefined : tailFilter,
+        kind: tailFilter,
         limit: TAIL_PAGE_SIZE,
-        offset: (tailPage - 1) * TAIL_PAGE_SIZE,
       }, ctl.signal);
-      if (rRes.total > 0 && (tailPage - 1) * TAIL_PAGE_SIZE >= rRes.total) {
-        setTailPageState({
-          key: tailFilterKey,
-          page: Math.max(1, Math.ceil(rRes.total / TAIL_PAGE_SIZE)),
-        });
-        return;
-      }
       setRawEvents(rRes.events);
+      setTailNextCursor(rRes.next_cursor);
       setTailTotal(rRes.total);
+      setTailOlderLoaded(false);
+      setTailNewState({ key: tailFilterKey, value: false });
     } catch (err) {
       if (ctl.signal.aborted) return;
       setTailError(err instanceof Error ? err.message : 'Failed to load event tail');
     } finally {
       if (!ctl.signal.aborted) setTailLoading(false);
     }
-  }, [projectFilter, clientFilter, tailFilter, tailPage, tailFilterKey]);
+  }, [projectFilter, clientFilter, tailFilter, tailFilterKey]);
+
+  const loadOlderTail = useCallback(async () => {
+    if (!tailNextCursor || tailLoadingMore) return;
+    const ctl = takeOver(tailAbortRef);
+    setTailLoadingMore(true);
+    setTailError(null);
+    try {
+      const rRes = await api.rawEvents({
+        project_id: projectFilter || undefined,
+        client: clientFilter || undefined,
+        kind: tailFilter,
+        limit: TAIL_PAGE_SIZE,
+        before: tailNextCursor,
+      }, ctl.signal);
+      setRawEvents((prev) => {
+        const seen = new Set(prev.map((ev) => ev.id));
+        const older = rRes.events.filter((ev) => !seen.has(ev.id));
+        return [...prev, ...older];
+      });
+      setTailNextCursor(rRes.next_cursor);
+      setTailTotal(rRes.total);
+      setTailOlderLoaded(true);
+    } catch (err) {
+      if (ctl.signal.aborted) return;
+      setTailError(err instanceof Error ? err.message : 'Failed to load older events');
+    } finally {
+      if (!ctl.signal.aborted) setTailLoadingMore(false);
+    }
+  }, [tailNextCursor, tailLoadingMore, projectFilter, clientFilter, tailFilter]);
 
   useEffect(() => {
     void loadMemories();
@@ -338,17 +343,9 @@ export function StreamPage({
     if (memPage === 1) {
       const t = window.setTimeout(() => void loadMemories(), TICK_DEBOUNCE_MS);
       return () => window.clearTimeout(t);
-    } else {
-      const latest = latestEventRef.current;
-      const matchesMemScope =
-        !latest ||
-        ((!projectFilter || !latest.project_id || latest.project_id === projectFilter) &&
-          (!clientFilter || latest.source_client === clientFilter));
-      if (matchesMemScope) {
-        setMemNewState({ key: memFilterKey, value: true });
-      }
     }
-  }, [sseMemoryTick, memPage, memFilterKey, projectFilter, clientFilter, loadMemories]);
+    setMemNewState({ key: memFilterKey, value: true });
+  }, [sseMemoryTick, memPage, memFilterKey, loadMemories]);
 
   useEffect(() => {
     if (sseSessionTick === prevSessTickRef.current) return;
@@ -356,33 +353,26 @@ export function StreamPage({
     if (sessionsPage === 1) {
       const t = window.setTimeout(() => void loadSessions(), TICK_DEBOUNCE_MS);
       return () => window.clearTimeout(t);
-    } else {
-      const latest = latestEventRef.current;
-      if (!latest || !projectFilter || !latest.project_id || latest.project_id === projectFilter) {
-        setSessNewState({ key: sessFilterKey, value: true });
-      }
     }
-  }, [sseSessionTick, sessionsPage, sessFilterKey, projectFilter, loadSessions]);
+    setSessNewState({ key: sessFilterKey, value: true });
+  }, [sseSessionTick, sessionsPage, sessFilterKey, loadSessions]);
 
   useEffect(() => {
     if (sseTailTick === prevTailTickRef.current) return;
     // Leave the ref behind while paused so Resume catches up with one fetch.
     if (tailPaused) return;
-    if (tailPage === 1) {
-      // Mark the tick seen only when the fetch fires, so a Pause inside the window still catches up.
-      const t = window.setTimeout(() => {
-        prevTailTickRef.current = sseTailTick;
-        void loadTail();
-      }, TICK_DEBOUNCE_MS);
-      return () => window.clearTimeout(t);
-    } else {
+    if (tailOlderLoaded) {
       prevTailTickRef.current = sseTailTick;
-      const latest = latestEventRef.current;
-      if (!latest || matchesTailFilters(latest, projectFilter, clientFilter, tailFilter)) {
-        setTailNewState({ key: tailFilterKey, value: true });
-      }
+      setTailNewState({ key: tailFilterKey, value: true });
+      return;
     }
-  }, [sseTailTick, tailPaused, tailPage, tailFilterKey, projectFilter, clientFilter, tailFilter, loadTail]);
+    // Mark the tick seen only when the fetch fires, so a Pause inside the window still catches up.
+    const t = window.setTimeout(() => {
+      prevTailTickRef.current = sseTailTick;
+      void loadTail();
+    }, TICK_DEBOUNCE_MS);
+    return () => window.clearTimeout(t);
+  }, [sseTailTick, tailPaused, tailOlderLoaded, tailFilterKey, loadTail]);
 
   const tokenPct =
     summary && summary.daily_token_cap > 0
@@ -431,41 +421,7 @@ export function StreamPage({
     return Array.from(groups.entries()).map(([key, g]) => ({ key, ...g }));
   }, [filtered, groupMode, sessionMap]);
 
-  const liveTail = useMemo(() => {
-    const base: LiveStreamItem[] = rawEvents.map((ev) => ({
-      id: ev.id,
-      kind: 'raw_event',
-      timestamp: ev.created_at,
-      source_client: ev.source_client,
-      project_id: ev.project_id,
-      project_name: ev.project_name,
-      session_id: ev.session_id,
-      event_type: ev.event_type,
-      tool_name: ev.tool_name,
-      preview: ev.preview,
-    }));
-
-    const matchedBase = base.filter((item) =>
-      matchesTailFilters(item, projectFilter, clientFilter, tailFilter),
-    );
-    if (tailPage > 1) {
-      return aggregateTail(matchedBase);
-    }
-
-    const baseIds = new Set(matchedBase.map((item) => item.id));
-    const liveExtras: LiveStreamItem[] = [];
-    const seenExtras = new Set<string>();
-    for (const item of liveEvents) {
-      if (baseIds.has(item.id) || seenExtras.has(item.id)) continue;
-      if (!matchesTailFilters(item, projectFilter, clientFilter, tailFilter)) continue;
-      seenExtras.add(item.id);
-      liveExtras.push(item);
-      if (liveExtras.length >= 10) break;
-    }
-    return aggregateTail([...liveExtras, ...matchedBase]);
-  }, [rawEvents, liveEvents, tailPage, projectFilter, clientFilter, tailFilter]);
-
-  const displayedTail = tailPage === 1 && pausedSnapshot ? pausedSnapshot : liveTail;
+  const displayedTail = useMemo(() => aggregateTail(rawEvents), [rawEvents]);
 
   const activeProjectObj = projects.find((p) => p.id === projectFilter);
   const projectFilterOptions = [
@@ -1049,35 +1005,27 @@ export function StreamPage({
             <section className="panel">
               <div className="panel-header">
                 <h2 className="panel-title">Live event tail ({tailTotal})</h2>
-                {tailPage === 1 ? (
-                  <button
-                    type="button"
-                    className="btn-subtle"
-                    aria-pressed={tailPaused}
-                    onClick={() =>
-                      setPausedState((prev) => ({
-                        key: tailFilterKey,
-                        rows: prev.key === tailFilterKey && prev.rows !== null ? null : liveTail,
-                      }))
-                    }
-                  >
-                    {tailPaused ? <IconPlay size={12} /> : <IconPause size={12} />}
-                    {tailPaused ? 'Resume' : 'Pause'}
-                  </button>
-                ) : (
-                  <span className="field-hint measure">Page {tailPage}</span>
-                )}
+                <button
+                  type="button"
+                  className="btn-subtle"
+                  aria-pressed={tailPaused}
+                  onClick={() =>
+                    setTailPausedState((prev) => ({
+                      key: tailFilterKey,
+                      paused: !(prev.key === tailFilterKey && prev.paused),
+                    }))
+                  }
+                >
+                  {tailPaused ? <IconPlay size={12} /> : <IconPause size={12} />}
+                  {tailPaused ? 'Resume' : 'Pause'}
+                </button>
               </div>
 
               <NewItemsBanner
-                visible={tailHasNew && tailPage > 1}
-                label={`New events arrived while on page ${tailPage}.`}
-                buttonText="New events — back to page 1"
-                onBack={() => {
-                  setTailNewState({ key: tailFilterKey, value: false });
-                  setPausedState({ key: tailFilterKey, rows: null });
-                  setTailPageState({ key: tailFilterKey, page: 1 });
-                }}
+                visible={tailHasNew && tailOlderLoaded}
+                label="New events arrived while reading older history."
+                buttonText="Show latest"
+                onBack={() => void loadTail()}
               />
 
               {tailError ? (
@@ -1097,11 +1045,11 @@ export function StreamPage({
                   paddingBlock: 'var(--space-xs)',
                 }}
               >
-                <fieldset className="seg-group" aria-label="Filter live event tail">
+                <fieldset className="seg-group seg-group--tail" aria-label="Filter live event tail">
                   {(
                     [
+                      ['signal', 'Signal'],
                       ['all', 'All'],
-                      ['prompts', 'Prompts'],
                       ['tools', 'Tools'],
                       ['turn_end', 'Turn End'],
                       ['distill', 'Distill'],
@@ -1134,12 +1082,9 @@ export function StreamPage({
                   {displayedTail.map(({ key, item, repeatCount }) => {
                     const isErr =
                       item.event_type === 'tool_error' ||
-                      item.status === 'error' ||
-                      item.status === 'budget_blocked' ||
-                      (item.event_type === 'distill_result' && item.preview?.startsWith('Failed:'));
+                      (item.event_type === 'distill_result' && item.preview.startsWith('Failed:'));
                     const isGood =
-                      item.kind === 'memory_created' ||
-                      (item.kind === 'usage_recorded' && item.status === 'ok');
+                      item.event_type === 'distill_result' && !item.preview.startsWith('Failed:');
                     return (
                       <li key={key} className="event-row">
                         <div className="event-row-top">
@@ -1151,13 +1096,13 @@ export function StreamPage({
                               className={`tag ${isErr ? 'danger' : isGood ? 'ok' : ''}`}
                             >
                               {item.tool_name ??
-                                EVENT_LABELS[item.event_type ?? ''] ??
+                                EVENT_LABELS[item.event_type] ??
                                 item.event_type}
                               {repeatCount > 1 ? ` x${repeatCount}` : ''}
                             </span>
                           </div>
-                          <time className="field-hint measure" dateTime={item.timestamp}>
-                            {formatUtcClock(item.timestamp)}
+                          <time className="field-hint measure" dateTime={item.created_at}>
+                            {formatUtcClock(item.created_at)}
                           </time>
                         </div>
                         <span className="event-preview" title={item.preview}>
@@ -1169,17 +1114,23 @@ export function StreamPage({
                 </ul>
               )}
 
-              <PaginationBar
-                label="Live event tail pages"
-                page={tailPage}
-                pageSize={TAIL_PAGE_SIZE}
-                total={tailTotal}
-                onPageChange={(nextPage) => {
-                  setTailNewState({ key: tailFilterKey, value: false });
-                  setPausedState({ key: tailFilterKey, rows: null });
-                  setTailPageState({ key: tailFilterKey, page: nextPage });
-                }}
-              />
+              {tailTotal > 0 ? (
+                <div className="pagination-bar">
+                  <span className="pagination-meta measure">
+                    Showing {rawEvents.length.toLocaleString()} of {tailTotal.toLocaleString()}
+                  </span>
+                  {tailNextCursor ? (
+                    <button
+                      type="button"
+                      className="btn-subtle page-btn"
+                      disabled={tailLoadingMore}
+                      onClick={() => void loadOlderTail()}
+                    >
+                      {tailLoadingMore ? 'Loading...' : 'Load older'}
+                    </button>
+                  ) : null}
+                </div>
+              ) : null}
             </section>
           </aside>
         ) : null}

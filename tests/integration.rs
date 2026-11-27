@@ -1547,12 +1547,12 @@ async fn pagination_across_memories_sessions_raw_events_and_usage() {
         .collect();
     assert!(s1_ids.is_disjoint(&s2_ids));
 
-    // 3. Raw events pagination + kind=prompts filter (indices 0,3,6,9,12,15,18,21,24 => 9 prompts)
+    // 3. Raw events keyset pagination + kind=prompts filter (indices 0,3,6,9,12,15,18,21,24 => 9 prompts)
     let r_p1 = body_json(
         app.clone()
             .oneshot(
                 Request::builder()
-                    .uri("/api/raw-events?limit=5&offset=0&kind=prompts")
+                    .uri("/api/raw-events?limit=5&kind=prompts")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1560,11 +1560,14 @@ async fn pagination_across_memories_sessions_raw_events_and_usage() {
             .unwrap(),
     )
     .await;
+    let cursor = r_p1["next_cursor"].as_str().unwrap();
     let r_p2 = body_json(
         app.clone()
             .oneshot(
                 Request::builder()
-                    .uri("/api/raw-events?limit=5&offset=5&kind=prompts")
+                    .uri(format!(
+                        "/api/raw-events?limit=5&kind=prompts&before={cursor}"
+                    ))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1576,6 +1579,7 @@ async fn pagination_across_memories_sessions_raw_events_and_usage() {
     assert_eq!(r_p1["events"].as_array().unwrap().len(), 5);
     assert_eq!(r_p2["total"], 9);
     assert_eq!(r_p2["events"].as_array().unwrap().len(), 4);
+    assert!(r_p2["next_cursor"].is_null());
     let r1_ids: HashSet<String> = r_p1["events"]
         .as_array()
         .unwrap()
@@ -2912,4 +2916,162 @@ async fn viewing_connections_writes_only_when_client_state_changes() {
         .collect();
     assert_eq!(changed.len(), 1, "{changed:?}");
     assert!(changed[0].starts_with("claude-code="));
+}
+
+#[tokio::test]
+async fn tail_keyset_pages_signal_view_and_preview_only_sse() {
+    use axum::{Router, routing::post};
+
+    let mock_router = Router::new().route(
+        "/v1/chat/completions",
+        post(|| async {
+            let content = json!({"memories": [{
+                "scope": "project", "type": "decision", "title": "Signal tail",
+                "summary": "Keyset ordered tail", "content": "Details."
+            }]});
+            axum::Json(json!({
+                "choices": [{ "message": { "content": content.to_string() } }],
+                "usage": { "prompt_tokens": 10, "completion_tokens": 4, "cost": 0.0 }
+            }))
+        }),
+    );
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+    let mock_task = tokio::spawn(async move {
+        let _ = axum::serve(mock_listener, mock_router).await;
+    });
+
+    let tmp = tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    tokio::fs::create_dir_all(&repo).await.unwrap();
+    let state = test_state(tmp.path());
+    let mut settings = state.db.get_settings().unwrap();
+    settings.provider = "openai_compatible".into();
+    settings.base_url = format!("http://{mock_addr}/v1");
+    settings.model = "mock-model".into();
+    state.db.save_settings(&settings).unwrap();
+
+    let app = build_router(state.clone());
+    let mut sse_rx = state.events_tx.subscribe();
+
+    let hook = |event: &'static str, body: Value| {
+        let app = app.clone();
+        async move {
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/v1/hooks/claude?event={event}"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+    };
+
+    for i in 0..25 {
+        hook(
+            "UserPromptSubmit",
+            json!({"cwd": repo, "session_id": "tail-s1", "prompt": format!("Prompt number {i:02}")}),
+        )
+        .await;
+    }
+    let long_cmd = format!("echo {} TAIL_MARKER_END", "x".repeat(3_500));
+    hook(
+        "PostToolUse",
+        json!({"cwd": repo, "session_id": "tail-s1", "tool_name": "Bash", "tool_input": {"command": long_cmd}}),
+    )
+    .await;
+    hook(
+        "PostToolUse",
+        json!({"cwd": repo, "session_id": "tail-s1", "tool_name": "Edit", "tool_input": {"file_path": "src/main.rs"}}),
+    )
+    .await;
+
+    // Drain SSE events emitted by hooks and verify preview-only payloads (no payload_json).
+    let mut tool_sse = None;
+    while let Ok(ev) = sse_rx.try_recv() {
+        if ev.kind == "raw_event" {
+            assert!(
+                ev.payload.get("payload_json").is_none(),
+                "SSE leaked payload_json: {}",
+                ev.payload
+            );
+            if ev.payload["tool_name"] == "Bash" {
+                tool_sse = Some(ev.payload);
+            }
+        }
+    }
+    let tool_sse = tool_sse.expect("expected Bash raw_event on SSE");
+    let preview = tool_sse["preview"].as_str().unwrap();
+    assert!(preview.chars().count() <= 123, "{preview}");
+    assert!(!preview.contains("TAIL_MARKER_END"), "{preview}");
+
+    let proj = ox1_memory::project::resolve_project(&repo);
+    let sess = state
+        .db
+        .upsert_session(&proj.id, "claude-code", "tail-s1", None)
+        .unwrap();
+    distill_session_once(
+        &state.db,
+        &state.embedder,
+        &state.llm,
+        &state.events_tx,
+        &sess.id,
+    )
+    .await;
+
+    let get = |uri: String| {
+        let app = app.clone();
+        async move {
+            let resp = app
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            body_json(resp).await
+        }
+    };
+
+    // Signal view excludes tool_use rows: 25 prompts + 1 distill_result = 26 rows.
+    let mut seen_ids = Vec::new();
+    let mut keys = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let uri = match &cursor {
+            Some(c) => format!("/api/raw-events?kind=signal&limit=10&before={c}"),
+            None => "/api/raw-events?kind=signal&limit=10".into(),
+        };
+        let page = get(uri).await;
+        assert_eq!(page["total"], 26, "{page}");
+        for ev in page["events"].as_array().unwrap() {
+            assert_ne!(ev["event_type"], "tool_use");
+            seen_ids.push(ev["id"].as_str().unwrap().to_string());
+            keys.push((
+                ev["created_at"].as_str().unwrap().to_string(),
+                ev["id"].as_str().unwrap().to_string(),
+            ));
+        }
+        cursor = page["next_cursor"].as_str().map(str::to_string);
+        if cursor.is_none() {
+            break;
+        }
+    }
+    assert_eq!(seen_ids.len(), 26);
+    let unique: std::collections::HashSet<&String> = seen_ids.iter().collect();
+    assert_eq!(unique.len(), 26, "duplicate event across keyset pages");
+    assert!(
+        keys.windows(2).all(|w| w[0] >= w[1]),
+        "tail not strictly newest-first"
+    );
+
+    let all = get("/api/raw-events?kind=all&limit=50".into()).await;
+    assert_eq!(all["total"], 28, "{all}");
+    let codex_only = get("/api/raw-events?kind=signal&client=codex".into()).await;
+    assert_eq!(codex_only["total"], 0, "{codex_only}");
+
+    mock_task.abort();
 }

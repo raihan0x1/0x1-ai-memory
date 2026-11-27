@@ -1446,6 +1446,14 @@ dialog::backdrop {
   border-bottom-color: var(--color-accent);
 }
 
+.seg-group--tail {
+  flex-wrap: wrap;
+}
+
+.seg-group--tail .seg-btn {
+  padding-inline: var(--space-xs);
+}
+
 /* Interactive Tag & File Chips */
 .chip {
   display: inline-flex;

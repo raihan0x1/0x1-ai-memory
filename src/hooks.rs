@@ -5,7 +5,7 @@ use crate::embed::Embedder;
 use crate::models::{SearchFilter, StreamEvent, normalize_client};
 use crate::project::resolve_project;
 use crate::scrub::scrub_json_value;
-use chrono::{Local, Utc};
+use chrono::Local;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::Path;
@@ -132,11 +132,7 @@ pub async fn handle_hook(
                     None,
                     &clean.to_string(),
                 ) {
-                    let _ = events_tx.send(StreamEvent {
-                        kind: "raw_event".into(),
-                        timestamp: Utc::now().to_rfc3339(),
-                        payload: serde_json::to_value(&ev).unwrap_or_default(),
-                    });
+                    let _ = events_tx.send(crate::db::raw_event_stream_event(&ev));
                 }
             }
 
@@ -235,11 +231,7 @@ pub async fn handle_hook(
                 Some(tool_name),
                 &compact_payload.to_string(),
             ) {
-                let _ = events_tx.send(StreamEvent {
-                    kind: "raw_event".into(),
-                    timestamp: Utc::now().to_rfc3339(),
-                    payload: serde_json::to_value(&ev).unwrap_or_default(),
-                });
+                let _ = events_tx.send(crate::db::raw_event_stream_event(&ev));
             }
             json!({})
         }
@@ -258,11 +250,7 @@ pub async fn handle_hook(
                         &scrub_json_value(&json!({ "assistant": last_msg }), 2_000).to_string(),
                     )
                 {
-                    let _ = events_tx.send(StreamEvent {
-                        kind: "raw_event".into(),
-                        timestamp: Utc::now().to_rfc3339(),
-                        payload: serde_json::to_value(&ev).unwrap_or_default(),
-                    });
+                    let _ = events_tx.send(crate::db::raw_event_stream_event(&ev));
                 }
                 // Trigger async 1x per-turn distillation off the hot path (<5ms hook return!)
                 distill.queue_session(session.id.clone());

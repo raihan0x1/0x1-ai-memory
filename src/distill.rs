@@ -280,11 +280,7 @@ fn record_distill_result(
         "distill_result",
         &payload.to_string(),
     ) {
-        let _ = events_tx.send(StreamEvent {
-            kind: "raw_event".into(),
-            timestamp: Utc::now().to_rfc3339(),
-            payload: serde_json::to_value(&ev).unwrap_or_default(),
-        });
+        let _ = events_tx.send(crate::db::raw_event_stream_event(&ev));
     }
 }
 
