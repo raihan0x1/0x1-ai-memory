@@ -253,21 +253,39 @@ export function App() {
   useEffect(() => {
     void refresh();
     const es = new EventSource('/api/stream');
-    let refreshTimer: number | null = null;
+    const timers = new Map<string, number>();
+    let opened = false;
+    // Events that arrived while the tab was hidden; one resync replaces them all.
+    let stale = false;
+
+    const debounce = (key: string, fn: () => void) => {
+      window.clearTimeout(timers.get(key));
+      timers.set(key, window.setTimeout(fn, 300));
+    };
+    const resync = () => {
+      if (document.hidden) {
+        stale = true;
+        return;
+      }
+      stale = false;
+      void refresh();
+      setSseMemoryTick((t) => t + 1);
+      setSseSessionTick((t) => t + 1);
+      setSseTailTick((t) => t + 1);
+    };
+    const onVisibility = () => {
+      if (stale) resync();
+    };
+    document.addEventListener('visibilitychange', onVisibility);
 
     es.onopen = () => {
       setSseConnected(true);
       setDaemonStopped(false);
+      // A reconnect means events were missed while the stream was down.
+      if (opened) resync();
+      opened = true;
     };
     es.onerror = () => setSseConnected(false);
-
-    const scheduleRefresh = () => {
-      if (refreshTimer !== null) window.clearTimeout(refreshTimer);
-      refreshTimer = window.setTimeout(() => {
-        refreshTimer = null;
-        void refresh();
-      }, 250);
-    };
 
     const kinds: LiveStreamItem['kind'][] = [
       'memory_created',
@@ -279,21 +297,36 @@ export function App() {
     ];
     for (const kind of kinds) {
       es.addEventListener(kind, (ev) => {
+        let item: LiveStreamItem | null = null;
         if (ev instanceof MessageEvent && typeof ev.data === 'string') {
           sseSeqRef.current += 1;
-          const item = parseSseItem(kind, ev.data, sseSeqRef.current);
-          if (item) {
-            setLiveEvents((prev) => [item, ...prev.filter((p) => p.id !== item.id)].slice(0, 80));
+          item = parseSseItem(kind, ev.data, sseSeqRef.current);
+          const live = item;
+          if (live) {
+            setLiveEvents((prev) => [live, ...prev.filter((p) => p.id !== live.id)].slice(0, 80));
           }
         }
-        if (kind === 'memory_created' || kind === 'memory_updated' || kind === 'memory_deleted') {
-          setSseMemoryTick((t) => t + 1);
+        if (document.hidden) {
+          stale = true;
+          return;
         }
+        const memoryKind =
+          kind === 'memory_created' || kind === 'memory_updated' || kind === 'memory_deleted';
+        if (memoryKind) setSseMemoryTick((t) => t + 1);
         if (kind === 'raw_event' || kind === 'usage_recorded' || kind === 'memory_created') {
           setSseSessionTick((t) => t + 1);
           setSseTailTick((t) => t + 1);
         }
-        scheduleRefresh();
+        if (memoryKind || kind === 'usage_recorded' || item?.event_type === 'distill_result') {
+          debounce('summary', () => {
+            api.summary().then(setSummary, () => undefined);
+          });
+        }
+        if (kind === 'connection_changed') {
+          debounce('connections', () => {
+            api.connections().then((c) => setConnections(c.connections), () => undefined);
+          });
+        }
       });
     }
 
@@ -309,7 +342,8 @@ export function App() {
     });
 
     return () => {
-      if (refreshTimer !== null) window.clearTimeout(refreshTimer);
+      for (const t of timers.values()) window.clearTimeout(t);
+      document.removeEventListener('visibilitychange', onVisibility);
       es.close();
     };
   }, [refresh]);

@@ -2853,3 +2853,63 @@ async fn one_time_rescrub_redacts_stored_secrets_keeps_search_in_sync_and_backs_
     let _again = test_state(tmp.path());
     assert_eq!(backups().len(), 1, "the re-scrub runs once");
 }
+
+#[tokio::test]
+async fn viewing_connections_writes_only_when_client_state_changes() {
+    let tmp = tempdir().unwrap();
+    let state = test_state(tmp.path());
+    let app = build_router(state.clone());
+    let list = || {
+        let app = app.clone();
+        async move {
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/connections")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            body_json(resp).await["connections"].clone()
+        }
+    };
+    let stamps = || {
+        let raw = rusqlite::Connection::open(tmp.path().join("memory.db")).unwrap();
+        let mut stmt = raw
+            .prepare(
+                "SELECT client_id || '=' || updated_at FROM client_connections ORDER BY client_id",
+            )
+            .unwrap();
+        stmt.query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>()
+    };
+    list().await;
+    let first = stamps();
+    assert_eq!(first.len(), 3);
+    list().await;
+    assert_eq!(stamps(), first, "an unchanged GET must not rewrite rows");
+
+    // Installing Claude Code changes only its row.
+    tokio::fs::create_dir_all(tmp.path().join("home/.claude"))
+        .await
+        .unwrap();
+    let after = list().await;
+    let claude = after
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["client_id"] == "claude-code")
+        .unwrap();
+    assert_eq!(claude["detected"], true, "{claude}");
+    let changed: Vec<_> = stamps()
+        .into_iter()
+        .zip(&first)
+        .filter(|(now, before)| now != *before)
+        .map(|(now, _)| now)
+        .collect();
+    assert_eq!(changed.len(), 1, "{changed:?}");
+    assert!(changed[0].starts_with("claude-code="));
+}

@@ -67,9 +67,11 @@ export const api = {
     }),
   sessions: (
     params: { project_id?: string; client?: string; limit?: number; offset?: number } = {},
+    signal?: AbortSignal,
   ) =>
     req<{ sessions: SessionSummary[]; total: number; limit: number; offset: number }>(
       `/api/sessions${buildQuery(params)}`,
+      { signal },
     ),
   distillSession: (id: string) =>
     req<{ queued: boolean; session_id: string }>(
@@ -82,9 +84,11 @@ export const api = {
     }),
   rawEvents: (
     params: { project_id?: string; client?: string; kind?: string; limit?: number; offset?: number } = {},
+    signal?: AbortSignal,
   ) =>
     req<{ events: RawEventView[]; total: number; limit: number; offset: number }>(
       `/api/raw-events${buildQuery(params)}`,
+      { signal },
     ),
   searchMemories: (params: Record<string, string | number | boolean | undefined>, signal?: AbortSignal) =>
     req<{ count: number; total: number; limit: number; offset: number; memories: MemoryHit[] }>(

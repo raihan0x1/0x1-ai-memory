@@ -40,6 +40,14 @@ interface StreamPageProps {
 const MEM_PAGE_SIZE = 10;
 const SESSIONS_PAGE_SIZE = 6;
 const TAIL_PAGE_SIZE = 20;
+const TICK_DEBOUNCE_MS = 300;
+
+function takeOver(ref: { current: AbortController | null }): AbortController {
+  ref.current?.abort();
+  const ctl = new AbortController();
+  ref.current = ctl;
+  return ctl;
+}
 
 type StreamGroupMode = 'day' | 'session' | 'flat';
 type TailFilter = 'all' | 'prompts' | 'tools' | 'turn_end' | 'distill';
@@ -214,6 +222,9 @@ export function StreamPage({
   const prevMemTickRef = useRef(sseMemoryTick);
   const prevSessTickRef = useRef(sseSessionTick);
   const prevTailTickRef = useRef(sseTailTick);
+  const memAbortRef = useRef<AbortController | null>(null);
+  const sessAbortRef = useRef<AbortController | null>(null);
+  const tailAbortRef = useRef<AbortController | null>(null);
   const latestEventRef = useRef<LiveStreamItem | undefined>(liveEvents[0]);
   latestEventRef.current = liveEvents[0];
 
@@ -228,6 +239,7 @@ export function StreamPage({
   const [targetProject, setTargetProject] = useState('');
 
   const loadMemories = useCallback(async () => {
+    const ctl = takeOver(memAbortRef);
     setMemLoading(true);
     setMemError(null);
     try {
@@ -236,7 +248,7 @@ export function StreamPage({
         source_client: clientFilter || undefined,
         limit: MEM_PAGE_SIZE,
         offset: (memPage - 1) * MEM_PAGE_SIZE,
-      });
+      }, ctl.signal);
       if (res.total > 0 && (memPage - 1) * MEM_PAGE_SIZE >= res.total) {
         setMemPageState({ key: memFilterKey, page: Math.max(1, Math.ceil(res.total / MEM_PAGE_SIZE)) });
         return;
@@ -244,13 +256,15 @@ export function StreamPage({
       setMemHits(res.memories);
       setMemTotal(res.total);
     } catch (err) {
+      if (ctl.signal.aborted) return;
       setMemError(err instanceof Error ? err.message : 'Failed to load memories');
     } finally {
-      setMemLoading(false);
+      if (!ctl.signal.aborted) setMemLoading(false);
     }
   }, [projectFilter, clientFilter, memPage, memFilterKey]);
 
   const loadSessions = useCallback(async () => {
+    const ctl = takeOver(sessAbortRef);
     setSessionsLoading(true);
     setSessionsError(null);
     try {
@@ -259,7 +273,7 @@ export function StreamPage({
         client: clientFilter || undefined,
         limit: SESSIONS_PAGE_SIZE,
         offset: (sessionsPage - 1) * SESSIONS_PAGE_SIZE,
-      });
+      }, ctl.signal);
       if (sRes.total > 0 && (sessionsPage - 1) * SESSIONS_PAGE_SIZE >= sRes.total) {
         setSessPageState({
           key: sessFilterKey,
@@ -270,13 +284,15 @@ export function StreamPage({
       setSessions(sRes.sessions);
       setSessionsTotal(sRes.total);
     } catch (err) {
+      if (ctl.signal.aborted) return;
       setSessionsError(err instanceof Error ? err.message : 'Failed to load sessions');
     } finally {
-      setSessionsLoading(false);
+      if (!ctl.signal.aborted) setSessionsLoading(false);
     }
   }, [projectFilter, clientFilter, sessionsPage, sessFilterKey]);
 
   const loadTail = useCallback(async () => {
+    const ctl = takeOver(tailAbortRef);
     setTailLoading(true);
     setTailError(null);
     try {
@@ -286,7 +302,7 @@ export function StreamPage({
         kind: tailFilter === 'all' ? undefined : tailFilter,
         limit: TAIL_PAGE_SIZE,
         offset: (tailPage - 1) * TAIL_PAGE_SIZE,
-      });
+      }, ctl.signal);
       if (rRes.total > 0 && (tailPage - 1) * TAIL_PAGE_SIZE >= rRes.total) {
         setTailPageState({
           key: tailFilterKey,
@@ -297,9 +313,10 @@ export function StreamPage({
       setRawEvents(rRes.events);
       setTailTotal(rRes.total);
     } catch (err) {
+      if (ctl.signal.aborted) return;
       setTailError(err instanceof Error ? err.message : 'Failed to load event tail');
     } finally {
-      setTailLoading(false);
+      if (!ctl.signal.aborted) setTailLoading(false);
     }
   }, [projectFilter, clientFilter, tailFilter, tailPage, tailFilterKey]);
 
@@ -319,7 +336,8 @@ export function StreamPage({
     if (sseMemoryTick === prevMemTickRef.current) return;
     prevMemTickRef.current = sseMemoryTick;
     if (memPage === 1) {
-      void loadMemories();
+      const t = window.setTimeout(() => void loadMemories(), TICK_DEBOUNCE_MS);
+      return () => window.clearTimeout(t);
     } else {
       const latest = latestEventRef.current;
       const matchesMemScope =
@@ -336,7 +354,8 @@ export function StreamPage({
     if (sseSessionTick === prevSessTickRef.current) return;
     prevSessTickRef.current = sseSessionTick;
     if (sessionsPage === 1) {
-      void loadSessions();
+      const t = window.setTimeout(() => void loadSessions(), TICK_DEBOUNCE_MS);
+      return () => window.clearTimeout(t);
     } else {
       const latest = latestEventRef.current;
       if (!latest || !projectFilter || !latest.project_id || latest.project_id === projectFilter) {
@@ -347,16 +366,23 @@ export function StreamPage({
 
   useEffect(() => {
     if (sseTailTick === prevTailTickRef.current) return;
-    prevTailTickRef.current = sseTailTick;
+    // Leave the ref behind while paused so Resume catches up with one fetch.
+    if (tailPaused) return;
     if (tailPage === 1) {
-      void loadTail();
+      // Mark the tick seen only when the fetch fires, so a Pause inside the window still catches up.
+      const t = window.setTimeout(() => {
+        prevTailTickRef.current = sseTailTick;
+        void loadTail();
+      }, TICK_DEBOUNCE_MS);
+      return () => window.clearTimeout(t);
     } else {
+      prevTailTickRef.current = sseTailTick;
       const latest = latestEventRef.current;
       if (!latest || matchesTailFilters(latest, projectFilter, clientFilter, tailFilter)) {
         setTailNewState({ key: tailFilterKey, value: true });
       }
     }
-  }, [sseTailTick, tailPage, tailFilterKey, projectFilter, clientFilter, tailFilter, loadTail]);
+  }, [sseTailTick, tailPaused, tailPage, tailFilterKey, projectFilter, clientFilter, tailFilter, loadTail]);
 
   const tokenPct =
     summary && summary.daily_token_cap > 0

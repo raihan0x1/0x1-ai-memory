@@ -1934,7 +1934,19 @@ impl MemoryDb {
                 last_heartbeat_at = COALESCE(client_connections.last_heartbeat_at, excluded.last_heartbeat_at),
                 last_event_at = COALESCE(client_connections.last_event_at, excluded.last_event_at),
                 status_note = excluded.status_note,
-                updated_at = excluded.updated_at",
+                updated_at = excluded.updated_at
+             -- Viewing Connections must not write unless the inspected state changed.
+             WHERE client_connections.display_name IS NOT excluded.display_name
+                OR client_connections.detected IS NOT excluded.detected
+                OR client_connections.connected IS NOT excluded.connected
+                OR client_connections.needs_manual_step IS NOT excluded.needs_manual_step
+                OR client_connections.manual_step_hint IS NOT excluded.manual_step_hint
+                OR client_connections.config_paths_json IS NOT excluded.config_paths_json
+                OR client_connections.status_note IS NOT excluded.status_note
+                OR (excluded.config_backup_path IS NOT NULL
+                    AND client_connections.config_backup_path IS NOT excluded.config_backup_path)
+                OR (client_connections.last_heartbeat_at IS NULL AND excluded.last_heartbeat_at IS NOT NULL)
+                OR (client_connections.last_event_at IS NULL AND excluded.last_event_at IS NOT NULL)",
             params![
                 c.client_id,
                 c.display_name,
