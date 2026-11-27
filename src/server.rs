@@ -465,6 +465,7 @@ async fn api_memory_graph(
 #[derive(Deserialize)]
 struct SessionsQuery {
     project_id: Option<String>,
+    client: Option<String>,
     limit: Option<usize>,
     offset: Option<usize>,
 }
@@ -479,6 +480,7 @@ async fn api_list_sessions(
         .db
         .list_sessions_paged(
             q.project_id.as_deref().filter(|s| !s.is_empty()),
+            q.client.as_deref().filter(|s| !s.is_empty()),
             limit,
             offset,
         )

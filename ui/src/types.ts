@@ -43,9 +43,8 @@ export interface SessionSummary {
   started_at: string;
   ended_at: string | null;
   last_turn_at: string;
-  status: 'active' | 'ended';
+  status: 'active' | 'idle' | 'ended';
   pending_events: number;
-  total_events: number;
   memory_count: number;
 }
 

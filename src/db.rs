@@ -84,6 +84,7 @@ impl MemoryDb {
                 UNIQUE(source_client, external_session_id)
             );
             CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project_id, last_turn_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_sessions_last_turn ON sessions(last_turn_at DESC);
 
             CREATE TABLE IF NOT EXISTS raw_events (
                 id TEXT PRIMARY KEY,
@@ -119,6 +120,7 @@ impl MemoryDb {
             CREATE INDEX IF NOT EXISTS idx_memories_project ON memories(project_id, status, updated_at DESC);
             CREATE INDEX IF NOT EXISTS idx_memories_scope ON memories(scope, status, updated_at DESC);
             CREATE INDEX IF NOT EXISTS idx_memories_client ON memories(source_client, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_memories_session ON memories(session_id);
 
             CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
                 title,
@@ -457,57 +459,59 @@ impl MemoryDb {
         Ok(())
     }
 
-    pub fn list_sessions(
-        &self,
-        project_id: Option<&str>,
-        limit: usize,
-    ) -> Result<Vec<SessionSummary>> {
-        self.list_sessions_paged(project_id, limit.clamp(1, 50), 0)
-            .map(|(sessions, _)| sessions)
-    }
-
     pub fn list_sessions_paged(
         &self,
         project_id: Option<&str>,
+        client: Option<&str>,
         limit: usize,
         offset: usize,
     ) -> Result<(Vec<SessionSummary>, usize)> {
         let limit = limit.clamp(1, 100) as i64;
         let offset = offset as i64;
+        let client = client.map(|c| normalize_client(Some(c)));
         let conn = self.conn.lock().unwrap();
         let total: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM sessions s WHERE (?1 IS NULL OR s.project_id = ?1)",
-            params![project_id],
+            "SELECT COUNT(*) FROM sessions s
+             WHERE (?1 IS NULL OR s.project_id = ?1) AND (?2 IS NULL OR s.source_client = ?2)",
+            params![project_id, client],
             |r| r.get(0),
         )?;
+        // Select the page first so the per-session counts run only for its rows.
         let mut stmt = conn.prepare(
-            "SELECT s.id, s.project_id, p.name, s.source_client, s.branch,
-                    s.started_at, s.ended_at, s.last_turn_at, s.status,
-                    COALESCE((SELECT COUNT(*) FROM raw_events r WHERE r.session_id = s.id AND r.distilled = 0), 0),
-                    COALESCE((SELECT COUNT(*) FROM raw_events r WHERE r.session_id = s.id), 0),
-                    COALESCE((SELECT COUNT(*) FROM memories m WHERE m.session_id = s.id), 0)
-             FROM sessions s
+            "WITH page AS (
+                SELECT * FROM sessions s
+                WHERE (?1 IS NULL OR s.project_id = ?1) AND (?2 IS NULL OR s.source_client = ?2)
+                ORDER BY s.last_turn_at DESC, s.id
+                LIMIT ?3 OFFSET ?4
+             )
+             SELECT s.id, s.project_id, p.name, s.source_client, s.branch,
+                    s.started_at, s.ended_at, s.last_turn_at,
+                    CASE WHEN s.ended_at IS NOT NULL OR s.status = 'ended' THEN 'ended'
+                         WHEN s.last_turn_at >= ?5 THEN 'active' ELSE 'idle' END,
+                    (SELECT COUNT(*) FROM raw_events r WHERE r.session_id = s.id AND r.distilled = 0),
+                    (SELECT COUNT(*) FROM memories m WHERE m.session_id = s.id)
+             FROM page s
              LEFT JOIN projects p ON p.id = s.project_id
-             WHERE (?1 IS NULL OR s.project_id = ?1)
-             ORDER BY s.last_turn_at DESC
-             LIMIT ?2 OFFSET ?3",
+             ORDER BY s.last_turn_at DESC, s.id",
         )?;
-        let rows = stmt.query_map(params![project_id, limit, offset], |r| {
-            Ok(SessionSummary {
-                id: r.get(0)?,
-                project_id: r.get(1)?,
-                project_name: r.get(2)?,
-                source_client: r.get(3)?,
-                branch: r.get(4)?,
-                started_at: r.get(5)?,
-                ended_at: r.get(6)?,
-                last_turn_at: r.get(7)?,
-                status: r.get(8)?,
-                pending_events: r.get(9)?,
-                total_events: r.get(10)?,
-                memory_count: r.get(11)?,
-            })
-        })?;
+        let rows = stmt.query_map(
+            params![project_id, client, limit, offset, active_cutoff()],
+            |r| {
+                Ok(SessionSummary {
+                    id: r.get(0)?,
+                    project_id: r.get(1)?,
+                    project_name: r.get(2)?,
+                    source_client: r.get(3)?,
+                    branch: r.get(4)?,
+                    started_at: r.get(5)?,
+                    ended_at: r.get(6)?,
+                    last_turn_at: r.get(7)?,
+                    status: r.get(8)?,
+                    pending_events: r.get(9)?,
+                    memory_count: r.get(10)?,
+                })
+            },
+        )?;
         Ok((rows.filter_map(Result::ok).collect(), total.max(0) as usize))
     }
 
@@ -1761,8 +1765,9 @@ impl MemoryDb {
             |r| r.get(0),
         )?;
         let active_sessions: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM sessions WHERE status = 'active'",
-            [],
+            "SELECT COUNT(*) FROM sessions
+             WHERE ended_at IS NULL AND status != 'ended' AND last_turn_at >= ?1",
+            params![active_cutoff()],
             |r| r.get(0),
         )?;
 
@@ -2005,6 +2010,13 @@ fn normalize_legacy_clients(conn: &Connection) -> Result<()> {
          DELETE FROM settings WHERE key IN ('t3_watcher_enabled', '_meta:t3_watermark');",
     )?;
     Ok(())
+}
+
+/// An unended session is an Active Session when its last activity is within this window.
+const ACTIVE_SESSION_MINUTES: i64 = 30;
+
+fn active_cutoff() -> String {
+    (Utc::now() - chrono::Duration::minutes(ACTIVE_SESSION_MINUTES)).to_rfc3339()
 }
 
 fn has_existing_user_data_locked(conn: &Connection) -> Result<bool> {

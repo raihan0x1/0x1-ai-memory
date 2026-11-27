@@ -2550,3 +2550,94 @@ async fn distill_results_are_stored_events_that_never_revive_a_session() {
 
     mock_task.abort();
 }
+
+#[tokio::test]
+async fn sessions_page_filter_by_client_and_derive_active_idle_ended() {
+    let tmp = tempdir().unwrap();
+    let state = test_state(tmp.path());
+    let app = build_router(state.clone());
+
+    // 12,000 sessions, session i last active i minutes ago; every 7th has ended.
+    let clients = ["claude-code", "codex", "antigravity"];
+    let now = chrono::Utc::now();
+    {
+        let mut raw = rusqlite::Connection::open(tmp.path().join("memory.db")).unwrap();
+        let tx = raw.transaction().unwrap();
+        for i in 1..=12_000i64 {
+            let at = (now - chrono::Duration::minutes(i)).to_rfc3339();
+            let ended = i % 7 == 0;
+            tx.execute(
+                "INSERT INTO sessions(id, project_id, source_client, external_session_id, started_at, ended_at, last_turn_at, status)
+                 VALUES (?1, 'proj_big', ?2, ?1, ?3, ?4, ?3, ?5)",
+                rusqlite::params![
+                    format!("sess_{i:05}"),
+                    clients[(i % 3) as usize],
+                    at,
+                    ended.then(|| at.clone()),
+                    if ended { "ended" } else { "active" }
+                ],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+    }
+    let get = |uri: String| {
+        let app = app.clone();
+        async move {
+            let resp = app
+                .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+            body_json(resp).await
+        }
+    };
+    let ids = |page: &Value| -> Vec<String> {
+        page["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    let first = get("/api/sessions?limit=100".into()).await;
+    assert_eq!(first["total"], 12_000);
+    let expected: Vec<String> = (1..=100).map(|i| format!("sess_{i:05}")).collect();
+    assert_eq!(ids(&first), expected, "newest activity first");
+    let second = get("/api/sessions?limit=100&offset=100".into()).await;
+    assert_eq!(ids(&second)[0], "sess_00101");
+    let last = get("/api/sessions?limit=100&offset=11950".into()).await;
+    assert_eq!(ids(&last).len(), 50);
+    assert_eq!(ids(&last).last().unwrap(), "sess_12000");
+    assert!(first["sessions"][0].get("total_events").is_none());
+
+    // Status: ended wins; otherwise active within 30 minutes, else idle.
+    let status = |page: &Value, id: &str| {
+        page["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["id"] == id)
+            .unwrap()["status"]
+            .clone()
+    };
+    assert_eq!(status(&first, "sess_00001"), "active");
+    assert_eq!(status(&first, "sess_00007"), "ended");
+    assert_eq!(status(&first, "sess_00029"), "active");
+    assert_eq!(status(&first, "sess_00031"), "idle");
+    // 1..=29 minutes ago minus the ended ones (7, 14, 21, 28).
+    let summary = get("/api/summary".into()).await;
+    assert_eq!(summary["active_sessions"], 25, "{summary}");
+
+    let codex = get("/api/sessions?limit=100&client=codex".into()).await;
+    assert_eq!(codex["total"], 4_000);
+    assert!(
+        codex["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|s| s["source_client"] == "codex")
+    );
+    assert_eq!(ids(&codex)[0], "sess_00001");
+}

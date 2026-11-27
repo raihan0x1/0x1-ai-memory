@@ -189,7 +189,7 @@ export function StreamPage({
   const [memNewState, setMemNewState] = useState({ key: memFilterKey, value: false });
   const memHasNew = memNewState.key === memFilterKey && memNewState.value;
 
-  const sessFilterKey = projectFilter;
+  const sessFilterKey = `${projectFilter}|${clientFilter}`;
   const [sessPageState, setSessPageState] = useState({ key: sessFilterKey, page: 1 });
   const sessionsPage = sessPageState.key === sessFilterKey ? sessPageState.page : 1;
   const [sessNewState, setSessNewState] = useState({ key: sessFilterKey, value: false });
@@ -252,6 +252,7 @@ export function StreamPage({
     try {
       const sRes = await api.sessions({
         project_id: projectFilter || undefined,
+        client: clientFilter || undefined,
         limit: SESSIONS_PAGE_SIZE,
         offset: (sessionsPage - 1) * SESSIONS_PAGE_SIZE,
       });
@@ -269,7 +270,7 @@ export function StreamPage({
     } finally {
       setSessionsLoading(false);
     }
-  }, [projectFilter, sessionsPage, sessFilterKey]);
+  }, [projectFilter, clientFilter, sessionsPage, sessFilterKey]);
 
   const loadTail = useCallback(async () => {
     setTailLoading(true);
@@ -388,7 +389,7 @@ export function StreamPage({
         key = m.session_id || `manual_${m.source_client}`;
         const sess = m.session_id ? sessionMap.get(m.session_id) : undefined;
         label = sess
-          ? `${sess.source_client} · ${sess.project_name ?? 'project'}${sess.branch ? ` (${sess.branch})` : ''}`
+          ? `${sess.source_client} · ${sess.project_name ?? 'project'}${sess.branch ? ` (${sess.branch})` : ''} · started ${formatUtcClock(sess.started_at)}`
           : m.session_id
             ? `${m.source_client} · session ${m.session_id.slice(0, 12)}`
             : `Manual / MCP (${m.source_client})`;
@@ -980,8 +981,8 @@ export function StreamPage({
 
                       <div className="session-row-meta">
                         <span className="field-hint measure">
-                          {s.pending_events} queued · {s.memory_count} mem ·{' '}
-                          {formatUtcClock(s.last_turn_at)}
+                          {s.pending_events} queued · {s.memory_count} mem · started{' '}
+                          {formatUtcClock(s.started_at)} · last {formatUtcClock(s.last_turn_at)}
                         </span>
                         {s.pending_events > 0 && !isZeroLlm ? (
                           <button

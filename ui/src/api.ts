@@ -65,7 +65,9 @@ export const api = {
       method: 'PATCH',
       body: JSON.stringify({ privacy_mode }),
     }),
-  sessions: (params: { project_id?: string; limit?: number; offset?: number } = {}) =>
+  sessions: (
+    params: { project_id?: string; client?: string; limit?: number; offset?: number } = {},
+  ) =>
     req<{ sessions: SessionSummary[]; total: number; limit: number; offset: number }>(
       `/api/sessions${buildQuery(params)}`,
     ),

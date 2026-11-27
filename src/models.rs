@@ -144,7 +144,6 @@ pub struct SessionSummary {
     pub last_turn_at: String,
     pub status: String,
     pub pending_events: i64,
-    pub total_events: i64,
     pub memory_count: i64,
 }
 
