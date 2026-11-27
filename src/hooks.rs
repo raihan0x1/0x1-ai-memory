@@ -90,22 +90,59 @@ pub async fn handle_hook(
 
     match event_name.as_str() {
         "SessionStart" => {
-            let (detail, included_ids) = db
-                .build_session_briefing_detailed(
-                    Some(&project.id),
+            let source = payload
+                .get("source")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_ascii_lowercase());
+            let allow_handoff = matches!(source.as_deref(), None | Some("") | Some("startup"))
+                && !matches!(project.privacy_mode.as_str(), "paused" | "private");
+            let (detail, included_ids, included_handoffs) = db
+                .build_session_briefing_for_start(
+                    &project.id,
+                    &session.id,
                     settings.session_start_token_budget,
+                    allow_handoff,
                 )
                 .unwrap_or_default();
+            for h in &included_handoffs {
+                if h.undistilled_count > 0 {
+                    distill.queue_session(h.session_id.clone());
+                }
+            }
             if detail.briefing.is_empty() {
                 return json!({});
             }
-            let _ = db.record_memory_recalls(&included_ids, &client);
+            if !included_ids.is_empty() {
+                let _ = db.record_memory_recalls(&included_ids, &client);
+            }
+            let handoff_session_ids: Vec<&str> = included_handoffs
+                .iter()
+                .map(|h| h.session_id.as_str())
+                .collect();
+            let handoff_sources: Vec<Value> = included_handoffs
+                .iter()
+                .map(|h| {
+                    json!({
+                        "session_id": h.session_id,
+                        "client": h.source_client,
+                        "host": h.host,
+                    })
+                })
+                .collect();
+            let mut recall_payload = json!({
+                "trigger": "session_start",
+                "memory_ids": included_ids,
+            });
+            if !handoff_session_ids.is_empty() {
+                recall_payload["handoff_session_ids"] = json!(handoff_session_ids);
+                recall_payload["handoff_sources"] = json!(handoff_sources);
+            }
             if let Ok(ev) = db.insert_daemon_event(
                 &session.id,
                 &project.id,
                 &client,
                 "recall",
-                &json!({ "trigger": "session_start", "memory_ids": included_ids }).to_string(),
+                &recall_payload.to_string(),
             ) {
                 let _ = events_tx.send(crate::db::raw_event_stream_event(&ev));
             }
@@ -353,7 +390,11 @@ fn format_context_injection(client: &str, event_name: &str, context: &str, count
                 "systemMessage": {
                     "systemMessage": context,
                     "metadata": {
-                        "user_markdown": format!("*0x1-memory: loaded {count} cross-agent memories*")
+                        "user_markdown": if count == 0 {
+                            "*0x1-memory: loaded cross-agent handoff*".to_string()
+                        } else {
+                            format!("*0x1-memory: loaded {count} cross-agent memories*")
+                        }
                     }
                 }
             }]

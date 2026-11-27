@@ -3184,3 +3184,178 @@ async fn recall_events_recorded_for_briefing_and_prompt_recall() {
             == 2
     );
 }
+
+#[tokio::test]
+async fn handoff_transfers_recent_sessions_and_respects_guards() {
+    let tmp = tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    tokio::fs::create_dir_all(&repo).await.unwrap();
+    let state = test_state(tmp.path());
+    let app = build_router(state.clone());
+
+    let post_hook = |client: &'static str, event: &'static str, body: Value| {
+        let app = app.clone();
+        async move {
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/v1/hooks/{client}?event={event}"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            body_json(resp).await
+        }
+    };
+
+    // 1. Claude Code (inside T3 Code) runs a session with a credential + <private> block.
+    post_hook(
+        "claude",
+        "UserPromptSubmit",
+        json!({
+            "cwd": repo,
+            "session_id": "cl-1",
+            "ox1_host": "t3-code",
+            "prompt": "Fix HF_TOKEN=hf_abcdefghijklmnopqrstu <private>personal secret note</private> in auth"
+        }),
+    )
+    .await;
+    post_hook(
+        "claude",
+        "UserPromptSubmit",
+        json!({
+            "cwd": repo,
+            "session_id": "cl-1",
+            "ox1_host": "t3-code",
+            "prompt": "Switch session state to keyset cursor"
+        }),
+    )
+    .await;
+
+    let proj = ox1_memory::project::resolve_project(&repo);
+
+    // 2. source: clear, compact, resume give NO Handoff (tested before startup drains pending events).
+    for src in ["clear", "compact", "resume"] {
+        let skipped = post_hook(
+            "antigravity",
+            "SessionStart",
+            json!({"cwd": repo, "conversationId": format!("agy-{src}"), "source": src}),
+        )
+        .await;
+        assert!(
+            skipped.get("injectSteps").is_none(),
+            "source={src} should not receive Handoff: {skipped}"
+        );
+    }
+
+    // 3. Antigravity starts fresh (no source) -> receives Handoff with redacted prompt & undistilled count.
+    let agy = post_hook(
+        "antigravity",
+        "SessionStart",
+        json!({"cwd": repo, "conversationId": "agy-fresh"}),
+    )
+    .await;
+    let ctx = agy["injectSteps"][0]["systemMessage"]["systemMessage"]
+        .as_str()
+        .unwrap();
+    assert!(ctx.contains("Generated at "), "{ctx}");
+    assert!(ctx.contains("## Handoff"), "{ctx}");
+    assert!(ctx.contains("Claude Code via T3 Code"), "{ctx}");
+    assert!(
+        ctx.contains("Switch session state to keyset cursor"),
+        "{ctx}"
+    );
+    assert!(ctx.contains("[REDACTED]"), "{ctx}");
+    assert!(!ctx.contains("hf_abcdefghijklmnopqrstu"), "{ctx}");
+    assert!(!ctx.contains("personal secret note"), "{ctx}");
+    assert!(ctx.contains("2 undistilled events"), "{ctx}");
+
+    // Recall row records Handoff session ids and renders "picked up from <Client> via <Host>".
+    let recalls = body_json(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/raw-events?kind=recall")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(recalls["total"], 1, "{recalls}");
+    assert_eq!(
+        recalls["events"][0]["preview"],
+        "picked up from Claude Code via T3 Code"
+    );
+    let cl_sess = state
+        .db
+        .upsert_session(&proj.id, "claude-code", "cl-1", None)
+        .unwrap();
+    let raw_db = rusqlite::Connection::open(tmp.path().join("memory.db")).unwrap();
+    let recall_payload: String = raw_db
+        .query_row(
+            "SELECT payload_json FROM raw_events WHERE event_type = 'recall' ORDER BY created_at DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(recall_payload.contains(&cl_sess.id), "{recall_payload}");
+
+    // 4. Paused project gives no Handoff.
+    state.db.set_project_privacy(&proj.id, "paused").unwrap();
+    let paused = post_hook(
+        "codex",
+        "SessionStart",
+        json!({"cwd": repo, "session_id": "cdx-paused"}),
+    )
+    .await;
+    assert!(paused.get("hookSpecificOutput").is_none(), "{paused}");
+
+    // 5. Cap of 3 concurrent recent sessions + 12h window exclusion on a second project.
+    let repo2 = tmp.path().join("repo2");
+    tokio::fs::create_dir_all(&repo2).await.unwrap();
+    for (idx, ext_id, prompt) in [
+        (0, "s-old", "Very old session prompt"),
+        (1, "s-1", "First recent prompt"),
+        (2, "s-2", "Second recent prompt"),
+        (3, "s-3", "Third recent prompt"),
+        (4, "s-4", "Fourth recent prompt"),
+    ] {
+        post_hook(
+            "claude",
+            "UserPromptSubmit",
+            json!({"cwd": repo2, "session_id": ext_id, "prompt": prompt}),
+        )
+        .await;
+        let ts = if idx == 0 {
+            (chrono::Utc::now() - chrono::Duration::hours(13)).to_rfc3339()
+        } else {
+            (chrono::Utc::now() - chrono::Duration::minutes(10 - idx as i64)).to_rfc3339()
+        };
+        raw_db
+            .execute(
+                "UPDATE sessions SET last_turn_at = ?1 WHERE external_session_id = ?2",
+                rusqlite::params![ts, ext_id],
+            )
+            .unwrap();
+    }
+    let cdx = post_hook(
+        "codex",
+        "SessionStart",
+        json!({"cwd": repo2, "session_id": "cdx-cap", "source": "startup"}),
+    )
+    .await;
+    let ctx2 = cdx["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+    assert!(!ctx2.contains("Very old session prompt"), "{ctx2}");
+    assert!(!ctx2.contains("First recent prompt"), "{ctx2}");
+    assert!(ctx2.contains("Second recent prompt"), "{ctx2}");
+    assert!(ctx2.contains("Third recent prompt"), "{ctx2}");
+    assert!(ctx2.contains("Fourth recent prompt"), "{ctx2}");
+}

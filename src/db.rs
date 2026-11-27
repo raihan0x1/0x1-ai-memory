@@ -1513,245 +1513,25 @@ impl MemoryDb {
         project_id: Option<&str>,
         token_budget: usize,
     ) -> Result<(ContextPreviewDetailed, Vec<String>)> {
-        let max_chars = token_budget.clamp(100, 2_000) * 4;
         let conn = self.conn.lock().unwrap();
-        let mut seen = HashSet::new();
-        let now = Local::now();
-        let when = |updated_at: &str| memory_when(updated_at, &now, "this briefing");
+        let (detail, ids, _) = build_briefing_locked(&conn, project_id, token_budget, &[])?;
+        Ok((detail, ids))
+    }
 
-        struct CandidateLine {
-            item: BriefingItemBreakdown,
-            line: String,
-        }
-
-        let mut pinned_items = Vec::new();
-        let mut global_items = Vec::new();
-        let mut project_items = Vec::new();
-
-        // 1. Pinned memories (project + global)
-        let mut stmt = conn.prepare(
-            "SELECT id, source_client, memory_type, status, title, summary, updated_at
-             FROM memories
-             WHERE status = 'pinned' AND (scope = 'global' OR project_id = ?1)
-             ORDER BY updated_at DESC LIMIT 5",
-        )?;
-        for row in stmt
-            .query_map(params![project_id], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, String>(4)?,
-                    r.get::<_, String>(5)?,
-                    r.get::<_, String>(6)?,
-                ))
-            })?
-            .filter_map(Result::ok)
-        {
-            if seen.insert(row.0.clone()) {
-                let line = format!(
-                    "- [pinned|{}|{}] {} — {} ({}; id:{})",
-                    row.1,
-                    row.2,
-                    row.4,
-                    row.5,
-                    when(&row.6),
-                    row.0
-                );
-                pinned_items.push(CandidateLine {
-                    item: BriefingItemBreakdown {
-                        id: row.0,
-                        title: row.4,
-                        source_client: row.1,
-                        memory_type: row.2,
-                        status: row.3,
-                        approx_tokens: (line.len() + 1).div_ceil(4),
-                        included: false,
-                    },
-                    line,
-                });
-            }
-        }
-
-        // 2. Global user preferences
-        let mut stmt = conn.prepare(
-            "SELECT id, source_client, memory_type, status, title, summary, updated_at
-             FROM memories
-             WHERE scope = 'global' AND status = 'active'
-             ORDER BY updated_at DESC LIMIT 4",
-        )?;
-        for row in stmt
-            .query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, String>(4)?,
-                    r.get::<_, String>(5)?,
-                    r.get::<_, String>(6)?,
-                ))
-            })?
-            .filter_map(Result::ok)
-        {
-            if seen.insert(row.0.clone()) {
-                let line = format!(
-                    "- [{}|{}] {} ({}; id:{})",
-                    row.1,
-                    row.2,
-                    row.4,
-                    when(&row.6),
-                    row.0
-                );
-                global_items.push(CandidateLine {
-                    item: BriefingItemBreakdown {
-                        id: row.0,
-                        title: row.4,
-                        source_client: row.1,
-                        memory_type: row.2,
-                        status: row.3,
-                        approx_tokens: (line.len() + 1).div_ceil(4),
-                        included: false,
-                    },
-                    line,
-                });
-            }
-        }
-
-        // 3. Recent cross-client active project memories
-        if let Some(pid) = project_id {
-            let mut stmt = conn.prepare(
-                "SELECT id, source_client, memory_type, status, title, summary, updated_at
-                 FROM memories
-                 WHERE project_id = ?1 AND status = 'active'
-                 ORDER BY updated_at DESC LIMIT 8",
-            )?;
-            for row in stmt
-                .query_map(params![pid], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                        r.get::<_, String>(3)?,
-                        r.get::<_, String>(4)?,
-                        r.get::<_, String>(5)?,
-                        r.get::<_, String>(6)?,
-                    ))
-                })?
-                .filter_map(Result::ok)
-            {
-                if seen.insert(row.0.clone()) {
-                    let line = format!(
-                        "- [{}|{}] {}: {} ({}; id:{})",
-                        row.1,
-                        row.2,
-                        row.4,
-                        row.5,
-                        when(&row.6),
-                        row.0
-                    );
-                    project_items.push(CandidateLine {
-                        item: BriefingItemBreakdown {
-                            id: row.0,
-                            title: row.4,
-                            source_client: row.1,
-                            memory_type: row.2,
-                            status: row.3,
-                            approx_tokens: (line.len() + 1).div_ceil(4),
-                            included: false,
-                        },
-                        line,
-                    });
-                }
-            }
-        }
-
-        let archive_approx_tokens: usize = conn
-            .query_row(
-                "SELECT COALESCE(SUM((LENGTH(title) + LENGTH(summary) + LENGTH(content) + 3) / 4), 0)
-                 FROM memories
-                 WHERE status IN ('active', 'pinned')
-                   AND (scope = 'global' OR project_id = ?1)",
-                params![project_id],
-                |r| r.get::<_, i64>(0),
-            )
-            .unwrap_or(0)
-            .max(0) as usize;
-
-        let count = pinned_items.len() + global_items.len() + project_items.len();
-        if count == 0 {
-            return Ok((
-                ContextPreviewDetailed {
-                    briefing: String::new(),
-                    memory_count: 0,
-                    approx_tokens: 0,
-                    token_budget,
-                    archive_approx_tokens,
-                    sections: Vec::new(),
-                },
-                Vec::new(),
-            ));
-        }
-
-        let mut buf = format!(
-            "# 0x1-ai-memory (Cross-Agent Briefing)\n{}\nUse `memory_get([id])` for full details or `memory_search(query)` for older context.\n",
-            generated_at_line(&now)
-        );
-        let mut included_ids = Vec::new();
-        let mut sections = Vec::new();
-
-        for (kind, label, header, candidates) in [
-            ("pinned", "Pinned", "\n## Pinned\n", &mut pinned_items),
-            (
-                "project",
-                "Recent Project Memory",
-                "\n## Recent Project Memory (All AI Clients)\n",
-                &mut project_items,
-            ),
-            (
-                "global",
-                "Global Preferences",
-                "\n## Global Preferences\n",
-                &mut global_items,
-            ),
-        ] {
-            if candidates.is_empty() {
-                continue;
-            }
-            buf.push_str(header);
-            let mut section_tokens = 0usize;
-            for cand in candidates.iter_mut() {
-                if buf.len() + cand.line.len() + 2 > max_chars {
-                    break;
-                }
-                buf.push_str(&cand.line);
-                buf.push('\n');
-                cand.item.included = true;
-                section_tokens += cand.item.approx_tokens;
-                included_ids.push(cand.item.id.clone());
-            }
-            sections.push(BriefingSectionBreakdown {
-                kind: kind.to_string(),
-                label: label.to_string(),
-                tokens: section_tokens,
-                items: candidates.iter().map(|c| c.item.clone()).collect(),
-            });
-        }
-
-        let briefing = buf.trim().to_string();
-        let approx_tokens = briefing.len().div_ceil(4);
-        Ok((
-            ContextPreviewDetailed {
-                briefing,
-                memory_count: included_ids.len(),
-                approx_tokens,
-                token_budget,
-                archive_approx_tokens,
-                sections,
-            },
-            included_ids,
-        ))
+    pub fn build_session_briefing_for_start(
+        &self,
+        project_id: &str,
+        session_id: &str,
+        token_budget: usize,
+        include_handoff: bool,
+    ) -> Result<(ContextPreviewDetailed, Vec<String>, Vec<HandoffSession>)> {
+        let conn = self.conn.lock().unwrap();
+        let handoffs = if include_handoff {
+            query_handoff_sessions_locked(&conn, project_id, session_id)?
+        } else {
+            Vec::new()
+        };
+        build_briefing_locked(&conn, Some(project_id), token_budget, &handoffs)
     }
 
     pub fn memories_missing_embeddings(
@@ -2128,6 +1908,423 @@ fn row_to_graph_record(r: &rusqlite::Row<'_>, score: f64) -> rusqlite::Result<Gr
         created_at: r.get(1)?,
         hit: row_to_memory_hit_offset(r, 2, score)?,
     })
+}
+
+const HANDOFF_WINDOW_HOURS: i64 = 12;
+const HANDOFF_MAX_SESSIONS: usize = 3;
+const HANDOFF_MAX_PROMPTS: usize = 3;
+const HANDOFF_PROMPT_MAX_CHARS: usize = 200;
+
+#[derive(Debug, Clone)]
+pub struct HandoffSession {
+    pub session_id: String,
+    pub source_client: String,
+    pub host: Option<String>,
+    pub last_turn_at: String,
+    pub prompts: Vec<String>,
+    pub memories: Vec<(String, String)>,
+    pub undistilled_count: i64,
+}
+
+fn query_handoff_sessions_locked(
+    conn: &Connection,
+    project_id: &str,
+    exclude_session_id: &str,
+) -> Result<Vec<HandoffSession>> {
+    let cutoff = (Utc::now() - chrono::Duration::hours(HANDOFF_WINDOW_HOURS)).to_rfc3339();
+    let mut stmt = conn.prepare(
+        "SELECT s.id, s.source_client, s.host, s.last_turn_at,
+                (SELECT COUNT(*) FROM raw_events r WHERE r.session_id = s.id AND r.distilled = 0)
+         FROM sessions s
+         JOIN projects p ON p.id = s.project_id
+         WHERE s.project_id = ?1
+           AND s.id != ?2
+           AND p.privacy_mode NOT IN ('paused', 'private')
+           AND s.last_turn_at >= ?3
+           AND (
+             EXISTS (SELECT 1 FROM raw_events r WHERE r.session_id = s.id AND r.event_type NOT IN ('recall', 'distill_result'))
+             OR EXISTS (SELECT 1 FROM memories m WHERE m.session_id = s.id AND m.status IN ('active', 'pinned'))
+           )
+         ORDER BY s.last_turn_at DESC, s.id DESC
+         LIMIT ?4",
+    )?;
+    let bases: Vec<(String, String, Option<String>, String, i64)> = stmt
+        .query_map(
+            params![
+                project_id,
+                exclude_session_id,
+                cutoff,
+                HANDOFF_MAX_SESSIONS as i64
+            ],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )?
+        .filter_map(Result::ok)
+        .collect();
+
+    let mut prompt_stmt = conn.prepare(
+        "SELECT payload_json FROM raw_events
+         WHERE session_id = ?1 AND event_type = 'prompt'
+         ORDER BY created_at DESC, id DESC LIMIT 10",
+    )?;
+    let mut mem_stmt = conn.prepare(
+        "SELECT id, title FROM memories
+         WHERE session_id = ?1 AND status IN ('active', 'pinned')
+         ORDER BY updated_at DESC LIMIT 5",
+    )?;
+
+    let mut out = Vec::with_capacity(bases.len());
+    for (session_id, source_client, host, last_turn_at, undistilled_count) in bases {
+        let raw_prompts: Vec<String> = prompt_stmt
+            .query_map(params![session_id], |r| r.get::<_, String>(0))?
+            .filter_map(Result::ok)
+            .collect();
+        let mut prompts = Vec::new();
+        for payload_json in raw_prompts {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&payload_json) else {
+                continue;
+            };
+            let Some(raw) = v.get("prompt").and_then(|p| p.as_str()) else {
+                continue;
+            };
+            let scrubbed = redact_secrets(raw).replace("[PRIVATE]", "");
+            let collapsed: String = scrubbed.split_whitespace().collect::<Vec<_>>().join(" ");
+            if collapsed.is_empty() {
+                continue;
+            }
+            let snippet = if collapsed.chars().count() > HANDOFF_PROMPT_MAX_CHARS {
+                let prefix: String = collapsed
+                    .chars()
+                    .take(HANDOFF_PROMPT_MAX_CHARS - 3)
+                    .collect();
+                format!("{prefix}...")
+            } else {
+                collapsed
+            };
+            prompts.push(snippet);
+            if prompts.len() >= HANDOFF_MAX_PROMPTS {
+                break;
+            }
+        }
+        let memories: Vec<(String, String)> = mem_stmt
+            .query_map(params![session_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .filter_map(Result::ok)
+            .collect();
+        out.push(HandoffSession {
+            session_id,
+            source_client,
+            host,
+            last_turn_at,
+            prompts,
+            memories,
+            undistilled_count,
+        });
+    }
+    Ok(out)
+}
+
+fn build_briefing_locked(
+    conn: &Connection,
+    project_id: Option<&str>,
+    token_budget: usize,
+    handoffs: &[HandoffSession],
+) -> Result<(ContextPreviewDetailed, Vec<String>, Vec<HandoffSession>)> {
+    let max_chars = token_budget.clamp(100, 2_000) * 4;
+    let mut seen = HashSet::new();
+    let now = Local::now();
+    let when = |updated_at: &str| memory_when(updated_at, &now, "this briefing");
+
+    struct CandidateLine {
+        item: BriefingItemBreakdown,
+        line: String,
+    }
+
+    let mut pinned_items = Vec::new();
+    let mut global_items = Vec::new();
+    let mut project_items = Vec::new();
+
+    // 1. Pinned memories (project + global)
+    let mut stmt = conn.prepare(
+        "SELECT id, source_client, memory_type, status, title, summary, updated_at
+         FROM memories
+         WHERE status = 'pinned' AND (scope = 'global' OR project_id = ?1)
+         ORDER BY updated_at DESC LIMIT 5",
+    )?;
+    for row in stmt
+        .query_map(params![project_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, String>(6)?,
+            ))
+        })?
+        .filter_map(Result::ok)
+    {
+        if seen.insert(row.0.clone()) {
+            let line = format!(
+                "- [pinned|{}|{}] {} — {} ({}; id:{})",
+                row.1,
+                row.2,
+                row.4,
+                row.5,
+                when(&row.6),
+                row.0
+            );
+            pinned_items.push(CandidateLine {
+                item: BriefingItemBreakdown {
+                    id: row.0,
+                    title: row.4,
+                    source_client: row.1,
+                    memory_type: row.2,
+                    status: row.3,
+                    approx_tokens: (line.len() + 1).div_ceil(4),
+                    included: false,
+                },
+                line,
+            });
+        }
+    }
+
+    // 2. Global user preferences
+    let mut stmt = conn.prepare(
+        "SELECT id, source_client, memory_type, status, title, summary, updated_at
+         FROM memories
+         WHERE scope = 'global' AND status = 'active'
+         ORDER BY updated_at DESC LIMIT 4",
+    )?;
+    for row in stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, String>(6)?,
+            ))
+        })?
+        .filter_map(Result::ok)
+    {
+        if seen.insert(row.0.clone()) {
+            let line = format!(
+                "- [{}|{}] {} ({}; id:{})",
+                row.1,
+                row.2,
+                row.4,
+                when(&row.6),
+                row.0
+            );
+            global_items.push(CandidateLine {
+                item: BriefingItemBreakdown {
+                    id: row.0,
+                    title: row.4,
+                    source_client: row.1,
+                    memory_type: row.2,
+                    status: row.3,
+                    approx_tokens: (line.len() + 1).div_ceil(4),
+                    included: false,
+                },
+                line,
+            });
+        }
+    }
+
+    // 3. Recent cross-client active project memories
+    if let Some(pid) = project_id {
+        let mut stmt = conn.prepare(
+            "SELECT id, source_client, memory_type, status, title, summary, updated_at
+             FROM memories
+             WHERE project_id = ?1 AND status = 'active'
+             ORDER BY updated_at DESC LIMIT 8",
+        )?;
+        for row in stmt
+            .query_map(params![pid], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, String>(6)?,
+                ))
+            })?
+            .filter_map(Result::ok)
+        {
+            if seen.insert(row.0.clone()) {
+                let line = format!(
+                    "- [{}|{}] {}: {} ({}; id:{})",
+                    row.1,
+                    row.2,
+                    row.4,
+                    row.5,
+                    when(&row.6),
+                    row.0
+                );
+                project_items.push(CandidateLine {
+                    item: BriefingItemBreakdown {
+                        id: row.0,
+                        title: row.4,
+                        source_client: row.1,
+                        memory_type: row.2,
+                        status: row.3,
+                        approx_tokens: (line.len() + 1).div_ceil(4),
+                        included: false,
+                    },
+                    line,
+                });
+            }
+        }
+    }
+
+    let archive_approx_tokens: usize = conn
+        .query_row(
+            "SELECT COALESCE(SUM((LENGTH(title) + LENGTH(summary) + LENGTH(content) + 3) / 4), 0)
+             FROM memories
+             WHERE status IN ('active', 'pinned')
+               AND (scope = 'global' OR project_id = ?1)",
+            params![project_id],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        .max(0) as usize;
+
+    let count = pinned_items.len() + global_items.len() + project_items.len() + handoffs.len();
+    if count == 0 {
+        return Ok((
+            ContextPreviewDetailed {
+                briefing: String::new(),
+                memory_count: 0,
+                approx_tokens: 0,
+                token_budget,
+                archive_approx_tokens,
+                sections: Vec::new(),
+            },
+            Vec::new(),
+            Vec::new(),
+        ));
+    }
+
+    let mut buf = format!(
+        "# 0x1-ai-memory (Cross-Agent Briefing)\n{}\nUse `memory_get([id])` for full details or `memory_search(query)` for older context.\n",
+        generated_at_line(&now)
+    );
+    let mut included_handoffs = Vec::new();
+    if !handoffs.is_empty() {
+        let heading = "\n## Handoff (Recent Other Sessions)\n";
+        let mut wrote_heading = false;
+        for h in handoffs {
+            let via = h
+                .host
+                .as_deref()
+                .map(|host| format!(" via {}", display_host_name(host)))
+                .unwrap_or_default();
+            let undistilled = format!(
+                "{} undistilled {}",
+                h.undistilled_count,
+                if h.undistilled_count == 1 {
+                    "event"
+                } else {
+                    "events"
+                }
+            );
+            let header_line = format!(
+                "- {}{} ({}; {undistilled}):\n",
+                display_client_name(&h.source_client),
+                via,
+                memory_when(&h.last_turn_at, &now, "this briefing"),
+            );
+            let needed = header_line.len() + if wrote_heading { 0 } else { heading.len() };
+            if buf.len() + needed > max_chars {
+                break;
+            }
+            if !wrote_heading {
+                buf.push_str(heading);
+                wrote_heading = true;
+            }
+            buf.push_str(&header_line);
+            included_handoffs.push(h.clone());
+            for p in &h.prompts {
+                let pline = format!("  - Prompt: \"{p}\"\n");
+                if buf.len() + pline.len() > max_chars {
+                    break;
+                }
+                buf.push_str(&pline);
+            }
+            if !h.memories.is_empty() {
+                let mem_list = h
+                    .memories
+                    .iter()
+                    .map(|(id, title)| format!("{title} (id:{id})"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let mline = format!("  - Memories: {mem_list}\n");
+                if buf.len() + mline.len() <= max_chars {
+                    buf.push_str(&mline);
+                }
+            }
+        }
+    }
+
+    let mut included_ids = Vec::new();
+    let mut sections = Vec::new();
+
+    for (kind, label, header, candidates) in [
+        ("pinned", "Pinned", "\n## Pinned\n", &mut pinned_items),
+        (
+            "project",
+            "Recent Project Memory",
+            "\n## Recent Project Memory (All AI Clients)\n",
+            &mut project_items,
+        ),
+        (
+            "global",
+            "Global Preferences",
+            "\n## Global Preferences\n",
+            &mut global_items,
+        ),
+    ] {
+        if candidates.is_empty() {
+            continue;
+        }
+        buf.push_str(header);
+        let mut section_tokens = 0usize;
+        for cand in candidates.iter_mut() {
+            if buf.len() + cand.line.len() + 2 > max_chars {
+                break;
+            }
+            buf.push_str(&cand.line);
+            buf.push('\n');
+            cand.item.included = true;
+            section_tokens += cand.item.approx_tokens;
+            included_ids.push(cand.item.id.clone());
+        }
+        sections.push(BriefingSectionBreakdown {
+            kind: kind.to_string(),
+            label: label.to_string(),
+            tokens: section_tokens,
+            items: candidates.iter().map(|c| c.item.clone()).collect(),
+        });
+    }
+
+    let briefing = buf.trim().to_string();
+    let approx_tokens = briefing.len().div_ceil(4);
+    Ok((
+        ContextPreviewDetailed {
+            briefing,
+            memory_count: included_ids.len(),
+            approx_tokens,
+            token_budget,
+            archive_approx_tokens,
+            sections,
+        },
+        included_ids,
+        included_handoffs,
+    ))
 }
 
 /// Rewrites Client names stored before normalization (MCP aliases, User-Agent fallbacks) and
