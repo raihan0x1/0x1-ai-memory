@@ -1,6 +1,6 @@
 # 0x1-ai-memory
 
-Local-first, anti-drain, cross-agent persistent memory engine connecting **Claude Code**, **Codex CLI & App**, **Antigravity**, and any MCP client.
+Shared, local-first, anti-drain cross-agent persistent memory engine connecting **Claude Code**, **Codex CLI & App**, **Antigravity**, and any Streamable HTTP MCP client.
 
 ## Instant Start
 
@@ -8,7 +8,7 @@ Local-first, anti-drain, cross-agent persistent memory engine connecting **Claud
 npx 0x1-ai-memory
 ```
 
-On first run, this thin zero-dependency launcher downloads the verified native Rust binary (`0x1-memory`, SHA-256 checked) into `~/.0x1-memory/bin/`, starts the local **Daemon** in the background on `:10101`, opens **Onboarding** in your browser, and returns your terminal prompt. All lifecycle hooks and the Daemon run natively in Rust (~9ms hooks, zero Node/Python runtime overhead).
+On first run, this thin zero-dependency launcher downloads and SHA-256 verifies the native Rust binary (`0x1-memory`) into `~/.0x1-memory/bin/`, starts the local **Daemon** in the background on `http://127.0.0.1:10101`, opens **Onboarding** or **Live stream** in your browser, and returns your terminal prompt. All lifecycle hooks and the Daemon run natively in Rust (~9 ms hooks, zero Node/Python runtime overhead).
 
 ```bash
 # CLI Setup (terminal)
