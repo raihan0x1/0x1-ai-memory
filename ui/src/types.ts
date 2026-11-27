@@ -122,6 +122,7 @@ export interface GraphEdge {
 export interface MemoryGraphResponse {
   nodes: GraphNode[];
   edges: GraphEdge[];
+  total: number;
 }
 
 export interface NeighborLink {

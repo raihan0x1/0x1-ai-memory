@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useEffect, useId, useMemo, useState } from 'react';
 import { api, formatUtcTime } from '../api';
 import { BriefingPreviewModal } from '../components/BriefingPreviewModal';
 import {
@@ -94,32 +94,48 @@ export function MemoriesPage({ projects, onChanged }: MemoriesPageProps) {
   const [tagFilter, setTagFilter] = useState(() => readParam('tag'));
   const [fileFilter, setFileFilter] = useState(() => readParam('file'));
   const [sortMode, setSortMode] = useState(() => readParam('sort'));
-  const [includeInactive, setIncludeInactive] = useState(false);
+  const [includeInactive, setIncludeInactive] = useState(() => readParam('inactive') === '1');
+  const [filtersOpen, setFiltersOpen] = useState(false);
+  const filterPanelId = useId();
 
   const [hits, setHits] = useState<MemoryHit[]>([]);
   const [total, setTotal] = useState(0);
   const [pageSize, setPageSize] = useState(20);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-
-  const filterKey = JSON.stringify([
-    query.trim(),
-    projectId,
-    scope,
-    memType,
-    sourceClient,
-    tagFilter,
-    fileFilter,
-    sortMode,
-    includeInactive,
-    pageSize,
-  ]);
+  const [requestVersion, setRequestVersion] = useState(0);
+  const [settledRequest, setSettledRequest] = useState<{ key: string; error: string | null }>();
+  const trimmedQuery = query.trim();
+  const filters = useMemo(
+    () => ({
+      query: trimmedQuery,
+      project_id: projectId,
+      scope,
+      memory_type: memType,
+      source_client: sourceClient,
+      tag: tagFilter,
+      file: fileFilter,
+      sort: sortMode,
+      include_inactive: includeInactive,
+    }),
+    [
+      trimmedQuery,
+      projectId,
+      scope,
+      memType,
+      sourceClient,
+      tagFilter,
+      fileFilter,
+      sortMode,
+      includeInactive,
+    ],
+  );
+  const filterKey = JSON.stringify([filters, pageSize]);
   const [pageState, setPageState] = useState({ key: filterKey, page: 1 });
   const page = pageState.key === filterKey ? pageState.page : 1;
+  const requestKey = JSON.stringify([viewMode, filterKey, page, requestVersion]);
+  const loading = settledRequest?.key !== requestKey;
+  const error = settledRequest?.key === requestKey ? settledRequest.error : null;
 
   const [graphData, setGraphData] = useState<MemoryGraphResponse | null>(null);
-  const [graphLoading, setGraphLoading] = useState(false);
-  const [graphError, setGraphError] = useState<string | null>(null);
 
   const [collapsedGroups, setCollapsedGroups] = useState<Record<string, boolean>>({});
   const [selectedMemoryId, setSelectedMemoryId] = useState<string | null>(null);
@@ -135,7 +151,7 @@ export function MemoriesPage({ projects, onChanged }: MemoriesPageProps) {
     const entries: [string, string][] = [
       ['view', viewMode === 'graph' ? 'graph' : ''],
       ['group', groupBy !== 'project' ? groupBy : ''],
-      ['q', query.trim()],
+      ['q', trimmedQuery],
       ['project', projectId],
       ['scope', scope],
       ['type', memType],
@@ -143,6 +159,7 @@ export function MemoriesPage({ projects, onChanged }: MemoriesPageProps) {
       ['tag', tagFilter],
       ['file', fileFilter],
       ['sort', sortMode],
+      ['inactive', includeInactive ? '1' : ''],
     ];
     for (const [k, v] of entries) {
       if (v) url.searchParams.set(k, v);
@@ -152,46 +169,7 @@ export function MemoriesPage({ projects, onChanged }: MemoriesPageProps) {
   }, [
     viewMode,
     groupBy,
-    query,
-    projectId,
-    scope,
-    memType,
-    sourceClient,
-    tagFilter,
-    fileFilter,
-    sortMode,
-  ]);
-
-  const runSearch = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const res = await api.searchMemories({
-        query: query.trim() || undefined,
-        project_id: projectId || undefined,
-        scope: scope || undefined,
-        memory_type: memType || undefined,
-        source_client: sourceClient || undefined,
-        tag: tagFilter || undefined,
-        file: fileFilter || undefined,
-        sort: sortMode || undefined,
-        include_inactive: includeInactive,
-        limit: pageSize,
-        offset: (page - 1) * pageSize,
-      });
-      if (res.total > 0 && (page - 1) * pageSize >= res.total) {
-        setPageState({ key: filterKey, page: Math.max(1, Math.ceil(res.total / pageSize)) });
-        return;
-      }
-      setHits(res.memories);
-      setTotal(res.total);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Search failed');
-    } finally {
-      setLoading(false);
-    }
-  }, [
-    query,
+    trimmedQuery,
     projectId,
     scope,
     memType,
@@ -200,52 +178,48 @@ export function MemoriesPage({ projects, onChanged }: MemoriesPageProps) {
     fileFilter,
     sortMode,
     includeInactive,
-    pageSize,
-    page,
-    filterKey,
   ]);
 
-  const runGraph = useCallback(async () => {
-    setGraphLoading(true);
-    setGraphError(null);
-    try {
-      const res = await api.graph({
-        project_id: projectId || undefined,
-        scope: scope || undefined,
-        memory_type: memType || undefined,
-        source_client: sourceClient || undefined,
-        tag: tagFilter || undefined,
-        file: fileFilter || undefined,
-        include_inactive: includeInactive,
-        limit: 200,
-      });
-      setGraphData(res);
-    } catch (e) {
-      setGraphError(e instanceof Error ? e.message : 'Failed to build memory graph');
-    } finally {
-      setGraphLoading(false);
-    }
-  }, [projectId, scope, memType, sourceClient, tagFilter, fileFilter, includeInactive]);
-
   useEffect(() => {
-    const timer = setTimeout(() => {
-      void runSearch();
+    const controller = new AbortController();
+    const { signal } = controller;
+    const timer = window.setTimeout(async () => {
+      let loadError: string | null = null;
+      try {
+        if (viewMode === 'graph') {
+          const res = await api.graph({ ...filters, limit: 200 }, signal);
+          if (!signal.aborted) setGraphData(res);
+          return;
+        }
+
+        const offset = (page - 1) * pageSize;
+        const res = await api.searchMemories({ ...filters, limit: pageSize, offset }, signal);
+        if (signal.aborted) return;
+        if (res.total > 0 && offset >= res.total) {
+          setPageState({ key: filterKey, page: Math.ceil(res.total / pageSize) });
+          return;
+        }
+        setHits(res.memories);
+        setTotal(res.total);
+      } catch (e) {
+        loadError = e instanceof Error ? e.message : 'Could not load memories';
+      } finally {
+        if (!signal.aborted) setSettledRequest({ key: requestKey, error: loadError });
+      }
     }, 150);
-    return () => clearTimeout(timer);
-  }, [runSearch]);
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+    };
+  }, [viewMode, filters, page, pageSize, filterKey, requestKey]);
 
-  useEffect(() => {
-    if (viewMode === 'graph') {
-      void runGraph();
-    }
-  }, [viewMode, runGraph]);
+  function reloadResults() {
+    setRequestVersion((version) => version + 1);
+  }
 
-  async function refreshAll() {
-    await Promise.all([
-      runSearch(),
-      viewMode === 'graph' ? runGraph() : Promise.resolve(),
-      onChanged(),
-    ]);
+  function refreshAll() {
+    reloadResults();
+    return onChanged();
   }
 
   async function togglePin(hit: MemoryHit) {
@@ -254,8 +228,10 @@ export function MemoriesPage({ projects, onChanged }: MemoriesPageProps) {
   }
 
   const topTags = useMemo(() => {
+    if (loading || error) return [];
     const counts = new Map<string, number>();
-    for (const m of hits) {
+    const memories = viewMode === 'graph' ? graphData?.nodes : hits;
+    for (const m of memories ?? []) {
       for (const t of m.tags) {
         counts.set(t, (counts.get(t) ?? 0) + 1);
       }
@@ -263,7 +239,7 @@ export function MemoriesPage({ projects, onChanged }: MemoriesPageProps) {
     return Array.from(counts.entries())
       .sort((a, b) => b[1] - a[1])
       .slice(0, 8);
-  }, [hits]);
+  }, [viewMode, graphData, hits, loading, error]);
 
   const groupedHits = useMemo(() => {
     if (groupBy === 'flat') {
@@ -314,8 +290,18 @@ export function MemoriesPage({ projects, onChanged }: MemoriesPageProps) {
   }, [hits, groupBy]);
 
   const hasFilters = Boolean(
-    query || projectId || scope || memType || sourceClient || tagFilter || fileFilter || sortMode,
+    trimmedQuery ||
+      projectId ||
+      scope ||
+      memType ||
+      sourceClient ||
+      tagFilter ||
+      fileFilter ||
+      sortMode ||
+      includeInactive,
   );
+  const filterCount = [scope, memType, sourceClient, sortMode, includeInactive, tagFilter, fileFilter]
+    .filter(Boolean).length;
 
   function clearFilters() {
     setQuery('');
@@ -326,10 +312,11 @@ export function MemoriesPage({ projects, onChanged }: MemoriesPageProps) {
     setTagFilter('');
     setFileFilter('');
     setSortMode('');
+    setIncludeInactive(false);
   }
 
   return (
-    <div>
+    <div className="memories-page" data-filters-open={filtersOpen}>
       <div className="page-head">
         <div>
           <h1 className="page-title">Memories &amp; knowledge map</h1>
@@ -339,26 +326,24 @@ export function MemoriesPage({ projects, onChanged }: MemoriesPageProps) {
         </div>
 
         <div className="head-actions">
-          <div className="seg-group" role="tablist" aria-label="Memories view mode">
+          <fieldset className="seg-group" aria-label="Memories view mode">
             <button
               type="button"
-              role="tab"
               className="seg-btn"
-              aria-selected={viewMode === 'list'}
+              aria-pressed={viewMode === 'list'}
               onClick={() => setViewMode('list')}
             >
               <IconList size={14} /> Grouped list
             </button>
             <button
               type="button"
-              role="tab"
               className="seg-btn"
-              aria-selected={viewMode === 'graph'}
+              aria-pressed={viewMode === 'graph'}
               onClick={() => setViewMode('graph')}
             >
               <IconGraph size={14} /> Graph map
             </button>
-          </div>
+          </fieldset>
 
           <button type="button" className="btn btn-primary" onClick={() => setPreviewOpen(true)}>
             Briefing preview
@@ -366,20 +351,18 @@ export function MemoriesPage({ projects, onChanged }: MemoriesPageProps) {
         </div>
       </div>
 
-      <div className="toolbar">
-        {viewMode === 'list' ? (
-          <div className="search-field">
-            <IconSearch className="search-field-icon" />
-            <input
-              type="search"
-              className="input"
-              aria-label="Search memories"
-              placeholder="Search decisions, bugfixes, files, or concepts"
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-            />
-          </div>
-        ) : null}
+      <div className="toolbar memories-toolbar">
+        <div className="search-field">
+          <IconSearch className="search-field-icon" />
+          <input
+            type="search"
+            className="input"
+            aria-label="Search memories"
+            placeholder="Search memories"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+          />
+        </div>
 
         <RimSelect
           ariaLabel="Filter by project"
@@ -388,57 +371,69 @@ export function MemoriesPage({ projects, onChanged }: MemoriesPageProps) {
           onChange={setProjectId}
         />
 
-        <RimSelect
-          ariaLabel="Filter by scope"
-          value={scope}
-          options={SCOPE_OPTIONS}
-          onChange={setScope}
-        />
+        <button
+          type="button"
+          className="btn memories-filter-toggle"
+          aria-expanded={filtersOpen}
+          aria-controls={filterPanelId}
+          onClick={() => setFiltersOpen((open) => !open)}
+        >
+          {filterCount > 0 ? `Filters (${filterCount})` : 'Filters'}
+          <IconChevronDown size={14} />
+        </button>
 
-        <RimSelect
-          ariaLabel="Filter by type"
-          value={memType}
-          options={TYPE_OPTIONS}
-          onChange={setMemType}
-        />
+        <div className="memories-extra-filters" id={filterPanelId}>
+          <RimSelect
+            ariaLabel="Filter by scope"
+            value={scope}
+            options={SCOPE_OPTIONS}
+            onChange={setScope}
+          />
 
-        <RimSelect
-          ariaLabel="Filter by AI client"
-          value={sourceClient}
-          options={CLIENT_OPTIONS}
-          onChange={setSourceClient}
-        />
+          <RimSelect
+            ariaLabel="Filter by type"
+            value={memType}
+            options={TYPE_OPTIONS}
+            onChange={setMemType}
+          />
 
-        {viewMode === 'list' ? (
-          <>
-            <RimSelect
-              ariaLabel="Sort memories"
-              value={sortMode}
-              options={SORT_OPTIONS}
-              onChange={setSortMode}
-            />
+          <RimSelect
+            ariaLabel="Filter by AI client"
+            value={sourceClient}
+            options={CLIENT_OPTIONS}
+            onChange={setSourceClient}
+          />
+
+          <RimSelect
+            ariaLabel="Sort memories"
+            value={sortMode}
+            options={SORT_OPTIONS}
+            onChange={setSortMode}
+          />
+
+          {viewMode === 'list' ? (
             <RimSelect
               ariaLabel="Group memories by"
               value={groupBy}
               options={GROUP_OPTIONS}
               onChange={(v) => setGroupBy(v as GroupBy)}
             />
-          </>
-        ) : null}
+          ) : null}
 
-        <label className="rim-check-label">
-          <input
-            type="checkbox"
-            className="rim-check"
-            checked={includeInactive}
-            onChange={(e) => setIncludeInactive(e.target.checked)}
-          />
-          Include superseded &amp; archived
-        </label>
+          <label className="rim-check-label">
+            <input
+              type="checkbox"
+              className="rim-check"
+              checked={includeInactive}
+              onChange={(e) => setIncludeInactive(e.target.checked)}
+            />
+            Include superseded &amp; archived
+          </label>
+        </div>
       </div>
 
-      {tagFilter || fileFilter || topTags.length > 0 ? (
-        <div className="facet-bar">
+      {hasFilters || topTags.length > 0 ? (
+        <div className="facet-bar memories-facets" data-active-facet={Boolean(tagFilter || fileFilter)}>
           {tagFilter ? (
             <button
               type="button"
@@ -447,7 +442,7 @@ export function MemoriesPage({ projects, onChanged }: MemoriesPageProps) {
               title="Clear tag filter"
             >
               <IconTag size={11} />
-              tag: {tagFilter}
+              <span className="chip-label">tag: {tagFilter}</span>
               <IconClose size={11} />
             </button>
           ) : null}
@@ -459,27 +454,25 @@ export function MemoriesPage({ projects, onChanged }: MemoriesPageProps) {
               title="Clear file filter"
             >
               <IconFile size={11} />
-              file: {fileFilter}
+              <span className="chip-label">file: {fileFilter}</span>
               <IconClose size={11} />
             </button>
           ) : null}
-          {topTags.length > 0 ? (
-            <>
-              <span className="field-hint">Quick tags:</span>
-              {topTags.map(([t, count]) => (
-                <button
-                  key={t}
-                  type="button"
-                  className={`chip${tagFilter.toLowerCase() === t.toLowerCase() ? ' chip--active' : ''}`}
-                  onClick={() =>
-                    setTagFilter((prev) => (prev.toLowerCase() === t.toLowerCase() ? '' : t))
-                  }
-                >
-                  #{t} <span className="measure">({count})</span>
-                </button>
-              ))}
-            </>
-          ) : null}
+          <div className="memories-quick-tags">
+            {topTags.length > 0 ? <span className="field-hint">Quick tags:</span> : null}
+            {topTags.map(([t, count]) => (
+              <button
+                key={t}
+                type="button"
+                className={`chip${tagFilter.toLowerCase() === t.toLowerCase() ? ' chip--active' : ''}`}
+                onClick={() =>
+                  setTagFilter((prev) => (prev.toLowerCase() === t.toLowerCase() ? '' : t))
+                }
+              >
+                <span className="chip-label">#{t}</span> <span className="measure">({count})</span>
+              </button>
+            ))}
+          </div>
           {hasFilters ? (
             <button
               type="button"
@@ -495,19 +488,19 @@ export function MemoriesPage({ projects, onChanged }: MemoriesPageProps) {
 
       {viewMode === 'graph' ? (
         <MemoryGraphCanvas
-          graph={graphData}
-          loading={graphLoading}
-          error={graphError}
+          graph={loading || error ? null : graphData}
+          loading={loading}
+          error={error}
           selectedId={selectedMemoryId}
           onSelectNode={(id) => setSelectedMemoryId(id)}
-          onRetry={() => void runGraph()}
+          onRetry={reloadResults}
         />
       ) : (
         <>
           {error ? (
             <div className="callout danger" style={{ marginBottom: 'var(--space-md)' }}>
-              <span>Search error: {error}</span>
-              <button type="button" className="btn btn-danger" onClick={() => void runSearch()}>
+              <span role="alert">Search error: {error}</span>
+              <button type="button" className="btn btn-danger" onClick={reloadResults}>
                 Retry
               </button>
             </div>
@@ -516,9 +509,14 @@ export function MemoriesPage({ projects, onChanged }: MemoriesPageProps) {
           <section className="panel" aria-label="Memory search results">
             <div className="panel-header">
               <h2 className="panel-title">
-                {loading ? 'Searching...' : `${total} memories`}
+                {loading ? 'Searching...' : error ? 'Memories' : null}
+                <span role="status">
+                  {loading || error ? null : `${total.toLocaleString()} ${total === 1 ? 'memory' : 'memories'}`}
+                </span>
               </h2>
-              <span className="field-hint">Click any row to inspect lineage, links, or edit</span>
+              <span className="field-hint memories-results-help">
+                Click any row to inspect lineage, links, or edit
+              </span>
             </div>
 
             {loading ? (
@@ -630,7 +628,7 @@ export function MemoriesPage({ projects, onChanged }: MemoriesPageProps) {
                                         }}
                                       >
                                         <IconTag size={10} />
-                                        {t}
+                                        <span className="chip-label">{t}</span>
                                       </button>
                                     ))}
                                     {m.files.slice(0, 2).map((f) => (
@@ -649,7 +647,7 @@ export function MemoriesPage({ projects, onChanged }: MemoriesPageProps) {
                                         }}
                                       >
                                         <IconFile size={10} />
-                                        {f}
+                                        <span className="chip-label">{f}</span>
                                       </button>
                                     ))}
                                     {m.files.length > 2 ? (

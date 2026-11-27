@@ -1050,6 +1050,262 @@ async fn stale_daemon_health_triggers_upgrade_and_ui_cache_headers() {
 }
 
 #[tokio::test]
+async fn search_filters_before_selecting_candidates() {
+    use ox1_memory::config::EMBEDDING_DIM;
+    use ox1_memory::models::{NewMemoryInput, SearchFilter};
+    use ox1_memory::project::ProjectIdentity;
+
+    let tmp = tempdir().unwrap();
+    let state = test_state(tmp.path());
+    for id in ["proj_wanted", "proj_distractor"] {
+        state
+            .db
+            .upsert_project(&ProjectIdentity {
+                id: id.into(),
+                name: id.into(),
+                remote_url: None,
+                root_path: format!("/tmp/{id}"),
+                branch: None,
+            })
+            .unwrap();
+    }
+
+    let create = |project_id: Option<&str>, title: &str, tag: Option<&str>, embedding| {
+        state
+            .db
+            .create_memory(
+                NewMemoryInput {
+                    scope: None,
+                    project_id: project_id.map(str::to_owned),
+                    session_id: None,
+                    source_client: None,
+                    memory_type: "decision".into(),
+                    title: title.into(),
+                    summary: String::new(),
+                    content: String::new(),
+                    files: None,
+                    tags: tag.map(|tag| vec![tag.to_owned()]),
+                    status: None,
+                    supersedes_id: None,
+                },
+                embedding,
+            )
+            .unwrap()
+            .id
+    };
+
+    let mut query_embedding = [0.0_f32; EMBEDDING_DIM];
+    query_embedding[0] = 1.0;
+    let mut relevant_embedding = [0.0_f32; EMBEDDING_DIM];
+    relevant_embedding[0] = 0.8;
+    relevant_embedding[1] = 0.6;
+    // These matches rank higher than the wanted memory in both FTS and KNN.
+    for _ in 0..60 {
+        create(
+            Some("proj_distractor"),
+            "candidatetoken",
+            None,
+            Some(query_embedding.as_slice()),
+        );
+    }
+    let relevant = create(
+        Some("proj_wanted"),
+        "A reference note about candidatetoken",
+        None,
+        Some(relevant_embedding.as_slice()),
+    );
+    let global = create(None, "A global note about candidatetoken", None, None);
+    let literal = create(
+        Some("proj_wanted"),
+        "precandidatetoken",
+        Some("literal"),
+        None,
+    );
+
+    let db = state.db.clone();
+    let app = build_router(state);
+    for (suffix, expected) in [
+        ("", vec![&relevant, &global]),
+        ("&tag=literal", vec![&literal]),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/memories?project_id=proj_wanted&query=candidatetoken{suffix}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["total"], expected.len(), "{suffix}");
+        let hits = body["memories"].as_array().unwrap();
+        assert_eq!(hits.len(), expected.len(), "{suffix}");
+        for id in expected {
+            assert!(hits.iter().any(|hit| hit["id"] == id.as_str()), "{suffix}");
+        }
+    }
+
+    let (hits, total) = db
+        .search_memories_paged(
+            &SearchFilter {
+                query: Some("unmatchedsemanticintent".into()),
+                project_id: Some("proj_wanted".into()),
+                ..SearchFilter::default()
+            },
+            Some(&query_embedding),
+        )
+        .unwrap();
+    assert_eq!(total, 1);
+    assert_eq!(hits[0].id, relevant);
+}
+
+#[tokio::test]
+async fn graph_filters_before_limiting_and_reports_total_matches() {
+    use ox1_memory::models::NewMemoryInput;
+
+    let tmp = tempdir().unwrap();
+    let state = test_state(tmp.path());
+    let create = |project_id: &str, title: &str| {
+        state
+            .db
+            .create_memory(
+                NewMemoryInput {
+                    scope: None,
+                    project_id: Some(project_id.into()),
+                    session_id: None,
+                    source_client: None,
+                    memory_type: "decision".into(),
+                    title: title.into(),
+                    summary: String::new(),
+                    content: String::new(),
+                    files: None,
+                    tags: None,
+                    status: None,
+                    supersedes_id: None,
+                },
+                None,
+            )
+            .unwrap()
+            .id
+    };
+    let first = create("proj_graph", "graphneedle recalled");
+    let second = create("proj_graph", "graphneedle fresh");
+    create("proj_graph", "other topic");
+    for _ in 0..501 {
+        create("proj_other", "graphneedle distractor");
+    }
+    state
+        .db
+        .record_memory_recalls(std::slice::from_ref(&first), "codex")
+        .unwrap();
+
+    let app = build_router(state);
+    for (suffix, expected_total, expected_id) in [
+        ("&sort=most_recalled", 3, Some(&first)),
+        ("&query=graphneedle&sort=most_recalled", 2, Some(&first)),
+        ("&query=graphneedle&sort=never_recalled", 1, Some(&second)),
+        ("&query=absentterm", 0, None),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/graph?project_id=proj_graph&limit=1{suffix}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let graph = body_json(response).await;
+        assert_eq!(graph["total"], expected_total, "{suffix}");
+        let nodes = graph["nodes"].as_array().unwrap();
+        assert_eq!(nodes.len(), usize::from(expected_id.is_some()), "{suffix}");
+        if let Some(id) = expected_id {
+            assert_eq!(nodes[0]["id"], id.as_str(), "{suffix}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn memory_browse_pages_count_only_matching_rows() {
+    use ox1_memory::models::NewMemoryInput;
+
+    let tmp = tempdir().unwrap();
+    let state = test_state(tmp.path());
+    let create = |project_id: Option<&str>, status: &str, tag: &str, file: &str| {
+        state
+            .db
+            .create_memory(
+                NewMemoryInput {
+                    scope: None,
+                    project_id: project_id.map(str::to_owned),
+                    session_id: None,
+                    source_client: Some("codex".into()),
+                    memory_type: "decision".into(),
+                    title: status.into(),
+                    summary: String::new(),
+                    content: String::new(),
+                    files: Some(vec![file.into()]),
+                    tags: Some(vec![tag.into()]),
+                    status: Some(status.into()),
+                    supersedes_id: None,
+                },
+                None,
+            )
+            .unwrap()
+            .id
+    };
+    let scoped = create(Some("proj_browse"), "active", "rust", "src/%tool.rs");
+    let global = create(None, "pinned", "rust", "src/%tool.rs");
+    create(Some("proj_browse"), "archived", "rust", "src/%tool.rs");
+    create(Some("proj_browse"), "active", "rust", "src/buildtool.rs");
+    create(Some("proj_browse"), "active", "rusty", "src/%tool.rs");
+    create(Some("other_proj"), "active", "rust", "src/%tool.rs");
+    state
+        .db
+        .record_memory_recalls(std::slice::from_ref(&scoped), "codex")
+        .unwrap();
+
+    let app = build_router(state);
+    let oversized = format!("&offset={}", usize::MAX);
+    for (suffix, total, expected) in [
+        ("", 2, Some(&global)),
+        ("&sort=most_recalled", 2, Some(&scoped)),
+        ("&offset=1&sort=most_recalled", 2, Some(&global)),
+        ("&sort=never_recalled", 1, Some(&global)),
+        ("&scope=project", 1, Some(&scoped)),
+        ("&include_inactive=true", 3, Some(&global)),
+        ("&memory_type=architecture", 0, None),
+        (oversized.as_str(), 2, None),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/memories?project_id=proj_browse&tag=%20RUST%20&file=%25TOOL&limit=1{suffix}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{suffix}");
+        let page = body_json(response).await;
+        assert_eq!(page["total"], total, "{suffix}");
+        assert_eq!(page["count"], usize::from(expected.is_some()), "{suffix}");
+        let first = page["memories"][0]["id"].as_str();
+        assert_eq!(first, expected.map(String::as_str), "{suffix}");
+    }
+}
+
+#[tokio::test]
 async fn pagination_across_memories_sessions_raw_events_and_usage() {
     use ox1_memory::models::NewMemoryInput;
     use ox1_memory::project::ProjectIdentity;

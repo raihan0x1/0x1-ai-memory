@@ -84,15 +84,16 @@ export const api = {
     req<{ events: RawEventView[]; total: number; limit: number; offset: number }>(
       `/api/raw-events${buildQuery(params)}`,
     ),
-  searchMemories: (params: Record<string, string | number | boolean | undefined>) =>
+  searchMemories: (params: Record<string, string | number | boolean | undefined>, signal?: AbortSignal) =>
     req<{ count: number; total: number; limit: number; offset: number; memories: MemoryHit[] }>(
       `/api/memories${buildQuery(params)}`,
+      { signal },
     ),
   getMemory: (id: string) => req<{ memory: MemoryDetail }>(`/api/memories/${encodeURIComponent(id)}`),
   memoryContext: (id: string) =>
     req<MemoryContextResponse>(`/api/memories/${encodeURIComponent(id)}/context`),
-  graph: (params: Record<string, string | number | boolean | undefined>) =>
-    req<MemoryGraphResponse>(`/api/graph${buildQuery(params)}`),
+  graph: (params: Record<string, string | number | boolean | undefined>, signal?: AbortSignal) =>
+    req<MemoryGraphResponse>(`/api/graph${buildQuery(params)}`, { signal }),
   createMemory: (body: {
     scope: string;
     project_id?: string | null;

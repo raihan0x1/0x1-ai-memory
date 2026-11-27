@@ -309,16 +309,7 @@ async fn api_search_memories(
     State(st): State<AppState>,
     Query(filter): Query<SearchFilter>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let settings = st.db.get_settings().map_err(internal_err)?;
-    let allow_ext = !st.db.is_project_local_only(filter.project_id.as_deref());
-    let q_vec = match filter.query.as_deref() {
-        Some(q) if !q.trim().is_empty() => {
-            st.embedder
-                .embed_text(q, &settings, Some(&st.db), allow_ext)
-                .await
-        }
-        _ => None,
-    };
+    let q_vec = memory_query_embedding(&st, &filter).await?;
     let limit = filter.limit.unwrap_or(20).clamp(1, 250);
     let offset = filter.offset.unwrap_or(0);
     let (hits, total) = st
@@ -332,6 +323,21 @@ async fn api_search_memories(
         "offset": offset,
         "memories": hits,
     })))
+}
+
+async fn memory_query_embedding(
+    st: &AppState,
+    filter: &SearchFilter,
+) -> Result<Option<Vec<f32>>, (StatusCode, String)> {
+    let Some(query) = filter.query.as_deref().filter(|q| !q.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let settings = st.db.get_settings().map_err(internal_err)?;
+    let allow_ext = !st.db.is_project_local_only(filter.project_id.as_deref());
+    Ok(st
+        .embedder
+        .embed_text(query, &settings, Some(&st.db), allow_ext)
+        .await)
 }
 
 async fn api_create_memory(
@@ -447,10 +453,11 @@ async fn api_memory_graph(
     State(st): State<AppState>,
     Query(filter): Query<SearchFilter>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
+    let q_vec = memory_query_embedding(&st, &filter).await?;
     let limit = filter.limit.unwrap_or(180);
     let graph = st
         .db
-        .build_memory_graph(&filter, limit)
+        .build_memory_graph(&filter, limit, q_vec.as_deref())
         .map_err(internal_err)?;
     Ok(Json(serde_json::to_value(graph).unwrap_or_default()))
 }

@@ -1031,15 +1031,39 @@ impl MemoryDb {
             return list_recent_memories_locked(&conn, filter, include_inactive, limit, offset);
         }
 
+        let matches = Self::ranked_memory_matches(&conn, filter, query, query_embedding)?;
+        let total = matches.len();
+        let page = matches
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .map(|record| record.hit)
+            .collect();
+        Ok((page, total))
+    }
+
+    fn ranked_memory_matches(
+        conn: &Connection,
+        filter: &SearchFilter,
+        query: &str,
+        query_embedding: Option<&[f32]>,
+    ) -> Result<Vec<GraphNodeRecord>> {
+        let include_inactive = filter.include_inactive.unwrap_or(false);
         let mut rrf_scores: HashMap<i64, f64> = HashMap::new();
 
         // 1. FTS5 BM25 pass
         if let Some(fts_query) = sanitize_fts_query(query) {
-            let mut stmt = conn.prepare(
-                "SELECT rowid FROM memories_fts WHERE memories_fts MATCH ?1 ORDER BY bm25(memories_fts) LIMIT 60",
-            )?;
+            let mut stmt = conn.prepare(&format!(
+                "SELECT m.rowid FROM memories_fts
+                     JOIN memories m ON m.rowid = memories_fts.rowid
+                     WHERE memories_fts MATCH ?1 AND {MEMORY_FILTER_PREDICATE}
+                     ORDER BY bm25(memories_fts) LIMIT 60"
+            ))?;
             let rows = stmt
-                .query_map(params![fts_query], |r| r.get::<_, i64>(0))?
+                .query_map(
+                    memory_filter_params(fts_query, filter, include_inactive),
+                    |r| r.get::<_, i64>(0),
+                )?
                 .filter_map(Result::ok);
             for (rank, rowid) in rows.enumerate() {
                 *rrf_scores.entry(rowid).or_insert(0.0) += 1.0 / (60.0 + (rank as f64) + 1.0);
@@ -1052,13 +1076,18 @@ impl MemoryDb {
         {
             let bytes = vec_to_le_bytes(vec);
             let mut stmt = conn.prepare(
-                "SELECT memory_rowid, distance FROM memories_vec
+                &format!(
+                    "SELECT memory_rowid, distance FROM memories_vec
                      WHERE embedding MATCH ?1 AND k = 60
-                     ORDER BY distance ASC",
+                       AND memory_rowid IN (SELECT m.rowid FROM memories m WHERE {MEMORY_FILTER_PREDICATE})
+                     ORDER BY distance ASC"
+                ),
             )?;
-            if let Ok(rows) = stmt.query_map(params![bytes], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?))
-            }) {
+            if let Ok(rows) = stmt
+                .query_map(memory_filter_params(bytes, filter, include_inactive), |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?))
+                })
+            {
                 for (rank, item) in rows.filter_map(Result::ok).enumerate() {
                     let (rowid, distance) = item;
                     if distance < 0.85 {
@@ -1072,34 +1101,36 @@ impl MemoryDb {
         // 3. Substring LIKE fallback if FTS5 & vector found nothing (e.g. exact path/symbol substring)
         if rrf_scores.is_empty() {
             let like = format!("%{}%", query.replace('%', "\\%").replace('_', "\\_"));
-            let mut stmt = conn.prepare(
-                "SELECT rowid FROM memories
-                 WHERE title LIKE ?1 ESCAPE '\\' OR summary LIKE ?1 ESCAPE '\\' OR content LIKE ?1 ESCAPE '\\' OR files_json LIKE ?1 ESCAPE '\\'
-                 ORDER BY updated_at DESC LIMIT 40",
-            )?;
+            let mut stmt = conn.prepare(&format!(
+                "SELECT m.rowid FROM memories m
+                     WHERE (m.title LIKE ?1 ESCAPE '\\' OR m.summary LIKE ?1 ESCAPE '\\'
+                            OR m.content LIKE ?1 ESCAPE '\\' OR m.files_json LIKE ?1 ESCAPE '\\')
+                       AND {MEMORY_FILTER_PREDICATE}
+                     ORDER BY m.updated_at DESC LIMIT 40"
+            ))?;
             let rows = stmt
-                .query_map(params![like], |r| r.get::<_, i64>(0))?
+                .query_map(memory_filter_params(like, filter, include_inactive), |r| {
+                    r.get::<_, i64>(0)
+                })?
                 .filter_map(Result::ok);
             for (rank, rowid) in rows.enumerate() {
                 *rrf_scores.entry(rowid).or_insert(0.0) += 0.5 / (60.0 + (rank as f64) + 1.0);
             }
         }
 
-        let mut hits = Vec::new();
-        let sql = format!("{MEMORY_HIT_SELECT} WHERE m.rowid = ?1");
+        let mut matches = Vec::new();
+        let sql = format!("{GRAPH_NODE_SELECT} WHERE m.rowid = ?1");
         let mut stmt = conn.prepare(&sql)?;
 
         for (rowid, base_score) in rrf_scores {
-            let Some(mut hit) = stmt
-                .query_row(params![rowid], |r| row_to_memory_hit(r, base_score))
+            let Some(mut record) = stmt
+                .query_row(params![rowid], |r| row_to_graph_record(r, base_score))
                 .optional()?
             else {
                 continue;
             };
+            let hit = &mut record.hit;
 
-            if !matches_filter(&hit, filter, include_inactive) {
-                continue;
-            }
             if hit.status == "pinned" {
                 hit.score += 0.015;
             }
@@ -1108,31 +1139,23 @@ impl MemoryDb {
                     (Utc::now() - ts.with_timezone(&Utc)).num_hours().max(0) as f64 / 24.0;
                 hit.score += 0.005 * (-age_days / 30.0).exp();
             }
-            hits.push(hit);
+            matches.push(record);
         }
 
-        if filter.sort.as_deref() == Some("most_recalled") {
-            hits.sort_by(|a, b| {
-                b.recall_count
-                    .cmp(&a.recall_count)
-                    .then_with(|| {
-                        b.score
-                            .partial_cmp(&a.score)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    })
-                    .then_with(|| b.updated_at.cmp(&a.updated_at))
-            });
-        } else {
-            hits.sort_by(|a, b| {
-                b.score
-                    .partial_cmp(&a.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| b.updated_at.cmp(&a.updated_at))
-            });
-        }
-        let total = hits.len();
-        let page = hits.into_iter().skip(offset).take(limit).collect();
-        Ok((page, total))
+        let sort_by_recall = filter.sort.as_deref() == Some("most_recalled");
+        matches.sort_by(|a, b| {
+            let (a, b) = (&a.hit, &b.hit);
+            let recall_order = if sort_by_recall {
+                b.recall_count.cmp(&a.recall_count)
+            } else {
+                std::cmp::Ordering::Equal
+            };
+            recall_order
+                .then_with(|| b.score.total_cmp(&a.score))
+                .then_with(|| b.updated_at.cmp(&a.updated_at))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        Ok(matches)
     }
 
     pub fn memory_timeline(
@@ -1175,7 +1198,7 @@ impl MemoryDb {
             let mut stmt = conn.prepare(&extra_sql)?;
             for id in extra_ids {
                 if let Some(rec) = stmt
-                    .query_row(params![id], row_to_graph_record)
+                    .query_row(params![id], |row| row_to_graph_record(row, 1.0))
                     .optional()?
                 {
                     records.push(rec);
@@ -1238,11 +1261,26 @@ impl MemoryDb {
         &self,
         filter: &SearchFilter,
         limit: usize,
+        query_embedding: Option<&[f32]>,
     ) -> Result<MemoryGraphResponse> {
         let limit = limit.clamp(1, 250);
-        let include_inactive = filter.include_inactive.unwrap_or(false);
+        let query = filter.query.as_deref().unwrap_or("").trim();
         let conn = self.conn.lock().unwrap();
-        let records = load_graph_records_locked(&conn, filter, include_inactive, limit)?;
+        let (records, total) = if query.is_empty() {
+            let include_inactive = filter.include_inactive.unwrap_or(false);
+            let records = load_graph_records_locked(&conn, filter, include_inactive, limit)?;
+            let total = if records.len() == limit {
+                count_filtered_memories_locked(&conn, filter, include_inactive)?
+            } else {
+                records.len()
+            };
+            (records, total)
+        } else {
+            let mut records = Self::ranked_memory_matches(&conn, filter, query, query_embedding)?;
+            let total = records.len();
+            records.truncate(limit);
+            (records, total)
+        };
         let edges = compute_edges_for_nodes_locked(&conn, &records);
 
         let mut degrees: HashMap<&str, usize> = HashMap::new();
@@ -1277,7 +1315,11 @@ impl MemoryDb {
             })
             .collect();
 
-        Ok(MemoryGraphResponse { nodes, edges })
+        Ok(MemoryGraphResponse {
+            nodes,
+            edges,
+            total,
+        })
     }
 
     /// Builds an ultra-lean (~300-500 token) SessionStart briefing shared across all clients.
@@ -1868,11 +1910,11 @@ fn row_to_memory_hit(r: &rusqlite::Row<'_>, score: f64) -> rusqlite::Result<Memo
     row_to_memory_hit_offset(r, 0, score)
 }
 
-fn row_to_graph_record(r: &rusqlite::Row<'_>) -> rusqlite::Result<GraphNodeRecord> {
+fn row_to_graph_record(r: &rusqlite::Row<'_>, score: f64) -> rusqlite::Result<GraphNodeRecord> {
     Ok(GraphNodeRecord {
         rowid: r.get(0)?,
         created_at: r.get(1)?,
-        hit: row_to_memory_hit_offset(r, 2, 1.0)?,
+        hit: row_to_memory_hit_offset(r, 2, score)?,
     })
 }
 
@@ -1890,6 +1932,14 @@ fn has_existing_user_data_locked(conn: &Connection) -> Result<bool> {
     Ok(has_memories || has_prior_conn)
 }
 
+fn recent_memory_order(filter: &SearchFilter) -> &'static str {
+    if filter.sort.as_deref() == Some("most_recalled") {
+        "ORDER BY COALESCE(rs.recall_count, 0) DESC, m.updated_at DESC, m.rowid"
+    } else {
+        "ORDER BY (CASE WHEN m.status = 'pinned' THEN 0 ELSE 1 END), m.updated_at DESC, m.rowid"
+    }
+}
+
 fn list_recent_memories_locked(
     conn: &Connection,
     filter: &SearchFilter,
@@ -1897,79 +1947,90 @@ fn list_recent_memories_locked(
     limit: usize,
     offset: usize,
 ) -> Result<(Vec<MemoryHit>, usize)> {
-    let order = if filter.sort.as_deref() == Some("most_recalled") {
-        "ORDER BY COALESCE(rs.recall_count, 0) DESC, m.updated_at DESC"
-    } else {
-        "ORDER BY (CASE WHEN m.status = 'pinned' THEN 0 ELSE 1 END), m.updated_at DESC"
-    };
-    let sql = format!("{MEMORY_HIT_SELECT} {order}");
-    let mut stmt = conn.prepare(&sql)?;
-    let mut total = 0usize;
-    let mut hits = Vec::new();
-    for row in stmt
-        .query_map([], |r| row_to_memory_hit(r, 1.0))?
-        .filter_map(Result::ok)
-    {
-        if matches_filter(&row, filter, include_inactive) {
-            if total >= offset && hits.len() < limit {
-                hits.push(row);
-            }
-            total += 1;
-        }
+    // Keep the page and count in one snapshot when another process writes to SQLite.
+    let tx = conn.unchecked_transaction()?;
+    let total = count_filtered_memories_locked(&tx, filter, include_inactive)?;
+    if offset >= total {
+        tx.commit()?;
+        return Ok((Vec::new(), total));
     }
+
+    let offset = i64::try_from(offset)?;
+    let order = recent_memory_order(filter);
+    let sql = format!(
+        "{MEMORY_HIT_SELECT} WHERE {MEMORY_FILTER_PREDICATE} {order} LIMIT {limit} OFFSET ?1"
+    );
+    let hits = {
+        let mut stmt = tx.prepare(&sql)?;
+        stmt.query_map(
+            memory_filter_params(offset, filter, include_inactive),
+            |row| row_to_memory_hit(row, 1.0),
+        )?
+        .filter_map(Result::ok)
+        .collect()
+    };
+    tx.commit()?;
     Ok((hits, total))
 }
 
-fn matches_filter(hit: &MemoryHit, filter: &SearchFilter, include_inactive: bool) -> bool {
-    if !include_inactive && hit.status != "active" && hit.status != "pinned" {
-        return false;
-    }
-    if let Some(pid) = filter.project_id.as_deref().filter(|s| !s.is_empty())
-        && hit.project_id.as_deref() != Some(pid)
-        && hit.scope != "global"
-    {
-        return false;
-    }
-    if let Some(scope) = filter.scope.as_deref().filter(|s| !s.is_empty())
-        && hit.scope != scope
-    {
-        return false;
-    }
-    if let Some(mtype) = filter.memory_type.as_deref().filter(|s| !s.is_empty())
-        && hit.memory_type != mtype
-    {
-        return false;
-    }
-    if let Some(client) = filter.source_client.as_deref().filter(|s| !s.is_empty())
-        && hit.source_client != client
-    {
-        return false;
-    }
-    if let Some(tag) = filter
-        .tag
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        && !hit.tags.iter().any(|t| t.eq_ignore_ascii_case(tag))
-    {
-        return false;
-    }
-    if let Some(file) = filter
-        .file
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        let needle = file.to_ascii_lowercase();
-        if !hit
-            .files
-            .iter()
-            .any(|f| f.to_ascii_lowercase().contains(&needle))
-        {
-            return false;
-        }
-    }
-    !(filter.sort.as_deref() == Some("never_recalled") && hit.recall_count > 0)
+fn count_filtered_memories_locked(
+    conn: &Connection,
+    filter: &SearchFilter,
+    include_inactive: bool,
+) -> Result<usize> {
+    let sql = format!("SELECT COUNT(*) FROM memories m WHERE {MEMORY_FILTER_PREDICATE}");
+    let total: i64 = conn.query_row(
+        &sql,
+        memory_filter_params(rusqlite::types::Null, filter, include_inactive),
+        |row| row.get(0),
+    )?;
+    Ok(usize::try_from(total)?)
+}
+
+// ?1 is reserved for the search input, row limit, or page offset.
+const MEMORY_FILTER_PREDICATE: &str = "
+    (?2 OR m.status IN ('active', 'pinned'))
+    AND (?3 IS NULL OR m.project_id = ?3 OR m.scope = 'global')
+    AND (?4 IS NULL OR m.scope = ?4)
+    AND (?5 IS NULL OR m.memory_type = ?5)
+    AND (?6 IS NULL OR m.source_client = ?6)
+    AND (?7 IS NULL OR EXISTS (
+        SELECT 1 FROM json_each(CASE WHEN json_valid(m.tags_json) THEN m.tags_json END)
+        WHERE typeof(key) = 'integer' AND type = 'text' AND lower(value) = lower(?7)
+    ))
+    AND (?8 IS NULL OR EXISTS (
+        SELECT 1 FROM json_each(CASE WHEN json_valid(m.files_json) THEN m.files_json END)
+        WHERE typeof(key) = 'integer' AND type = 'text' AND instr(lower(value), lower(?8)) > 0
+    ))
+    AND (NOT ?9 OR NOT EXISTS (
+        SELECT 1 FROM memory_recall_stats WHERE memory_id = m.id AND recall_count > 0
+    ))
+";
+
+fn memory_filter_params<'a>(
+    first: impl rusqlite::ToSql + 'a,
+    filter: &'a SearchFilter,
+    include_inactive: bool,
+) -> impl rusqlite::Params + 'a {
+    (
+        first,
+        include_inactive,
+        filter.project_id.as_deref().filter(|s| !s.is_empty()),
+        filter.scope.as_deref().filter(|s| !s.is_empty()),
+        filter.memory_type.as_deref().filter(|s| !s.is_empty()),
+        filter.source_client.as_deref().filter(|s| !s.is_empty()),
+        filter
+            .tag
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty()),
+        filter
+            .file
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty()),
+        filter.sort.as_deref() == Some("never_recalled"),
+    )
 }
 
 fn memory_timeline_locked(
@@ -2064,22 +2125,15 @@ fn load_graph_records_locked(
     include_inactive: bool,
     limit: usize,
 ) -> Result<Vec<GraphNodeRecord>> {
-    let sql = format!(
-        "{GRAPH_NODE_SELECT} ORDER BY (CASE WHEN m.status = 'pinned' THEN 0 ELSE 1 END), m.updated_at DESC LIMIT 500"
-    );
+    let order = recent_memory_order(filter);
+    let sql = format!("{GRAPH_NODE_SELECT} WHERE {MEMORY_FILTER_PREDICATE} {order} LIMIT ?1");
     let mut stmt = conn.prepare(&sql)?;
-    let mut records = Vec::new();
-    for rec in stmt
-        .query_map([], row_to_graph_record)?
-        .filter_map(Result::ok)
-    {
-        if matches_filter(&rec.hit, filter, include_inactive) {
-            records.push(rec);
-            if records.len() >= limit {
-                break;
-            }
-        }
-    }
+    let records = stmt
+        .query_map(
+            memory_filter_params(limit as i64, filter, include_inactive),
+            |row| row_to_graph_record(row, 1.0),
+        )?
+        .collect::<rusqlite::Result<_>>()?;
     Ok(records)
 }
 
@@ -2702,6 +2756,7 @@ mod tests {
                     ..Default::default()
                 },
                 50,
+                None,
             )
             .unwrap();
         assert_eq!(graph.nodes.len(), 2);

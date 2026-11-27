@@ -443,6 +443,10 @@ export function MemoryGraphCanvas({
           ['session_summary', TYPE_COLORS.session_summary],
         ];
 
+  const total = graph?.total ?? graph?.nodes.length ?? 0;
+  const nodeCount = filteredData.nodes.length;
+  const edgeCount = filteredData.links.length;
+
   return (
     <section className="panel ticks" aria-label="Memory knowledge graph">
       <div className="panel-header">
@@ -478,8 +482,10 @@ export function MemoryGraphCanvas({
         </div>
 
         <div className="head-actions">
-          <span className="field-hint measure">
-            {filteredData.nodes.length} nodes · {filteredData.links.length} edges
+          <span className="field-hint measure" role="status">
+            {graph && !loading && !error
+              ? `Showing ${nodeCount.toLocaleString()} of ${total.toLocaleString()} ${total === 1 ? 'result' : 'results'} · ${edgeCount.toLocaleString()} ${edgeCount === 1 ? 'edge' : 'edges'}`
+              : null}
           </span>
           <button
             type="button"
@@ -536,7 +542,7 @@ export function MemoryGraphCanvas({
       {error ? (
         <div className="panel-body">
           <div className="callout danger">
-            <span>Graph error: {error}</span>
+            <span role="alert">Graph error: {error}</span>
             <button type="button" className="btn btn-danger" onClick={onRetry}>
               Retry
             </button>
@@ -552,8 +558,9 @@ export function MemoryGraphCanvas({
       ) : filteredData.nodes.length === 0 ? (
         <div className="empty-state">
           <p>
-            No memories match the active graph filters (or enable &ldquo;Show unconnected&rdquo; to
-            view isolated nodes).
+            {graph?.nodes.length
+              ? 'No connected memories with these edge settings. Turn on Show unconnected to see the loaded memories.'
+              : 'No memories match the current query or filters.'}
           </p>
         </div>
       ) : (

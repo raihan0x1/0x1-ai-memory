@@ -1457,6 +1457,7 @@ dialog::backdrop {
   display: inline-flex;
   align-items: center;
   gap: 4px;
+  max-inline-size: 100%;
   padding: 2px var(--space-xs);
   border: var(--rule-hair) solid var(--color-rule-2);
   background: var(--color-paper);
@@ -1466,6 +1467,23 @@ dialog::backdrop {
   line-height: 1.35;
   cursor: pointer;
   transition: border-color var(--dur-micro) var(--ease-out), color var(--dur-micro) var(--ease-out), background-color var(--dur-micro) var(--ease-out);
+}
+
+.chip > svg {
+  flex: none;
+}
+
+.chip-label {
+  min-inline-size: 0;
+  overflow-wrap: anywhere;
+  text-align: start;
+}
+
+.memories-page .ledger-row .chip-label,
+.memories-facets .chip-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .chip:hover {
@@ -1499,6 +1517,99 @@ dialog::backdrop {
   padding: var(--space-xs) var(--space-sm);
   border: var(--rule-hair) solid var(--color-rule-2);
   background: var(--color-paper-2);
+}
+
+.memories-extra-filters,
+.memories-quick-tags {
+  display: contents;
+}
+
+.btn.memories-filter-toggle {
+  display: none;
+}
+
+@media (max-width: 40rem) {
+  .memories-page .page-head {
+    gap: var(--space-sm);
+    margin-bottom: var(--space-md);
+  }
+
+  .memories-page .page-subtitle,
+  .memories-results-help {
+    display: none;
+  }
+
+  .memories-toolbar {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .memories-toolbar .search-field,
+  .memories-extra-filters,
+  .memories-extra-filters .rim-check-label {
+    grid-column: 1 / -1;
+  }
+
+  .memories-toolbar .search-field {
+    min-inline-size: 0;
+  }
+
+  .memories-toolbar .search-field .input {
+    min-block-size: 44px;
+    font-size: 1rem;
+  }
+
+  .memories-toolbar .rim-select-wrap {
+    min-inline-size: 0;
+  }
+
+  .memories-toolbar .rim-select-trigger {
+    inline-size: 100%;
+    min-inline-size: 0;
+    min-block-size: 44px;
+  }
+
+  .btn.memories-filter-toggle {
+    display: inline-flex;
+    min-block-size: 44px;
+  }
+
+  .memories-filter-toggle[aria-expanded="true"] svg {
+    transform: rotate(180deg);
+  }
+
+  .memories-extra-filters {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: var(--space-xs);
+    padding: var(--space-xs);
+    border: var(--rule-hair) solid var(--color-rule-2);
+    background: var(--color-paper-2);
+  }
+
+  .memories-extra-filters .rim-check-label {
+    min-block-size: 44px;
+  }
+
+  .memories-page[data-filters-open="false"] .memories-extra-filters,
+  .memories-page[data-filters-open="false"] .memories-quick-tags,
+  .memories-page[data-filters-open="false"] .memories-facets:not([data-active-facet="true"]) {
+    display: none;
+  }
+
+  .memories-page .chip,
+  .inspector-drawer .chip--file {
+    min-block-size: 28px;
+  }
+
+  .memories-page .group-head-left {
+    overflow-wrap: anywhere;
+    text-align: start;
+  }
+
+  .memories-page .group-chevron {
+    flex: none;
+  }
 }
 
 /* Collapsible Group Headers */

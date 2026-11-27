@@ -195,6 +195,7 @@ pub struct GraphEdge {
 pub struct MemoryGraphResponse {
     pub nodes: Vec<GraphNode>,
     pub edges: Vec<GraphEdge>,
+    pub total: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

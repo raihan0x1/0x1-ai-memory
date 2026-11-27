@@ -615,7 +615,7 @@ export function MemoryInspectorDrawer({
                             }}
                           >
                             <IconFile size={11} />
-                            {f}
+                            <span className="chip-label">{f}</span>
                           </button>
                         ))}
                       </div>
