@@ -39,6 +39,7 @@ export interface SessionSummary {
   project_id: string;
   project_name: string | null;
   source_client: string;
+  host: 't3-code' | 'orca' | 'terminal' | null;
   branch: string | null;
   started_at: string;
   ended_at: string | null;

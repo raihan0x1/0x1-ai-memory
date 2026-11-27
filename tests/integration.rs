@@ -2641,3 +2641,63 @@ async fn sessions_page_filter_by_client_and_derive_active_idle_ended() {
     );
     assert_eq!(ids(&codex)[0], "sess_00001");
 }
+
+#[tokio::test]
+async fn hook_records_the_host_that_launched_the_client() {
+    let tmp = tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    tokio::fs::create_dir_all(&repo).await.unwrap();
+    let state = test_state(tmp.path());
+    let app = build_router(state.clone());
+    for (sid, host) in [
+        ("via-orca", "orca"),
+        ("via-junk", "<script>"),
+        ("plain", ""),
+    ] {
+        let mut body = json!({"cwd": repo, "session_id": sid, "prompt": "hello there"});
+        if !host.is_empty() {
+            body["ox1_host"] = host.into();
+        }
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/hooks/claude?event=UserPromptSubmit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/sessions?limit=10")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let sessions = body_json(resp).await["sessions"].clone();
+    let hosts: Vec<Value> = sessions
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["host"].clone())
+        .collect();
+    assert_eq!(hosts.len(), 3);
+    assert_eq!(
+        hosts.iter().filter(|h| **h == "orca").count(),
+        1,
+        "{sessions}"
+    );
+    // Unknown values are dropped rather than stored.
+    assert_eq!(
+        hosts.iter().filter(|h| h.is_null()).count(),
+        2,
+        "{sessions}"
+    );
+}

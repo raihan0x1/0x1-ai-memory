@@ -138,6 +138,8 @@ pub struct SessionSummary {
     pub project_id: String,
     pub project_name: Option<String>,
     pub source_client: String,
+    /// The Host that launched the Client (`t3-code`, `orca`, `terminal`), when known.
+    pub host: Option<String>,
     pub branch: Option<String>,
     pub started_at: String,
     pub ended_at: Option<String>,

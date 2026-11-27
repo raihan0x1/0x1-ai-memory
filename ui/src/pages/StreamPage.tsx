@@ -46,6 +46,10 @@ type TailFilter = 'all' | 'prompts' | 'tools' | 'turn_end' | 'distill';
 
 const EVENT_LABELS: Record<string, string> = { turn_stop: 'Turn End', distill_result: 'Distill' };
 
+const HOST_LABELS: Record<string, string> = { 't3-code': 'T3 Code', orca: 'Orca', terminal: 'terminal' };
+
+const viaHost = (host: string | null) => (host ? ` via ${HOST_LABELS[host] ?? host}` : '');
+
 const CLIENT_OPTIONS = [
   { value: '', label: 'All AI clients' },
   { value: 'claude-code', label: 'Claude Code' },
@@ -389,7 +393,7 @@ export function StreamPage({
         key = m.session_id || `manual_${m.source_client}`;
         const sess = m.session_id ? sessionMap.get(m.session_id) : undefined;
         label = sess
-          ? `${sess.source_client} · ${sess.project_name ?? 'project'}${sess.branch ? ` (${sess.branch})` : ''} · started ${formatUtcClock(sess.started_at)}`
+          ? `${sess.source_client}${viaHost(sess.host)} · ${sess.project_name ?? 'project'}${sess.branch ? ` (${sess.branch})` : ''} · started ${formatUtcClock(sess.started_at)}`
           : m.session_id
             ? `${m.source_client} · session ${m.session_id.slice(0, 12)}`
             : `Manual / MCP (${m.source_client})`;
@@ -969,6 +973,9 @@ export function StreamPage({
                       <div className="session-row-top">
                         <div className="tag-row">
                           <span className={`tag ${s.source_client}`}>{s.source_client}</span>
+                          {s.host ? (
+                            <span className="field-hint">{viaHost(s.host).trim()}</span>
+                          ) : null}
                           <span style={{ fontSize: 'var(--text-sm)', fontWeight: 500 }}>
                             {s.project_name ?? 'workspace'}
                           </span>

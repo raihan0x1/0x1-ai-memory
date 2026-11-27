@@ -197,6 +197,14 @@ impl MemoryDb {
             "
         ))?;
         normalize_legacy_clients(&conn)?;
+        let has_host: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('sessions') WHERE name = 'host')",
+            [],
+            |r| r.get(0),
+        )?;
+        if !has_host {
+            conn.execute("ALTER TABLE sessions ADD COLUMN host TEXT", [])?;
+        }
         Ok(())
     }
 
@@ -449,6 +457,15 @@ impl MemoryDb {
         })
     }
 
+    pub fn set_session_host(&self, session_id: &str, host: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE sessions SET host = ?2 WHERE id = ?1 AND host IS NOT ?2",
+            params![session_id, host],
+        )?;
+        Ok(())
+    }
+
     pub fn end_session(&self, session_id: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let now = Utc::now().to_rfc3339();
@@ -484,7 +501,7 @@ impl MemoryDb {
                 ORDER BY s.last_turn_at DESC, s.id
                 LIMIT ?3 OFFSET ?4
              )
-             SELECT s.id, s.project_id, p.name, s.source_client, s.branch,
+             SELECT s.id, s.project_id, p.name, s.source_client, s.host, s.branch,
                     s.started_at, s.ended_at, s.last_turn_at,
                     CASE WHEN s.ended_at IS NOT NULL OR s.status = 'ended' THEN 'ended'
                          WHEN s.last_turn_at >= ?5 THEN 'active' ELSE 'idle' END,
@@ -502,13 +519,14 @@ impl MemoryDb {
                     project_id: r.get(1)?,
                     project_name: r.get(2)?,
                     source_client: r.get(3)?,
-                    branch: r.get(4)?,
-                    started_at: r.get(5)?,
-                    ended_at: r.get(6)?,
-                    last_turn_at: r.get(7)?,
-                    status: r.get(8)?,
-                    pending_events: r.get(9)?,
-                    memory_count: r.get(10)?,
+                    host: r.get(4)?,
+                    branch: r.get(5)?,
+                    started_at: r.get(6)?,
+                    ended_at: r.get(7)?,
+                    last_turn_at: r.get(8)?,
+                    status: r.get(9)?,
+                    pending_events: r.get(10)?,
+                    memory_count: r.get(11)?,
                 })
             },
         )?;

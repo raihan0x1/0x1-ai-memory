@@ -77,6 +77,14 @@ pub async fn handle_hook(
         Err(_) => return json!({}),
     };
 
+    if let Some(host) = payload
+        .get("ox1_host")
+        .and_then(|v| v.as_str())
+        .and_then(normalize_host)
+    {
+        let _ = db.set_session_host(&session.id, host);
+    }
+
     let settings = db.get_settings().unwrap_or_default();
     let is_paused = project.privacy_mode == "paused";
 
@@ -299,6 +307,28 @@ fn extract_cwd(payload: &Value) -> String {
         })
 }
 
+/// The Host that launched the hook's Client, read from the environment the Client passes to its
+/// hook commands. Sent by the hook forwarder as `ox1_host`.
+pub fn detect_host(env: impl Fn(&str) -> Option<String>) -> Option<&'static str> {
+    let entrypoint = env("CLAUDE_CODE_ENTRYPOINT").unwrap_or_default();
+    if entrypoint == "t3-code" || env("T3CODE_THREAD_ID").is_some() {
+        Some("t3-code")
+    } else if entrypoint == "orca" || env("ORCA_PANE_KEY").is_some() {
+        Some("orca")
+    } else if entrypoint == "cli" {
+        Some("terminal")
+    } else {
+        None
+    }
+}
+
+/// Only known Hosts are stored; anything else from the hook payload is dropped.
+fn normalize_host(raw: &str) -> Option<&'static str> {
+    ["t3-code", "orca", "terminal"]
+        .into_iter()
+        .find(|h| *h == raw)
+}
+
 fn extract_session_id(payload: &Value, project_id: &str) -> String {
     payload
         .get("session_id")
@@ -342,6 +372,28 @@ fn format_context_injection(client: &str, event_name: &str, context: &str, count
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detects_host_from_inherited_environment() {
+        let host = |vars: &[(&str, &str)]| {
+            let vars: Vec<(String, String)> = vars
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            detect_host(|key| vars.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone()))
+        };
+        assert_eq!(
+            host(&[("CLAUDE_CODE_ENTRYPOINT", "t3-code")]),
+            Some("t3-code")
+        );
+        // Codex launched by T3 Code has no Claude entrypoint, only the thread id.
+        assert_eq!(host(&[("T3CODE_THREAD_ID", "thr_1")]), Some("t3-code"));
+        assert_eq!(host(&[("CLAUDE_CODE_ENTRYPOINT", "orca")]), Some("orca"));
+        assert_eq!(host(&[("ORCA_PANE_KEY", "pane-3")]), Some("orca"));
+        assert_eq!(host(&[("CLAUDE_CODE_ENTRYPOINT", "cli")]), Some("terminal"));
+        assert_eq!(host(&[("CLAUDE_CODE_ENTRYPOINT", "sdk-ts")]), None);
+        assert_eq!(host(&[]), None);
+    }
     use crate::distill::spawn_distill_worker;
     use crate::llm::MemoryLlmClient;
     use crate::models::NewMemoryInput;

@@ -171,11 +171,17 @@ fn main() -> Result<()> {
 fn run_hook_fast(client: &str, event: Option<&str>, port: u16) -> Result<()> {
     let mut stdin_buf = String::new();
     let _ = io::stdin().read_to_string(&mut stdin_buf);
-    let payload: Value = if stdin_buf.trim().is_empty() {
+    let mut payload: Value = if stdin_buf.trim().is_empty() {
         json!({})
     } else {
         serde_json::from_str(&stdin_buf).unwrap_or_else(|_| json!({ "raw": stdin_buf }))
     };
+    if let (Some(host), Some(obj)) = (
+        ox1_memory::hooks::detect_host(|k| std::env::var(k).ok()),
+        payload.as_object_mut(),
+    ) {
+        obj.insert("ox1_host".into(), host.into());
+    }
 
     let url = match event {
         Some(ev) if !ev.is_empty() => {
