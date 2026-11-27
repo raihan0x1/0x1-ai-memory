@@ -979,7 +979,7 @@ export function EnginePage({
                     disabled={autoCheckBusy || saving || !settings}
                     onChange={(e) => void handleAutoUpdateToggle(e.target.checked)}
                   />
-                  <span>Automatically check for updates every 6 hours</span>
+                  <span>Automatically check for updates every 30 minutes</span>
                 </label>
                 {daemon.autostart.supported ? (
                   <label className="rim-check-label" htmlFor="eng-autostart">

@@ -172,7 +172,9 @@ interface UpdateModalProps {
   open: boolean;
   status: UpdateStatusResponse | null;
   daemon: DaemonInfo | null;
+  autoTriggered?: boolean;
   onClose: () => void;
+  onDismissVersion?: (version: string) => void;
   onStatusChange: (next: UpdateStatusResponse) => void;
 }
 
@@ -180,7 +182,9 @@ export function UpdateModal({
   open,
   status,
   daemon,
+  autoTriggered = false,
   onClose,
+  onDismissVersion,
   onStatusChange,
 }: UpdateModalProps) {
   const [starting, setStarting] = useState(false);
@@ -304,18 +308,64 @@ export function UpdateModal({
   const failedPostSwap = lastProgressStageRef.current === 'restarting';
   const currentStep = stageToStep(activeStage, reconnecting);
   const lockClose = isUpdating && !reconnectTimedOut && !errMessage;
+  const modalTitle = autoTriggered
+    ? `New update available: v${release.version}`
+    : `Update Daemon to v${release.version}`;
+  const showSkipVersion = Boolean(
+    autoTriggered && onDismissVersion && !errMessage && !reconnectTimedOut,
+  );
+  const closeLabel = showSkipVersion ? 'Later' : 'Close';
+  const startLabel = errMessage ? 'Retry update' : 'Update & restart Daemon';
+
+  let primaryAction: ReactNode = null;
+  if (reconnectTimedOut) {
+    primaryAction = (
+      <button
+        type="button"
+        className="btn btn-primary"
+        onClick={() => {
+          setReconnectTimedOut(false);
+          setReconnecting(true);
+        }}
+      >
+        Retry reconnect
+      </button>
+    );
+  } else if (status.capability.supported) {
+    primaryAction = (
+      <button
+        type="button"
+        className="btn btn-primary"
+        onClick={() => void handleStartUpdate()}
+      >
+        {startLabel}
+      </button>
+    );
+  }
 
   return (
     <ModalDialog
       open={open}
-      title={`Update Daemon to v${release.version}`}
+      title={modalTitle}
       preventClose={lockClose}
       onClose={onClose}
       footer={
         lockClose ? undefined : (
           <>
+            {showSkipVersion ? (
+              <button
+                type="button"
+                className="btn-subtle"
+                onClick={() => {
+                  onDismissVersion?.(release.version);
+                  onClose();
+                }}
+              >
+                Skip v{release.version}
+              </button>
+            ) : null}
             <button type="button" className="btn" onClick={onClose}>
-              Close
+              {closeLabel}
             </button>
             {releaseHref ? (
               <a
@@ -327,26 +377,7 @@ export function UpdateModal({
                 View on GitHub
               </a>
             ) : null}
-            {reconnectTimedOut ? (
-              <button
-                type="button"
-                className="btn btn-primary"
-                onClick={() => {
-                  setReconnectTimedOut(false);
-                  setReconnecting(true);
-                }}
-              >
-                Retry reconnect
-              </button>
-            ) : status.capability.supported ? (
-              <button
-                type="button"
-                className="btn btn-primary"
-                onClick={() => void handleStartUpdate()}
-              >
-                {errMessage ? 'Retry update' : 'Update & restart Daemon'}
-              </button>
-            ) : null}
+            {primaryAction}
           </>
         )
       }

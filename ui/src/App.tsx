@@ -18,6 +18,8 @@ import type {
 
 export type Tab = 'stream' | 'memories' | 'connections' | 'engine' | 'onboarding';
 
+const UPDATE_PROMPTED_STORAGE_KEY = 'ox1_update_prompted_version';
+
 const TAB_TITLES: Record<Tab, string> = {
   stream: 'Live Stream | AI Memory',
   memories: 'Memories | AI Memory',
@@ -54,10 +56,14 @@ export function App() {
   const [daemonStopped, setDaemonStopped] = useState(false);
   const [checkedOnboardingRedirect, setCheckedOnboardingRedirect] = useState(false);
   const [updateModalOpen, setUpdateModalOpen] = useState(false);
+  const [updateModalAuto, setUpdateModalAuto] = useState(false);
   const [whatsNewOpen, setWhatsNewOpen] = useState(false);
   const [whatsNewAuto, setWhatsNewAuto] = useState(false);
 
   const whatsNewAutoHandledRef = useRef(false);
+  const updateAutoPromptedRef = useRef<string | null>(null);
+  const updateModalOpenRef = useRef(updateModalOpen);
+  updateModalOpenRef.current = updateModalOpen;
 
   const setTab = useCallback(
     (next: Tab, replace = false, queryParams?: Record<string, string>) => {
@@ -137,6 +143,34 @@ export function App() {
       setWhatsNewOpen(true);
     }
   }, [tab, updateStatus]);
+
+  useEffect(() => {
+    if (tab === 'onboarding' || whatsNewOpen || updateStatus?.whats_new.should_show) {
+      return;
+    }
+    if (!updateStatus?.update_available || !updateStatus.latest_release) {
+      return;
+    }
+    const latestVer = updateStatus.latest_release.version;
+    if (updateStatus.dismissed_version === latestVer) {
+      return;
+    }
+    if (updateModalOpenRef.current || updateAutoPromptedRef.current === latestVer) {
+      return;
+    }
+    try {
+      if (window.localStorage.getItem(UPDATE_PROMPTED_STORAGE_KEY) === latestVer) {
+        updateAutoPromptedRef.current = latestVer;
+        return;
+      }
+      window.localStorage.setItem(UPDATE_PROMPTED_STORAGE_KEY, latestVer);
+    } catch {
+      // Ignore storage failures in private browsing or restricted contexts
+    }
+    updateAutoPromptedRef.current = latestVer;
+    setUpdateModalAuto(true);
+    setUpdateModalOpen(true);
+  }, [tab, updateStatus, whatsNewOpen]);
 
   useEffect(() => {
     void refresh();
@@ -436,7 +470,10 @@ export function App() {
                   <button
                     type="button"
                     className="topbar-update-btn"
-                    onClick={() => setUpdateModalOpen(true)}
+                    onClick={() => {
+                      setUpdateModalAuto(false);
+                      setUpdateModalOpen(true);
+                    }}
                   >
                     Update v{updateStatus.latest_release.version}
                   </button>
@@ -526,7 +563,10 @@ export function App() {
               daemonLoading={loading}
               updateStatus={updateStatus}
               onCheckUpdates={handleCheckUpdates}
-              onOpenUpdateModal={() => setUpdateModalOpen(true)}
+              onOpenUpdateModal={() => {
+                setUpdateModalAuto(false);
+                setUpdateModalOpen(true);
+              }}
               onOpenWhatsNew={() => void handleOpenWhatsNew()}
               onSaved={refresh}
               onDaemonStopped={() => {
@@ -544,7 +584,14 @@ export function App() {
         open={updateModalOpen}
         status={updateStatus}
         daemon={daemon}
+        autoTriggered={updateModalAuto}
         onClose={() => setUpdateModalOpen(false)}
+        onDismissVersion={(ver) => {
+          void api
+            .dismissUpdate(ver)
+            .then(setUpdateStatus)
+            .catch(() => undefined);
+        }}
         onStatusChange={setUpdateStatus}
       />
 

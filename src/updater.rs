@@ -18,7 +18,7 @@ pub const GITHUB_REPO: &str = "raihan0x1/0x1-ai-memory";
 pub const DEFAULT_GITHUB_API_BASE: &str = "https://api.github.com";
 pub const DEFAULT_GITHUB_RELEASES_BASE: &str =
     "https://github.com/raihan0x1/0x1-ai-memory/releases/download";
-pub const UPDATE_CHECK_INTERVAL_SECS: i64 = 6 * 3600;
+pub const UPDATE_CHECK_INTERVAL_SECS: i64 = 30 * 60;
 
 const META_LAST_SEEN_VERSION: &str = "last_seen_version";
 const META_PREVIOUS_VERSION: &str = "previous_version";
@@ -1289,5 +1289,33 @@ mod tests {
         assert!(npx.supported);
         assert_eq!(npx.install_kind, "npx");
         assert!(npx.manual_command.contains("npx"));
+    }
+
+    #[test]
+    fn check_interval_is_thirty_minutes_and_delay_stays_bounded() {
+        assert_eq!(UPDATE_CHECK_INTERVAL_SECS, 1_800);
+        let tmp = tempdir().unwrap();
+        let db = MemoryDb::open_in_memory().unwrap();
+        let (shutdown_tx, _) = watch::channel(false);
+        let (events_tx, _) = broadcast::channel(8);
+        let mgr = UpdateManager::new(
+            db.clone(),
+            tmp.path().join("0x1-memory"),
+            tmp.path().to_path_buf(),
+            tmp.path().join("daemon.log"),
+            10101,
+            shutdown_tx,
+            events_tx,
+        );
+        assert_eq!(mgr.next_check_delay_secs(), 1_800);
+
+        let five_min_ago = (Utc::now() - chrono::Duration::minutes(5)).to_rfc3339();
+        db.set_meta(META_LAST_CHECKED_AT, &five_min_ago).unwrap();
+        let remaining = mgr.next_check_delay_secs();
+        assert!((1_490..=1_505).contains(&remaining), "got {remaining}");
+
+        let stale = (Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+        db.set_meta(META_LAST_CHECKED_AT, &stale).unwrap();
+        assert_eq!(mgr.next_check_delay_secs(), 60);
     }
 }
