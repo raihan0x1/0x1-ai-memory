@@ -1923,3 +1923,208 @@ impl TmpPathHelper for tempfile::TempDir {
         self.path().join("daemon.log")
     }
 }
+
+#[tokio::test]
+async fn distillation_sends_every_event_once_and_guards_supersede() {
+    use axum::{Router, extract::Request as AxumRequest, routing::post};
+    use std::sync::{Arc, Mutex};
+
+    // Mock LLM records every user prompt and supersedes whichever memory id the test sets.
+    let prompts = Arc::new(Mutex::new(Vec::<String>::new()));
+    let supersede = Arc::new(Mutex::new(None::<String>));
+    let (prompts_srv, supersede_srv) = (prompts.clone(), supersede.clone());
+    let mock_router = Router::new().route(
+        "/v1/chat/completions",
+        post(move |req: AxumRequest| {
+            let (prompts_srv, supersede_srv) = (prompts_srv.clone(), supersede_srv.clone());
+            async move {
+                let bytes = req.into_body().collect().await.unwrap().to_bytes();
+                let payload: Value = serde_json::from_slice(&bytes).unwrap_or_default();
+                let user = payload["messages"][1]["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                prompts_srv.lock().unwrap().push(user);
+                let content = json!({"memories": [{
+                    "scope": "project",
+                    "type": "decision",
+                    "title": "Batch decision",
+                    "summary": "A decision from this batch",
+                    "content": "Details of the batch decision.",
+                    "supersedes_id": supersede_srv.lock().unwrap().clone()
+                }]});
+                axum::Json(json!({
+                    "choices": [{ "message": { "content": content.to_string() } }],
+                    "usage": { "prompt_tokens": 12, "completion_tokens": 4, "cost": 0.0 }
+                }))
+            }
+        }),
+    );
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+    let mock_task = tokio::spawn(async move {
+        let _ = axum::serve(mock_listener, mock_router).await;
+    });
+
+    let tmp = tempdir().unwrap();
+    let repo_a = tmp.path().join("repo-a");
+    let repo_b = tmp.path().join("repo-b");
+    tokio::fs::create_dir_all(&repo_a).await.unwrap();
+    tokio::fs::create_dir_all(&repo_b).await.unwrap();
+    let state = test_state(tmp.path());
+    let app = build_router(state.clone());
+    let mut settings = state.db.get_settings().unwrap();
+    settings.provider = "openai_compatible".into();
+    settings.base_url = format!("http://{mock_addr}/v1");
+    settings.model = "mock-model".into();
+    state.db.save_settings(&settings).unwrap();
+
+    let post_tool = |marker: String| {
+        let app = app.clone();
+        let cwd = repo_a.to_string_lossy().to_string();
+        async move {
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/hooks/claude?event=PostToolUse")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            json!({
+                                "cwd": cwd,
+                                "session_id": "batch-sess",
+                                "tool_name": "Bash",
+                                "tool_input": { "command": format!("echo {marker}") },
+                                "tool_response": "x".repeat(1_500)
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+    };
+    let pending = || {
+        let app = app.clone();
+        async move {
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/sessions?limit=10")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            body_json(resp).await["sessions"][0]["pending_events"]
+                .as_i64()
+                .unwrap()
+        }
+    };
+
+    // 1. More events than fit one prompt: every event reaches the model exactly once.
+    let markers: Vec<String> = (0..40).map(|i| format!("EVT-{i:02}-END")).collect();
+    for m in &markers {
+        post_tool(m.clone()).await;
+    }
+    let project_a = ox1_memory::project::resolve_project(&repo_a).id;
+    let sess = state
+        .db
+        .upsert_session(&project_a, "claude-code", "batch-sess", None)
+        .unwrap();
+    for _ in 0..40 {
+        if pending().await == 0 {
+            break;
+        }
+        distill_session_once(
+            &state.db,
+            &state.embedder,
+            &state.llm,
+            &state.events_tx,
+            &sess.id,
+        )
+        .await;
+    }
+    assert_eq!(pending().await, 0);
+    let sent = prompts.lock().unwrap().clone();
+    assert!(
+        sent.len() > 1,
+        "40 large events fit {} prompt(s)",
+        sent.len()
+    );
+    for m in &markers {
+        let hits = sent.iter().filter(|p| p.contains(m.as_str())).count();
+        assert_eq!(hits, 1, "{m} reached the model {hits} times");
+    }
+
+    // 2. Supersede only replaces an active memory in the same project and scope.
+    let create = |body: Value| {
+        let app = app.clone();
+        async move {
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/memories")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            body_json(resp).await["memory"]["id"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        }
+    };
+    let status_of = |id: String| {
+        let app = app.clone();
+        async move {
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/api/memories/{id}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            body_json(resp).await["memory"]["status"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        }
+    };
+    let project_b = ox1_memory::project::resolve_project(&repo_b).id;
+    let memory = |project: &str, status: &str, title: &str| {
+        json!({
+            "scope": "project", "project_id": project, "status": status,
+            "memory_type": "decision", "title": title,
+            "summary": "s", "content": "c"
+        })
+    };
+    let pinned = create(memory(&project_a, "pinned", "Pinned rule")).await;
+    let other_project = create(memory(&project_b, "active", "Other project rule")).await;
+    let replaceable = create(memory(&project_a, "active", "Old rule")).await;
+
+    for target in [&pinned, &other_project, &replaceable] {
+        *supersede.lock().unwrap() = Some(target.clone());
+        post_tool(format!("supersede {target}")).await;
+        distill_session_once(
+            &state.db,
+            &state.embedder,
+            &state.llm,
+            &state.events_tx,
+            &sess.id,
+        )
+        .await;
+    }
+    assert_eq!(status_of(pinned).await, "pinned");
+    assert_eq!(status_of(other_project).await, "active");
+    assert_eq!(status_of(replaceable).await, "superseded");
+
+    mock_task.abort();
+}

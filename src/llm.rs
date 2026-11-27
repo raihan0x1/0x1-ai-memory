@@ -469,6 +469,26 @@ struct RawCompletion {
     cost_usd: f64,
 }
 
+/// Renders the prompt's event lines and returns how many leading events it included,
+/// so the caller marks only those as distilled and leaves the rest pending.
+pub fn distill_events_block(events: &[RawEvent]) -> (String, usize) {
+    let mut block = String::new();
+    let mut included = 0;
+    for ev in events.iter().take(30) {
+        let tool = ev.tool_name.as_deref().unwrap_or("-");
+        let snippet = truncate_head_tail(&redact_secrets(&ev.payload_json), 900);
+        block.push_str(&format!(
+            "[{} | tool:{}] {}\n",
+            ev.event_type, tool, snippet
+        ));
+        included += 1;
+        if block.len() > 7_500 {
+            break;
+        }
+    }
+    (block, included)
+}
+
 fn build_distill_prompts(
     project_name: &str,
     source_client: &str,
@@ -497,18 +517,7 @@ Respond ONLY with valid JSON matching:
         ));
     }
 
-    let mut events_block = String::new();
-    for ev in events.iter().take(30) {
-        let tool = ev.tool_name.as_deref().unwrap_or("-");
-        let snippet = truncate_head_tail(&redact_secrets(&ev.payload_json), 900);
-        events_block.push_str(&format!(
-            "[{} | tool:{}] {}\n",
-            ev.event_type, tool, snippet
-        ));
-        if events_block.len() > 7_500 {
-            break;
-        }
-    }
+    let (events_block, _) = distill_events_block(events);
 
     let user = format!(
         "Project: {project_name}\nSource AI client: {source_client}\n\nExisting recent memories (avoid duplicates; set supersedes_id if replaced):\n{}\nTurn events:\n{}",

@@ -780,10 +780,12 @@ impl MemoryDb {
         if let Some(old_id) = input.supersedes_id.as_deref()
             && !old_id.trim().is_empty()
         {
+            // Only an active memory in the same scope and project can be replaced.
             tx.execute(
-                    "UPDATE memories SET status = 'superseded', superseded_by = ?2, updated_at = ?3 WHERE id = ?1",
-                    params![old_id, id, now],
-                )?;
+                "UPDATE memories SET status = 'superseded', superseded_by = ?2, updated_at = ?3
+                 WHERE id = ?1 AND status = 'active' AND scope = ?4 AND project_id IS ?5",
+                params![old_id, id, now, scope, project_id],
+            )?;
         }
 
         tx.commit()?;

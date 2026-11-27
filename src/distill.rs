@@ -1,6 +1,6 @@
 use crate::db::MemoryDb;
 use crate::embed::Embedder;
-use crate::llm::MemoryLlmClient;
+use crate::llm::{MemoryLlmClient, distill_events_block};
 use crate::models::{NewMemoryInput, SearchFilter, StreamEvent};
 use crate::scrub::redact_secrets;
 use chrono::Utc;
@@ -126,6 +126,10 @@ pub async fn distill_session_once(
         return;
     }
 
+    // Send only what fits one prompt; the rest stays pending for the next pass.
+    let sent = distill_events_block(&events).1;
+    let (events, event_ids) = (&events[..sent], &event_ids[..sent]);
+
     let existing_recent = db
         .search_memories(
             &SearchFilter {
@@ -142,7 +146,7 @@ pub async fn distill_session_once(
             &settings,
             &project.name,
             &source_client,
-            &events,
+            events,
             &existing_recent,
         )
         .await
@@ -168,7 +172,7 @@ pub async fn distill_session_once(
                 "ok",
                 None,
             );
-            let _ = db.mark_events_distilled(&event_ids);
+            let _ = db.mark_events_distilled(event_ids);
 
             for item in memories.into_iter().take(3) {
                 if item.title.trim().is_empty() || item.summary.trim().is_empty() {
@@ -231,7 +235,7 @@ pub async fn distill_session_once(
                 "error",
                 Some(&msg),
             );
-            let _ = db.mark_events_distilled(&event_ids);
+            let _ = db.mark_events_distilled(event_ids);
             let _ = events_tx.send(StreamEvent {
                 kind: "usage_recorded".into(),
                 timestamp: Utc::now().to_rfc3339(),
