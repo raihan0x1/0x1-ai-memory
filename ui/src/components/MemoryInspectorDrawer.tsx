@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { api, formatUtcTime } from '../api';
+import { api, formatLocalTime, formatUtcTime } from '../api';
 import {
   IconClose,
   IconFile,
@@ -485,8 +485,8 @@ export function MemoryInspectorDrawer({
           {mem ? (
             <div className="tag-row">
               <span className="field-hint measure">{mem.id}</span>
-              <span className="field-hint measure">
-                Updated {formatUtcTime(mem.updated_at)}
+              <span className="field-hint measure" title={formatUtcTime(mem.updated_at)}>
+                Updated {formatLocalTime(mem.updated_at)}
               </span>
               <span className="field-hint measure">
                 {mem.recall_count > 0
@@ -686,8 +686,8 @@ export function MemoryInspectorDrawer({
                                 {item.title}
                               </div>
                             </div>
-                            <span className="field-hint measure">
-                              {formatUtcTime(item.updated_at)}
+                            <span className="field-hint measure" title={formatUtcTime(item.updated_at)}>
+                              {formatLocalTime(item.updated_at)}
                             </span>
                           </button>
                         ))}
@@ -721,8 +721,8 @@ export function MemoryInspectorDrawer({
                                 {item.title}
                               </div>
                             </div>
-                            <span className="field-hint measure">
-                              {formatUtcTime(item.updated_at)}
+                            <span className="field-hint measure" title={formatUtcTime(item.updated_at)}>
+                              {formatLocalTime(item.updated_at)}
                             </span>
                           </button>
                         ))}

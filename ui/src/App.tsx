@@ -459,10 +459,6 @@ export function App() {
                 <span className="topbar-sep" aria-hidden="true" />
               </>
             ) : null}
-            <span className="measure" title="Recorded cost today (UTC)">
-              ${(summary?.today_cost_usd ?? 0).toFixed(4)} USD
-            </span>
-            <span className="topbar-sep" aria-hidden="true" />
             <span className="telemetry-status" role="status">
               <span
                 className={`signal-square${sseConnected ? '' : ' signal-square--offline'}`}

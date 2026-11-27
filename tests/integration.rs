@@ -3430,3 +3430,65 @@ async fn recent_sort_orders_by_recency_without_pin_priority() {
     assert_eq!(d_mems[0]["id"], older_pinned);
     assert_eq!(d_mems[1]["id"], newer_active);
 }
+
+#[tokio::test]
+async fn usage_summary_counts_only_today_via_range_predicate() {
+    let tmp = tempdir().unwrap();
+    let state = test_state(tmp.path());
+    let app = build_router(state.clone());
+
+    state
+        .db
+        .record_usage(
+            "openai_compatible",
+            "m-old",
+            "distill",
+            500,
+            100,
+            0.25,
+            None,
+            "ok",
+            None,
+        )
+        .unwrap();
+    state
+        .db
+        .record_usage(
+            "openai_compatible",
+            "m-now",
+            "distill",
+            120,
+            30,
+            0.05,
+            None,
+            "ok",
+            None,
+        )
+        .unwrap();
+
+    let raw = rusqlite::Connection::open(tmp.path().join("memory.db")).unwrap();
+    let yesterday = (chrono::Utc::now() - chrono::Duration::days(1)).to_rfc3339();
+    raw.execute(
+        "UPDATE usage_ledger SET created_at = ?1 WHERE model = 'm-old'",
+        rusqlite::params![yesterday],
+    )
+    .unwrap();
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/summary")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let summary = body_json(resp).await;
+    assert_eq!(summary["today_input_tokens"], 120, "{summary}");
+    assert_eq!(summary["today_output_tokens"], 30, "{summary}");
+    assert_eq!(summary["today_total_tokens"], 150, "{summary}");
+    assert_eq!(summary["today_calls"], 1, "{summary}");
+    let cost = summary["today_cost_usd"].as_f64().unwrap();
+    assert!((cost - 0.05).abs() < 1e-6, "{cost}");
+}

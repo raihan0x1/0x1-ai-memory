@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { api, DEFAULT_DAEMON_PORT, formatUtcTime } from '../api';
+import { api, DEFAULT_DAEMON_PORT, formatLocalTime, formatUtcTime } from '../api';
 import { ModalDialog } from '../components/ModalDialog';
 import type { ClientConnection, ConnectionPreview, UniversalMcpSnippets } from '../types';
 
@@ -187,11 +187,17 @@ export function ConnectionsPage({
                 ) : null}
 
                 <div className="stack-sm" style={{ gap: 'var(--space-2xs)' }}>
-                  <span className="field-hint measure">
-                    Heartbeat: {formatUtcTime(c.last_heartbeat_at)}
+                  <span
+                    className="field-hint measure"
+                    title={c.last_heartbeat_at ? formatUtcTime(c.last_heartbeat_at) : undefined}
+                  >
+                    Heartbeat: {formatLocalTime(c.last_heartbeat_at)}
                   </span>
-                  <span className="field-hint measure">
-                    Last event: {formatUtcTime(c.last_event_at)}
+                  <span
+                    className="field-hint measure"
+                    title={c.last_event_at ? formatUtcTime(c.last_event_at) : undefined}
+                  >
+                    Last event: {formatLocalTime(c.last_event_at)}
                   </span>
                 </div>
 

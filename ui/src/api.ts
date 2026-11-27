@@ -193,11 +193,19 @@ export const api = {
   fetchWhatsNew: () => req<UpdateStatusResponse>('/api/updates/fetch-whats-new', { method: 'POST' }),
 };
 
-/** Exact UTC timestamp (Rim rule: never a bare time without zone). */
+function parseUtcDate(iso: string): Date | null {
+  const trimmed = iso.trim();
+  const hasZone = /([zZ]|[+-]\d{2}:?\d{2})$/.test(trimmed);
+  const normalized = hasZone ? trimmed : `${trimmed.replace(' ', 'T')}Z`;
+  const d = new Date(normalized);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+/** Exact UTC timestamp for tooltip details alongside local timestamps. */
 export function formatUtcTime(iso: string | null | undefined): string {
   if (!iso) return 'none';
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return iso;
+  const d = parseUtcDate(iso);
+  if (!d) return iso;
   const yyyy = d.getUTCFullYear();
   const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
   const dd = String(d.getUTCDate()).padStart(2, '0');
@@ -207,34 +215,50 @@ export function formatUtcTime(iso: string | null | undefined): string {
   return `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss} UTC`;
 }
 
-/** Short UTC HH:MM:SS UTC clock for compact live stream tails. */
-export function formatUtcClock(iso: string | null | undefined): string {
-  if (!iso) return '--:--:-- UTC';
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return iso;
-  const hh = String(d.getUTCHours()).padStart(2, '0');
-  const mi = String(d.getUTCMinutes()).padStart(2, '0');
-  const ss = String(d.getUTCSeconds()).padStart(2, '0');
-  return `${hh}:${mi}:${ss} UTC`;
+function localDayKey(d: Date): string {
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}`;
 }
 
-/** UTC calendar day label (`Today · YYYY-MM-DD UTC`, `Yesterday`, or `YYYY-MM-DD UTC`). */
-export function formatUtcDayLabel(iso: string): string {
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return 'Unknown date';
-  const key = d.toISOString().slice(0, 10);
+/** Local timestamp (`YYYY-MM-DD HH:MM:SS`). */
+export function formatLocalTime(iso: string | null | undefined): string {
+  if (!iso) return 'none';
+  const d = parseUtcDate(iso);
+  if (!d) return iso;
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mi = String(d.getMinutes()).padStart(2, '0');
+  const ss = String(d.getSeconds()).padStart(2, '0');
+  return `${localDayKey(d)} ${hh}:${mi}:${ss}`;
+}
+
+/** Short local `HH:MM:SS` clock for compact live stream tails and session rows. */
+export function formatLocalClock(iso: string | null | undefined): string {
+  if (!iso) return '--:--:--';
+  const d = parseUtcDate(iso);
+  if (!d) return iso;
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mi = String(d.getMinutes()).padStart(2, '0');
+  const ss = String(d.getSeconds()).padStart(2, '0');
+  return `${hh}:${mi}:${ss}`;
+}
+
+/** Local calendar day label (`Today · YYYY-MM-DD`, `Yesterday · YYYY-MM-DD`, or `YYYY-MM-DD`). */
+export function formatLocalDayLabel(iso: string): string {
+  const d = parseUtcDate(iso);
+  if (!d) return 'Unknown date';
+  const key = localDayKey(d);
   const now = new Date();
-  const todayKey = now.toISOString().slice(0, 10);
-  const yest = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - 1))
-    .toISOString()
-    .slice(0, 10);
-  if (key === todayKey) return `Today · ${key} UTC`;
-  if (key === yest) return `Yesterday · ${key} UTC`;
-  return `${key} UTC`;
+  const todayKey = localDayKey(now);
+  const yest = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
+  const yestKey = localDayKey(yest);
+  if (key === todayKey) return `Today · ${key}`;
+  if (key === yestKey) return `Yesterday · ${key}`;
+  return key;
 }
 
-export function formatUtcDayKey(iso: string): string {
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return 'unknown';
-  return d.toISOString().slice(0, 10);
+export function formatLocalDayKey(iso: string): string {
+  const d = parseUtcDate(iso);
+  return d ? localDayKey(d) : 'unknown';
 }

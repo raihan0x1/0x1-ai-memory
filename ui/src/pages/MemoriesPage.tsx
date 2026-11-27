@@ -1,5 +1,5 @@
 import { useEffect, useId, useMemo, useState } from 'react';
-import { api, formatUtcTime } from '../api';
+import { api, formatLocalTime, formatUtcTime } from '../api';
 import { BriefingPreviewModal } from '../components/BriefingPreviewModal';
 import {
   IconChevronDown,
@@ -658,8 +658,12 @@ export function MemoriesPage({ projects, onChanged }: MemoriesPageProps) {
                                 </div>
 
                                 <div className="ledger-aside">
-                                  <time className="field-hint measure" dateTime={m.updated_at}>
-                                    {formatUtcTime(m.updated_at)}
+                                  <time
+                                    className="field-hint measure"
+                                    dateTime={m.updated_at}
+                                    title={formatUtcTime(m.updated_at)}
+                                  >
+                                    {formatLocalTime(m.updated_at)}
                                   </time>
                                   <div className="tag-row">
                                     <button

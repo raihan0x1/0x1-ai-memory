@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
-import { api, formatUtcTime } from '../api';
+import { api, formatLocalTime, formatUtcTime } from '../api';
 import { ModalDialog } from '../components/ModalDialog';
 import { PaginationBar } from '../components/PaginationBar';
 import { RimSelect } from '../components/RimSelect';
@@ -803,7 +803,7 @@ export function EnginePage({
             <table>
               <thead>
                 <tr>
-                  <th>Time (UTC)</th>
+                  <th>Time</th>
                   <th>Provider</th>
                   <th>Model</th>
                   <th>Operation</th>
@@ -815,7 +815,9 @@ export function EnginePage({
               <tbody>
                 {usage.map((u) => (
                   <tr key={u.id}>
-                    <td className="measure">{formatUtcTime(u.created_at)}</td>
+                    <td className="measure" title={formatUtcTime(u.created_at)}>
+                      <time dateTime={u.created_at}>{formatLocalTime(u.created_at)}</time>
+                    </td>
                     <td className="measure">{u.provider}</td>
                     <td className="measure">{u.model || 'none'}</td>
                     <td>{u.operation}</td>
@@ -928,8 +930,15 @@ export function EnginePage({
                 </div>
                 <div className="daemon-meta-item">
                   <span className="field-hint">Last release check</span>
-                  <span className="measure">
-                    {formatUtcTime(updateStatus?.last_checked_at)}
+                  <span
+                    className="measure"
+                    title={
+                      updateStatus?.last_checked_at
+                        ? formatUtcTime(updateStatus.last_checked_at)
+                        : undefined
+                    }
+                  >
+                    {formatLocalTime(updateStatus?.last_checked_at)}
                   </span>
                 </div>
               </div>

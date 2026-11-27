@@ -1649,7 +1649,9 @@ impl MemoryDb {
         embedding_status: String,
     ) -> Result<UsageSummary> {
         let conn = self.conn.lock().unwrap();
-        let today_prefix = format!("{}%", Utc::now().format("%Y-%m-%d"));
+        let today = Utc::now().date_naive();
+        let start = format!("{today}T00:00:00");
+        let end = format!("{}T00:00:00", today + chrono::Duration::days(1));
         let (in_tok, out_tok, cost, calls, blocked): (i64, i64, f64, i64, i64) = conn.query_row(
             "SELECT
                 COALESCE(SUM(input_tokens), 0),
@@ -1657,8 +1659,8 @@ impl MemoryDb {
                 COALESCE(SUM(estimated_cost_usd), 0.0),
                 COUNT(*),
                 COALESCE(SUM(CASE WHEN status = 'budget_blocked' THEN 1 ELSE 0 END), 0)
-             FROM usage_ledger WHERE created_at LIKE ?1",
-            params![today_prefix],
+             FROM usage_ledger WHERE created_at >= ?1 AND created_at < ?2",
+            params![start, end],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )?;
         let total_memories: i64 = conn.query_row(

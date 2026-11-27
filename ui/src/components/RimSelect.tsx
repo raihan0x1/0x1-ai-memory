@@ -260,7 +260,16 @@ export function RimSelect({
               onMouseEnter={() => setActiveIndex(idx)}
               onMouseDown={(e) => {
                 e.preventDefault();
+              }}
+              onClick={() => {
                 commit(idx);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  commit(idx);
+                }
               }}
             >
               <span className="rim-select-opt-mark" aria-hidden="true">

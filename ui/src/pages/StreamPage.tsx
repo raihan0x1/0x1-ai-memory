@@ -1,5 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
-import { api, formatUtcClock, formatUtcDayKey, formatUtcDayLabel, formatUtcTime } from '../api';
+import {
+  api,
+  formatLocalClock,
+  formatLocalDayKey,
+  formatLocalDayLabel,
+  formatLocalTime,
+  formatUtcTime,
+} from '../api';
 import {
   IconBolt,
   IconChevronDown,
@@ -172,7 +179,12 @@ export function StreamPage({
   const [tailError, setTailError] = useState<string | null>(null);
   const [tailOlderLoaded, setTailOlderLoaded] = useState(false);
 
-  const [actionError, setActionError] = useState<string | null>(null);
+  const [actionNotice, setActionNotice] = useState<{ kind: 'ok' | 'danger'; text: string } | null>(
+    null,
+  );
+  const [pendingPauseProject, setPendingPauseProject] = useState<Project | null>(null);
+  const [privacyBusy, setPrivacyBusy] = useState(false);
+  const cancelPauseRef = useRef<HTMLButtonElement | null>(null);
   const [distillingId, setDistillingId] = useState<string | null>(null);
   const [flushing, setFlushing] = useState(false);
   const [tailFilter, setTailFilter] = useState<TailFilter>('signal');
@@ -398,13 +410,13 @@ export function StreamPage({
       let key: string;
       let label: string;
       if (groupMode === 'day') {
-        key = formatUtcDayKey(m.updated_at);
-        label = formatUtcDayLabel(m.updated_at);
+        key = formatLocalDayKey(m.updated_at);
+        label = formatLocalDayLabel(m.updated_at);
       } else {
         key = m.session_id || `manual_${m.source_client}`;
         const sess = m.session_id ? sessionMap.get(m.session_id) : undefined;
         label = sess
-          ? `${sess.source_client}${viaHost(sess.host)} · ${sess.project_name ?? 'project'}${sess.branch ? ` (${sess.branch})` : ''} · started ${formatUtcClock(sess.started_at)}`
+          ? `${sess.source_client}${viaHost(sess.host)} · ${sess.project_name ?? 'project'}${sess.branch ? ` (${sess.branch})` : ''} · started ${formatLocalClock(sess.started_at)}`
           : m.session_id
             ? `${m.source_client} · session ${m.session_id.slice(0, 12)}`
             : `Manual / MCP (${m.source_client})`;
@@ -475,27 +487,79 @@ export function StreamPage({
     }
   }
 
-  async function handlePrivacyChange(projectId: string, mode: string) {
-    await api.setProjectPrivacy(projectId, mode);
-    await onRefresh();
+  useEffect(() => {
+    if (actionNotice?.kind !== 'ok') return;
+    const t = window.setTimeout(() => setActionNotice(null), 4000);
+    return () => window.clearTimeout(t);
+  }, [actionNotice]);
+
+  useEffect(() => {
+    if (pendingPauseProject) {
+      cancelPauseRef.current?.focus();
+    }
+  }, [pendingPauseProject]);
+
+  async function applyPrivacyChange(project: Project, mode: string) {
+    setPrivacyBusy(true);
+    setActionNotice(null);
+    try {
+      await api.setProjectPrivacy(project.id, mode);
+      await onRefresh();
+      const label = PRIVACY_OPTIONS.find((o) => o.value === mode)?.label ?? mode;
+      setActionNotice({ kind: 'ok', text: `Privacy for ${project.name} set to ${label}.` });
+      if (mode === 'paused') setPendingPauseProject(null);
+    } catch (err) {
+      setActionNotice({
+        kind: 'danger',
+        text: err instanceof Error ? err.message : 'Failed to update project privacy',
+      });
+    } finally {
+      setPrivacyBusy(false);
+    }
+  }
+
+  function handlePrivacySelect(project: Project, mode: string) {
+    if (mode === project.privacy_mode) return;
+    if (mode === 'paused') {
+      setPendingPauseProject(project);
+      return;
+    }
+    void applyPrivacyChange(project, mode);
   }
 
   async function handleTogglePin(m: MemoryHit) {
     const nextStatus = m.status === 'pinned' ? 'active' : 'pinned';
-    await api.updateMemory(m.id, { status: nextStatus });
-    setMemHits((prev) => prev.map((hit) => (hit.id === m.id ? { ...hit, status: nextStatus } : hit)));
-    await onRefresh();
-    if (memPage === 1) await loadMemories();
+    setActionNotice(null);
+    try {
+      await api.updateMemory(m.id, { status: nextStatus });
+      setMemHits((prev) =>
+        prev.map((hit) => (hit.id === m.id ? { ...hit, status: nextStatus } : hit)),
+      );
+      await onRefresh();
+      if (memPage === 1) await loadMemories();
+      setActionNotice({
+        kind: 'ok',
+        text: `${nextStatus === 'pinned' ? 'Pinned' : 'Unpinned'} "${m.title}".`,
+      });
+    } catch (err) {
+      setActionNotice({
+        kind: 'danger',
+        text: err instanceof Error ? err.message : 'Failed to update pin state',
+      });
+    }
   }
 
   async function handleDistillSession(sid: string) {
     setDistillingId(sid);
-    setActionError(null);
+    setActionNotice(null);
     try {
       await api.distillSession(sid);
       await Promise.all([onRefresh(), loadSessions(), loadTail()]);
     } catch (err) {
-      setActionError(err instanceof Error ? err.message : 'Failed to queue distillation');
+      setActionNotice({
+        kind: 'danger',
+        text: err instanceof Error ? err.message : 'Failed to queue distillation',
+      });
     } finally {
       setDistillingId(null);
     }
@@ -503,12 +567,15 @@ export function StreamPage({
 
   async function handleFlushPending() {
     setFlushing(true);
-    setActionError(null);
+    setActionNotice(null);
     try {
       await api.distillFlush();
       await Promise.all([onRefresh(), loadSessions(), loadTail()]);
     } catch (err) {
-      setActionError(err instanceof Error ? err.message : 'Failed to flush pending events');
+      setActionNotice({
+        kind: 'danger',
+        text: err instanceof Error ? err.message : 'Failed to flush pending events',
+      });
     } finally {
       setFlushing(false);
     }
@@ -666,7 +733,7 @@ export function StreamPage({
               ariaLabel="Project privacy mode"
               value={activeProjectObj.privacy_mode}
               options={PRIVACY_OPTIONS}
-              onChange={(mode) => void handlePrivacyChange(activeProjectObj.id, mode)}
+              onChange={(mode) => handlePrivacySelect(activeProjectObj, mode)}
             />
           </div>
         ) : null}
@@ -682,6 +749,19 @@ export function StreamPage({
           {railVisible ? 'Hide pipeline' : 'Show pipeline'}
         </button>
       </div>
+
+      {actionNotice ? (
+        <div
+          className={`callout ${actionNotice.kind}`}
+          role={actionNotice.kind === 'danger' ? 'alert' : 'status'}
+          style={{ marginBottom: 'var(--space-md)' }}
+        >
+          <span>{actionNotice.text}</span>
+          <button type="button" className="btn-subtle" onClick={() => setActionNotice(null)}>
+            Dismiss
+          </button>
+        </div>
+      ) : null}
 
       <div className={railVisible ? 'stream-layout' : ''}>
         <section className="panel" aria-label="Recent cross-agent memories">
@@ -859,8 +939,12 @@ export function StreamPage({
                               </div>
 
                               <div className="ledger-aside">
-                                <time className="field-hint measure" dateTime={m.updated_at}>
-                                  {formatUtcTime(m.updated_at)}
+                                <time
+                                  className="field-hint measure"
+                                  dateTime={m.updated_at}
+                                  title={formatUtcTime(m.updated_at)}
+                                >
+                                  {formatLocalTime(m.updated_at)}
                                 </time>
                                 <div className="tag-row">
                                   <button
@@ -905,15 +989,6 @@ export function StreamPage({
 
         {railVisible ? (
           <aside className="stream-rail" aria-label="Live capture and distillation pipeline">
-            {actionError ? (
-              <div className="callout danger" role="alert">
-                <span>{actionError}</span>
-                <button type="button" className="btn-subtle" onClick={() => setActionError(null)}>
-                  Dismiss
-                </button>
-              </div>
-            ) : null}
-
             <section className="panel">
               <div className="panel-header">
                 <h2 className="panel-title">Sessions &amp; queue ({sessionsTotal})</h2>
@@ -998,7 +1073,13 @@ export function StreamPage({
                       <div className="session-row-meta">
                         <span className="field-hint measure">
                           {s.pending_events} queued · {s.memory_count} mem · started{' '}
-                          {formatUtcClock(s.started_at)} · last {formatUtcClock(s.last_turn_at)}
+                          <time dateTime={s.started_at} title={formatUtcTime(s.started_at)}>
+                            {formatLocalClock(s.started_at)}
+                          </time>{' '}
+                          · last{' '}
+                          <time dateTime={s.last_turn_at} title={formatUtcTime(s.last_turn_at)}>
+                            {formatLocalClock(s.last_turn_at)}
+                          </time>
                         </span>
                         {s.pending_events > 0 && !isZeroLlm ? (
                           <button
@@ -1146,8 +1227,12 @@ export function StreamPage({
                               {repeatCount > 1 ? ` x${repeatCount}` : ''}
                             </span>
                           </div>
-                          <time className="field-hint measure" dateTime={item.created_at}>
-                            {formatUtcClock(item.created_at)}
+                          <time
+                            className="field-hint measure"
+                            dateTime={item.created_at}
+                            title={formatUtcTime(item.created_at)}
+                          >
+                            {formatLocalClock(item.created_at)}
                           </time>
                         </div>
                         <span className="event-preview" title={item.preview}>
@@ -1296,6 +1381,45 @@ export function StreamPage({
             />
           </div>
         </form>
+      </ModalDialog>
+
+      <ModalDialog
+        open={Boolean(pendingPauseProject)}
+        title="Pause capture for this project?"
+        onClose={() => {
+          if (!privacyBusy) setPendingPauseProject(null);
+        }}
+        preventClose={privacyBusy}
+        footer={
+          <>
+            <button
+              ref={cancelPauseRef}
+              type="button"
+              className="btn"
+              disabled={privacyBusy}
+              onClick={() => setPendingPauseProject(null)}
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              className="btn btn-danger"
+              disabled={privacyBusy}
+              aria-busy={privacyBusy}
+              onClick={() => {
+                if (pendingPauseProject) void applyPrivacyChange(pendingPauseProject, 'paused');
+              }}
+            >
+              {privacyBusy ? 'Pausing...' : 'Pause project'}
+            </button>
+          </>
+        }
+      >
+        <p>
+          Stopping capture for <strong>{pendingPauseProject?.name}</strong> ignores new prompts,
+          tool activity, distillation, and Handoff for this project until you switch privacy back
+          to Full or Local-only.
+        </p>
       </ModalDialog>
     </div>
   );
