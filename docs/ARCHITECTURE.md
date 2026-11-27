@@ -22,6 +22,7 @@ Primary research backing every integration detail:
    - **Hard Invariant:** Never silently fall back to a user's Claude/Codex/Antigravity coding subscription when an API provider errors or hits rate limits. Distillation, API embeddings, and provider tests check recorded UTC-day usage before dispatch and record the attempt in `usage_ledger`. Each limit can be disabled with `0`. An in-flight call can exceed the threshold.
 4. **Ultra-Lean Progressive Disclosure Recall:**
    - `SessionStart` injects a compact **~300–500 token briefing** (pinned memories + 5–8 recent cross-AI headlines for this project + global user preferences).
+   - Every Briefing, prompt Recall and MCP `memory_search` result is time-anchored (`src/clock.rs`): a `Generated at <local time> UTC<offset>` line, and per memory its last-updated local time with its age relative to that moment, e.g. `19:06, 14m before this briefing`. Agents can then tell minutes ago from yesterday.
    - Exactly **5 compact MCP tools**: `memory_search`, `memory_get`, `memory_timeline`, `memory_save`, `memory_update`.
    - No intrusive `PreToolUse` File Read Gate.
 5. **Cross-Agent by Default & Clean Scoping:**

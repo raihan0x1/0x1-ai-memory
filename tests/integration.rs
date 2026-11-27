@@ -2287,3 +2287,145 @@ async fn legacy_client_names_are_normalized_and_t3_rows_removed_on_open() {
         .unwrap();
     assert_eq!(count, 0);
 }
+
+#[tokio::test]
+async fn briefing_recall_and_mcp_search_carry_generated_at_and_memory_ages() {
+    let tmp = tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    tokio::fs::create_dir_all(&repo).await.unwrap();
+    let state = test_state(tmp.path());
+    let app = build_router(state.clone());
+    let project = ox1_memory::project::resolve_project(&repo).id;
+    let call = |uri: &'static str, body: Value| {
+        let app = app.clone();
+        async move {
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+            body_json(resp).await
+        }
+    };
+    for (title, summary) in [
+        (
+            "Webhook retries use backoff",
+            "Retries back off exponentially",
+        ),
+        (
+            "Webhook signatures are verified",
+            "Signatures use HMAC SHA256",
+        ),
+    ] {
+        call(
+            "/api/memories",
+            json!({
+                "scope": "project", "project_id": project, "memory_type": "decision",
+                "title": title, "summary": summary, "content": "c"
+            }),
+        )
+        .await;
+    }
+    // Age the two memories: one 14 minutes, one two days before now.
+    let now = chrono::Utc::now();
+    let raw = rusqlite::Connection::open(tmp.path().join("memory.db")).unwrap();
+    for (title, age) in [
+        ("Webhook retries use backoff", chrono::Duration::minutes(14)),
+        ("Webhook signatures are verified", chrono::Duration::days(2)),
+    ] {
+        raw.execute(
+            "UPDATE memories SET updated_at = ?1 WHERE title = ?2",
+            rusqlite::params![(now - age).to_rfc3339(), title],
+        )
+        .unwrap();
+    }
+    let local = |age: chrono::Duration| (now - age).with_timezone(&chrono::Local);
+    let recent_clock = local(chrono::Duration::minutes(14))
+        .format("%H:%M")
+        .to_string();
+    let old_stamp = local(chrono::Duration::days(2))
+        .format("%Y-%m-%d %H:%M")
+        .to_string();
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+
+    let check = |text: &str, reference: &str| {
+        let first = text
+            .lines()
+            .find(|l| l.starts_with("Generated at "))
+            .unwrap_or_else(|| panic!("no generated-at line in:\n{text}"));
+        assert!(first.contains(&today), "{first}");
+        let recent = text
+            .lines()
+            .find(|l| l.contains("Webhook retries use backoff"))
+            .unwrap();
+        assert!(
+            recent.contains(&format!("{recent_clock}, 14m before {reference}")),
+            "{recent}"
+        );
+        let old = text
+            .lines()
+            .find(|l| l.contains("Webhook signatures are verified"))
+            .unwrap();
+        assert!(
+            old.contains(&format!("{old_stamp}, 2d 0h before {reference}")),
+            "{old}"
+        );
+        assert!(!text.contains(" ago"), "{text}");
+    };
+
+    let briefing = call(
+        "/v1/hooks/claude?event=SessionStart",
+        json!({"cwd": repo, "session_id": "time-sess"}),
+    )
+    .await;
+    check(
+        briefing["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap(),
+        "this briefing",
+    );
+
+    let recall = call(
+        "/v1/hooks/claude?event=UserPromptSubmit",
+        json!({"cwd": repo, "session_id": "time-sess", "prompt": "how do webhook retries and signatures work"}),
+    )
+    .await;
+    check(
+        recall["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap(),
+        "this recall",
+    );
+
+    let search = call(
+        "/mcp",
+        json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "memory_search", "arguments": {
+                "query": "webhook", "project": repo.to_string_lossy()
+            }}
+        }),
+    )
+    .await;
+    let text = search["result"]["content"][0]["text"].as_str().unwrap();
+    let parsed: Value = serde_json::from_str(text).unwrap();
+    let mut lines = vec![format!(
+        "Generated at {}",
+        parsed["generated_at"].as_str().unwrap()
+    )];
+    for r in parsed["results"].as_array().unwrap() {
+        lines.push(format!(
+            "{} ({})",
+            r["title"].as_str().unwrap(),
+            r["updated"].as_str().unwrap()
+        ));
+    }
+    check(&lines.join("\n"), "this search");
+}

@@ -1,9 +1,10 @@
+use crate::clock::{generated_at_line, memory_when};
 use crate::config::{EMBEDDING_DIM, Settings, ensure_parent_dir};
 use crate::models::*;
 use crate::project::ProjectIdentity;
 use crate::scrub::{redact_secrets, scrub_and_truncate};
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{Local, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -1331,6 +1332,8 @@ impl MemoryDb {
         let max_chars = token_budget.clamp(100, 2_000) * 4;
         let conn = self.conn.lock().unwrap();
         let mut seen = HashSet::new();
+        let now = Local::now();
+        let when = |updated_at: &str| memory_when(updated_at, &now, "this briefing");
 
         struct CandidateLine {
             item: BriefingItemBreakdown,
@@ -1343,7 +1346,7 @@ impl MemoryDb {
 
         // 1. Pinned memories (project + global)
         let mut stmt = conn.prepare(
-            "SELECT id, source_client, memory_type, status, title, summary
+            "SELECT id, source_client, memory_type, status, title, summary, updated_at
              FROM memories
              WHERE status = 'pinned' AND (scope = 'global' OR project_id = ?1)
              ORDER BY updated_at DESC LIMIT 5",
@@ -1357,14 +1360,20 @@ impl MemoryDb {
                     r.get::<_, String>(3)?,
                     r.get::<_, String>(4)?,
                     r.get::<_, String>(5)?,
+                    r.get::<_, String>(6)?,
                 ))
             })?
             .filter_map(Result::ok)
         {
             if seen.insert(row.0.clone()) {
                 let line = format!(
-                    "- [pinned|{}|{}] {} — {} (id:{})",
-                    row.1, row.2, row.4, row.5, row.0
+                    "- [pinned|{}|{}] {} — {} ({}; id:{})",
+                    row.1,
+                    row.2,
+                    row.4,
+                    row.5,
+                    when(&row.6),
+                    row.0
                 );
                 pinned_items.push(CandidateLine {
                     item: BriefingItemBreakdown {
@@ -1383,7 +1392,7 @@ impl MemoryDb {
 
         // 2. Global user preferences
         let mut stmt = conn.prepare(
-            "SELECT id, source_client, memory_type, status, title, summary
+            "SELECT id, source_client, memory_type, status, title, summary, updated_at
              FROM memories
              WHERE scope = 'global' AND status = 'active'
              ORDER BY updated_at DESC LIMIT 4",
@@ -1397,12 +1406,20 @@ impl MemoryDb {
                     r.get::<_, String>(3)?,
                     r.get::<_, String>(4)?,
                     r.get::<_, String>(5)?,
+                    r.get::<_, String>(6)?,
                 ))
             })?
             .filter_map(Result::ok)
         {
             if seen.insert(row.0.clone()) {
-                let line = format!("- [{}|{}] {} (id:{})", row.1, row.2, row.4, row.0);
+                let line = format!(
+                    "- [{}|{}] {} ({}; id:{})",
+                    row.1,
+                    row.2,
+                    row.4,
+                    when(&row.6),
+                    row.0
+                );
                 global_items.push(CandidateLine {
                     item: BriefingItemBreakdown {
                         id: row.0,
@@ -1421,7 +1438,7 @@ impl MemoryDb {
         // 3. Recent cross-client active project memories
         if let Some(pid) = project_id {
             let mut stmt = conn.prepare(
-                "SELECT id, source_client, memory_type, status, title, summary
+                "SELECT id, source_client, memory_type, status, title, summary, updated_at
                  FROM memories
                  WHERE project_id = ?1 AND status = 'active'
                  ORDER BY updated_at DESC LIMIT 8",
@@ -1435,14 +1452,20 @@ impl MemoryDb {
                         r.get::<_, String>(3)?,
                         r.get::<_, String>(4)?,
                         r.get::<_, String>(5)?,
+                        r.get::<_, String>(6)?,
                     ))
                 })?
                 .filter_map(Result::ok)
             {
                 if seen.insert(row.0.clone()) {
                     let line = format!(
-                        "- [{}|{}] {}: {} (id:{})",
-                        row.1, row.2, row.4, row.5, row.0
+                        "- [{}|{}] {}: {} ({}; id:{})",
+                        row.1,
+                        row.2,
+                        row.4,
+                        row.5,
+                        when(&row.6),
+                        row.0
                     );
                     project_items.push(CandidateLine {
                         item: BriefingItemBreakdown {
@@ -1487,8 +1510,9 @@ impl MemoryDb {
             ));
         }
 
-        let mut buf = String::from(
-            "# 0x1-ai-memory (Cross-Agent Briefing)\nUse `memory_get([id])` for full details or `memory_search(query)` for older context.\n",
+        let mut buf = format!(
+            "# 0x1-ai-memory (Cross-Agent Briefing)\n{}\nUse `memory_get([id])` for full details or `memory_search(query)` for older context.\n",
+            generated_at_line(&now)
         );
         let mut included_ids = Vec::new();
         let mut sections = Vec::new();

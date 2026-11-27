@@ -1,8 +1,9 @@
+use crate::clock::{generated_at, memory_when};
 use crate::db::MemoryDb;
 use crate::embed::Embedder;
 use crate::models::{NewMemoryInput, SearchFilter, StreamEvent, UpdateMemoryInput};
 use crate::project::resolve_project;
-use chrono::Utc;
+use chrono::{Local, Utc};
 use serde_json::{Value, json};
 use std::path::Path;
 use tokio::sync::broadcast;
@@ -212,7 +213,16 @@ async fn execute_tool_call(
                 let ids: Vec<String> = hits.iter().map(|h| h.id.clone()).collect();
                 let _ = db.record_memory_recalls(&ids, client_hint.unwrap_or("mcp"));
             }
-            json!({ "count": hits.len(), "results": hits })
+            let now = Local::now();
+            let results: Vec<Value> = hits
+                .iter()
+                .map(|h| {
+                    let mut v = serde_json::to_value(h).unwrap_or_default();
+                    v["updated"] = memory_when(&h.updated_at, &now, "this search").into();
+                    v
+                })
+                .collect();
+            json!({ "generated_at": generated_at(&now), "count": hits.len(), "results": results })
         }
         "memory_get" => {
             let ids: Vec<String> = args

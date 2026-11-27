@@ -1,10 +1,11 @@
+use crate::clock::{generated_at_line, memory_when};
 use crate::db::MemoryDb;
 use crate::distill::DistillHandle;
 use crate::embed::Embedder;
 use crate::models::{SearchFilter, StreamEvent, normalize_client};
 use crate::project::resolve_project;
 use crate::scrub::scrub_json_value;
-use chrono::Utc;
+use chrono::{Local, Utc};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::Path;
@@ -150,13 +151,20 @@ pub async fn handle_hook(
                 {
                     let ids: Vec<String> = hits.iter().map(|h| h.id.clone()).collect();
                     let _ = db.record_memory_recalls(&ids, &client);
-                    let mut lines = String::from(
-                        "Relevant cross-agent memories (call `memory_get([id])` if needed):\n",
+                    let now = Local::now();
+                    let mut lines = format!(
+                        "Relevant cross-agent memories (call `memory_get([id])` if needed):\n{}\n",
+                        generated_at_line(&now)
                     );
                     for h in &hits {
                         lines.push_str(&format!(
-                            "- [{}|{}] {}: {} (id:{})\n",
-                            h.source_client, h.memory_type, h.title, h.summary, h.id
+                            "- [{}|{}] {}: {} ({}; id:{})\n",
+                            h.source_client,
+                            h.memory_type,
+                            h.title,
+                            h.summary,
+                            memory_when(&h.updated_at, &now, "this recall"),
+                            h.id
                         ));
                     }
                     return format_context_injection(

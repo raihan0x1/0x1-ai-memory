@@ -1,3 +1,4 @@
+pub mod clock;
 pub mod config;
 pub mod connectors;
 pub mod daemon;
