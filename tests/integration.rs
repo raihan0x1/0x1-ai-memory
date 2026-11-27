@@ -3359,3 +3359,74 @@ async fn handoff_transfers_recent_sessions_and_respects_guards() {
     assert!(ctx2.contains("Third recent prompt"), "{ctx2}");
     assert!(ctx2.contains("Fourth recent prompt"), "{ctx2}");
 }
+
+#[tokio::test]
+async fn recent_sort_orders_by_recency_without_pin_priority() {
+    let tmp = tempdir().unwrap();
+    let state = test_state(tmp.path());
+    let app = build_router(state.clone());
+
+    let post_mem = |title: &'static str, status: &'static str| {
+        let app = app.clone();
+        async move {
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/memories")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            json!({
+                                "scope": "global",
+                                "memory_type": "decision",
+                                "title": title,
+                                "summary": "Order check",
+                                "content": "Details",
+                                "status": status
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            body_json(resp).await["memory"]["id"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        }
+    };
+
+    let older_pinned = post_mem("Older pinned rule", "pinned").await;
+    let raw = rusqlite::Connection::open(tmp.path().join("memory.db")).unwrap();
+    let older_ts = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+    raw.execute(
+        "UPDATE memories SET updated_at = ?1 WHERE id = ?2",
+        rusqlite::params![older_ts, older_pinned],
+    )
+    .unwrap();
+    let newer_active = post_mem("Newer active rule", "active").await;
+
+    let get = |uri: &'static str| {
+        let app = app.clone();
+        async move {
+            let resp = app
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            body_json(resp).await
+        }
+    };
+
+    let recent = get("/api/memories?sort=recent").await;
+    let r_mems = recent["memories"].as_array().unwrap();
+    assert_eq!(r_mems[0]["id"], newer_active);
+    assert_eq!(r_mems[1]["id"], older_pinned);
+
+    let default_sort = get("/api/memories").await;
+    let d_mems = default_sort["memories"].as_array().unwrap();
+    assert_eq!(d_mems[0]["id"], older_pinned);
+    assert_eq!(d_mems[1]["id"], newer_active);
+}

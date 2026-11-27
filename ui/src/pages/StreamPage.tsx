@@ -15,6 +15,7 @@ import { ModalDialog } from '../components/ModalDialog';
 import { PaginationBar } from '../components/PaginationBar';
 import { RimSelect } from '../components/RimSelect';
 import type {
+  ClientConnection,
   MemoryHit,
   Project,
   RawEventView,
@@ -26,6 +27,7 @@ import type { Tab } from '../App';
 interface StreamPageProps {
   summary: UsageSummary | null;
   projects: Project[];
+  connections: ClientConnection[];
   sseMemoryTick: number;
   sseSessionTick: number;
   sseTailTick: number;
@@ -62,15 +64,6 @@ const EVENT_LABELS: Record<string, string> = {
 const HOST_LABELS: Record<string, string> = { 't3-code': 'T3 Code', orca: 'Orca', terminal: 'terminal' };
 
 const viaHost = (host: string | null) => (host ? ` via ${HOST_LABELS[host] ?? host}` : '');
-
-const CLIENT_OPTIONS = [
-  { value: '', label: 'All AI clients' },
-  { value: 'claude-code', label: 'Claude Code' },
-  { value: 'codex', label: 'Codex' },
-  { value: 'antigravity', label: 'Antigravity' },
-  { value: 'mcp', label: 'MCP' },
-  { value: 'ui', label: 'Manual UI' },
-];
 
 const PRIVACY_OPTIONS = [
   { value: 'full', label: 'Full', meta: 'distill' },
@@ -145,6 +138,7 @@ function NewItemsBanner({
 export function StreamPage({
   summary,
   projects,
+  connections,
   sseMemoryTick,
   sseSessionTick,
   sseTailTick,
@@ -226,6 +220,7 @@ export function StreamPage({
       const res = await api.searchMemories({
         project_id: projectFilter || undefined,
         source_client: clientFilter || undefined,
+        sort: 'recent',
         limit: MEM_PAGE_SIZE,
         offset: (memPage - 1) * MEM_PAGE_SIZE,
       }, ctl.signal);
@@ -428,6 +423,22 @@ export function StreamPage({
     { value: '', label: 'All projects' },
     ...projects.map((p) => ({ value: p.id, label: p.name, meta: p.privacy_mode })),
   ];
+  const clientFilterOptions = useMemo(() => {
+    const active = connections.filter(
+      (c) => c.connected || c.detected || Boolean(c.last_event_at || c.last_heartbeat_at),
+    );
+    const list = active.length > 0 ? active : connections;
+    return [
+      { value: '', label: 'All AI clients' },
+      ...list.map((c) => ({ value: c.client_id, label: c.display_name })),
+    ];
+  }, [connections]);
+  const hasStreamFilter = Boolean(projectFilter || clientFilter);
+  const hasAnyMemories = (summary?.total_memories ?? 0) > 0;
+  const clearStreamFilters = () => {
+    setProjectFilter('');
+    setClientFilter('');
+  };
   const projectTargetOptions = projects.map((p) => ({ value: p.id, label: p.name }));
   const totalRecalls = summary?.total_recalls ?? 0;
   const activeSessionsCount = summary?.active_sessions ?? 0;
@@ -623,7 +634,7 @@ export function StreamPage({
         <RimSelect
           ariaLabel="Filter by AI client"
           value={clientFilter}
-          options={CLIENT_OPTIONS}
+          options={clientFilterOptions}
           onChange={setClientFilter}
         />
 
@@ -711,27 +722,38 @@ export function StreamPage({
               ))}
             </div>
           ) : filtered.length === 0 ? (
-            <div className="empty-state">
-              <p>
-                No memories recorded yet. Connect Claude Code, Codex or Antigravity, or
-                save a decision directly.
-              </p>
-              <span className="field-hint measure">
-                Local MCP ready at {window.location.origin}/mcp
-              </span>
-              <div className="head-actions">
-                <button
-                  type="button"
-                  className="btn btn-primary"
-                  onClick={() => onNavigate('onboarding')}
-                >
-                  Open onboarding
-                </button>
-                <button type="button" className="btn" onClick={() => setSaveOpen(true)}>
-                  Save first memory
-                </button>
+            hasStreamFilter || hasAnyMemories ? (
+              <div className="empty-state">
+                <p>No results for this filter.</p>
+                <div className="head-actions">
+                  <button type="button" className="btn" onClick={clearStreamFilters}>
+                    Clear filters
+                  </button>
+                </div>
               </div>
-            </div>
+            ) : (
+              <div className="empty-state">
+                <p>
+                  No memories recorded yet. Connect Claude Code, Codex or Antigravity, or
+                  save a decision directly.
+                </p>
+                <span className="field-hint measure">
+                  Local MCP ready at {window.location.origin}/mcp
+                </span>
+                <div className="head-actions">
+                  <button
+                    type="button"
+                    className="btn btn-primary"
+                    onClick={() => onNavigate('onboarding')}
+                  >
+                    Open onboarding
+                  </button>
+                  <button type="button" className="btn" onClick={() => setSaveOpen(true)}>
+                    Save first memory
+                  </button>
+                </div>
+              </div>
+            )
           ) : (
             <div>
               {groupedMemories.map((group) => {
@@ -946,7 +968,12 @@ export function StreamPage({
                 </div>
               ) : sessions.length === 0 ? (
                 <div className="empty-state" style={{ paddingBlock: 'var(--space-lg)' }}>
-                  <p>No sessions captured yet.</p>
+                  <p>{hasStreamFilter ? 'No results for this filter.' : 'No sessions captured yet.'}</p>
+                  {hasStreamFilter ? (
+                    <button type="button" className="btn" onClick={clearStreamFilters}>
+                      Clear filters
+                    </button>
+                  ) : null}
                 </div>
               ) : (
                 <ul className="session-list">
@@ -1076,7 +1103,23 @@ export function StreamPage({
                 </div>
               ) : displayedTail.length === 0 ? (
                 <div className="empty-state" style={{ paddingBlock: 'var(--space-lg)' }}>
-                  <p>Waiting for hook or MCP activity.</p>
+                  <p>
+                    {hasStreamFilter || tailFilter !== 'signal'
+                      ? 'No results for this filter.'
+                      : 'Waiting for hook or MCP activity.'}
+                  </p>
+                  {hasStreamFilter || tailFilter !== 'signal' ? (
+                    <button
+                      type="button"
+                      className="btn"
+                      onClick={() => {
+                        clearStreamFilters();
+                        setTailFilter('signal');
+                      }}
+                    >
+                      Clear filters
+                    </button>
+                  ) : null}
                 </div>
               ) : (
                 <ul className="event-tail">

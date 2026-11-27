@@ -2291,11 +2291,16 @@ fn build_briefing_locked(
         if candidates.is_empty() {
             continue;
         }
-        buf.push_str(header);
+        let mut wrote_header = false;
         let mut section_tokens = 0usize;
         for cand in candidates.iter_mut() {
-            if buf.len() + cand.line.len() + 2 > max_chars {
+            let needed = cand.line.len() + 2 + if wrote_header { 0 } else { header.len() };
+            if buf.len() + needed > max_chars {
                 break;
+            }
+            if !wrote_header {
+                buf.push_str(header);
+                wrote_header = true;
             }
             buf.push_str(&cand.line);
             buf.push('\n');
@@ -2378,6 +2383,8 @@ fn has_existing_user_data_locked(conn: &Connection) -> Result<bool> {
 fn recent_memory_order(filter: &SearchFilter) -> &'static str {
     if filter.sort.as_deref() == Some("most_recalled") {
         "ORDER BY COALESCE(rs.recall_count, 0) DESC, m.updated_at DESC, m.rowid"
+    } else if filter.sort.as_deref() == Some("recent") {
+        "ORDER BY m.updated_at DESC, m.rowid"
     } else {
         "ORDER BY (CASE WHEN m.status = 'pinned' THEN 0 ELSE 1 END), m.updated_at DESC, m.rowid"
     }

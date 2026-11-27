@@ -502,6 +502,7 @@ export function App() {
           <StreamPage
             summary={summary}
             projects={projects}
+            connections={connections}
             sseMemoryTick={sseMemoryTick}
             sseSessionTick={sseSessionTick}
             sseTailTick={sseTailTick}
