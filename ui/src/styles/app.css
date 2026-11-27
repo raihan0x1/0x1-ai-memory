@@ -11,7 +11,6 @@
   --color-claude: var(--color-accent);
   --color-codex: var(--color-success);
   --color-agy: var(--color-accent-2);
-  --color-t3: oklch(76% 0.10 305);
   --control-height: 36px;
 }
 
@@ -511,11 +510,6 @@
 .tag.antigravity {
   color: var(--color-agy);
   border-color: color-mix(in oklch, var(--color-agy) 55%, var(--color-rule));
-}
-
-.tag.t3-code {
-  color: var(--color-t3);
-  border-color: color-mix(in oklch, var(--color-t3) 55%, var(--color-rule));
 }
 
 .tag.ok {

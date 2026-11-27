@@ -426,6 +426,17 @@ Inspecting `~/.codex/hooks.json`, `~/.codex/config.toml`, `~/.codex/.hook-trust/
     - `projection_projects(project_id, title, workspace_root, ...)` — maps `project_id` to canonical repo path.
   - **Safe Read-Only Watching Pattern:** Open read-only (`sqlite3` with `mode=ro` + `busy_timeout=2000`; never write to T3's DB!), trigger on mtime/WAL changes or short poll interval, query `orchestration_v2_projection_messages WHERE streaming = 0 AND updated_at > ?` joined with `orchestration_v2_projection_provider_threads` so threads already ingested via Claude/Codex hooks are cleanly deduplicated via `provider_thread_id`!
 
+### 4.5 Status in 0x1-memory: T3 watcher removed (Spec #1)
+
+The read-only `statev2.sqlite` watcher described above was removed, along with the `t3-code` Client, its Connections card and the `t3_watcher_enabled` setting. It never captured anything: it read an empty `search_text` column and deduplicated on the wrong id. T3 Code is a **Host**, not a **Client**: it launches Claude Code and Codex, whose own hooks and MCP entries already reach the Daemon. The Daemon only records the Host for a session; it never reads a Host's private storage.
+
+On open, the Daemon deletes the leftover `t3-code` connection row and the `t3_watcher_enabled` / `_meta:t3_watermark` settings.
+
+**Not captured, by design:**
+
+- **Antigravity inside T3 Code.** T3 starts `agy acp` with a private `GEMINI_HOME` (4.3), so the global 0x1-memory hooks and MCP entry never load. Run Antigravity outside T3 (the app, `agy` in a terminal, or an Orca terminal) when its memory matters.
+- **Orca chat mode for Antigravity with a non-Google sign-in.** It has the same isolation. Orca terminals, and Claude Code or Codex chats on the default account, use the user config and are captured normally.
+
 ---
 
 ## 5. Subscription / Headless CLI Reuse Feasibility (Memory LLM Backend)

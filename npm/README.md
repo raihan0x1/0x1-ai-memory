@@ -1,6 +1,6 @@
 # 0x1-ai-memory
 
-Local-first, anti-drain, cross-agent persistent memory engine connecting **Claude Code**, **Codex CLI & App**, **Antigravity**, **T3 Code**, and any MCP client.
+Local-first, anti-drain, cross-agent persistent memory engine connecting **Claude Code**, **Codex CLI & App**, **Antigravity**, and any MCP client.
 
 ## Instant Start
 

@@ -30,7 +30,7 @@ pub struct RawEvent {
     pub session_id: String,
     pub project_id: String,
     pub source_client: String,
-    pub event_type: String, // "prompt" | "tool_use" | "tool_error" | "turn_stop" | "t3_message"
+    pub event_type: String, // "prompt" | "tool_use" | "tool_error" | "turn_stop"
     pub tool_name: Option<String>,
     pub payload_json: String,
     pub distilled: bool,
@@ -44,7 +44,7 @@ pub struct Memory {
     pub project_id: Option<String>,
     pub project_name: Option<String>,
     pub session_id: Option<String>,
-    pub source_client: String, // "claude-code" | "codex" | "antigravity" | "t3-code" | "mcp" | "ui"
+    pub source_client: String, // "claude-code" | "codex" | "antigravity" | "mcp" | "ui"
     pub memory_type: String, // "decision" | "bugfix" | "architecture" | "preference" | "pattern" | "session_summary"
     pub title: String,
     pub summary: String,
@@ -371,13 +371,11 @@ pub fn normalize_client(raw: Option<&str>) -> String {
     {
         return "antigravity".into();
     }
-    if lower == "t3" || lower == "t3code" || lower.starts_with("t3-") {
-        return "t3-code".into();
-    }
     if lower == "ui" || lower == "user" {
         return "ui".into();
     }
-    lower
+    // Unrecognised MCP callers (often a bare User-Agent such as go-http-client) share one bucket.
+    "mcp".into()
 }
 
 #[cfg(test)]
@@ -389,8 +387,8 @@ mod tests {
         assert_eq!(normalize_client(Some("codex-mcp-client")), "codex");
         assert_eq!(normalize_client(Some("antigravity-client")), "antigravity");
         assert_eq!(normalize_client(Some("claude-code/1.2.3")), "claude-code");
-        assert_eq!(normalize_client(Some("t3-code-desktop")), "t3-code");
-        assert_eq!(normalize_client(Some("cursor")), "cursor");
+        assert_eq!(normalize_client(Some("Go-http-client/1.1")), "mcp");
+        assert_eq!(normalize_client(Some("t3-code")), "mcp");
         assert_eq!(normalize_client(None), "mcp");
     }
 }

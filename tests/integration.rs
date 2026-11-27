@@ -2128,3 +2128,162 @@ async fn distillation_sends_every_event_once_and_guards_supersede() {
 
     mock_task.abort();
 }
+
+#[tokio::test]
+async fn legacy_client_names_are_normalized_and_t3_rows_removed_on_open() {
+    let tmp = tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    tokio::fs::create_dir_all(&repo).await.unwrap();
+    let project = ox1_memory::project::resolve_project(&repo).id;
+    {
+        // Seed data the old binary could write: alias Client names, a T3 Code connection,
+        // and two sessions that collide once their names are normalized.
+        let state = test_state(tmp.path());
+        let app = build_router(state.clone());
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/hooks/claude?event=UserPromptSubmit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"cwd": repo, "session_id": "s-alias", "prompt": "hello"})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let memory = json!({
+            "scope": "project", "project_id": project, "memory_type": "decision",
+            "title": "Legacy memory", "summary": "s", "content": "c"
+        });
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/memories")
+                    .header("content-type", "application/json")
+                    .body(Body::from(memory.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        state
+            .db
+            .upsert_session(&project, "codex", "dup", None)
+            .unwrap();
+        state
+            .db
+            .upsert_session(&project, "claude-code", "dup", None)
+            .unwrap();
+        let raw = rusqlite::Connection::open(tmp.path().join("memory.db")).unwrap();
+        raw.execute_batch(
+            "UPDATE memories SET source_client = 'go-http-client/1.1';
+             UPDATE raw_events SET source_client = 'antigravity-client';
+             UPDATE sessions SET source_client = 'antigravity-client' WHERE external_session_id = 's-alias';
+             UPDATE sessions SET source_client = 'codex-mcp-client'
+               WHERE external_session_id = 'dup' AND source_client = 'claude-code';
+             INSERT INTO client_connections(client_id, display_name, detected, connected, updated_at) VALUES
+               ('t3-code', 'T3 Code', 1, 1, '2026-01-01T00:00:00Z'),
+               ('codex-mcp-client', 'codex-mcp-client', 1, 1, '2026-01-01T00:00:00Z'),
+               ('go-http-client/1.1', 'go-http-client/1.1', 1, 1, '2026-01-01T00:00:00Z'),
+               ('codex', 'Codex CLI & App', 1, 1, '2026-01-01T00:00:00Z');",
+        )
+        .unwrap();
+    }
+
+    // Reopening runs the migration; the Daemon must start and serve canonical names.
+    let state = test_state(tmp.path());
+    let app = build_router(state.clone());
+    let get = |uri: &'static str| {
+        let app = app.clone();
+        async move {
+            let resp = app
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+            body_json(resp).await
+        }
+    };
+    let memories = get("/api/memories?limit=10").await;
+    assert_eq!(memories["memories"][0]["source_client"], "mcp");
+    let events = get("/api/raw-events?limit=10").await;
+    assert_eq!(events["events"][0]["source_client"], "antigravity");
+    let sessions = get("/api/sessions?limit=10").await;
+    let mut names: Vec<String> = sessions["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["source_client"].as_str().unwrap().to_string())
+        .collect();
+    names.sort();
+    // The colliding alias session is kept as-is rather than merged or dropped.
+    assert_eq!(names, ["antigravity", "codex", "codex-mcp-client"]);
+
+    let connections = get("/api/connections").await;
+    let shown: Vec<&str> = connections["connections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["client_id"].as_str().unwrap())
+        .collect();
+    assert!(!shown.contains(&"t3-code"), "{shown:?}");
+    let raw = rusqlite::Connection::open(tmp.path().join("memory.db")).unwrap();
+    let mut stmt = raw
+        .prepare("SELECT client_id FROM client_connections ORDER BY client_id")
+        .unwrap();
+    let rows: Vec<String> = stmt
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(rows, ["antigravity", "claude-code", "codex"]);
+
+    // An MCP caller identified only by a generic User-Agent is attributed to `mcp`
+    // and does not appear as a Client connection.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header("content-type", "application/json")
+                .header("user-agent", "Go-http-client/1.1")
+                .body(Body::from(
+                    json!({
+                        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                        "params": { "name": "memory_save", "arguments": {
+                            "title": "From a generic MCP caller", "summary": "s",
+                            "content": "c", "type": "decision", "scope": "project",
+                            "project": repo.to_string_lossy()
+                        }}
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let memories = get("/api/memories?limit=10").await;
+    assert!(
+        memories["memories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m["source_client"] == "mcp")
+    );
+    let count: i64 = raw
+        .query_row(
+            "SELECT COUNT(*) FROM client_connections WHERE client_id NOT IN ('claude-code','codex','antigravity')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 0);
+}

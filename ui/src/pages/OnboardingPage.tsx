@@ -371,8 +371,8 @@ export function OnboardingPage({
                 {STEPS[0].title}
               </h1>
               <p className="page-subtitle">
-                One local persistent memory store shared across Claude Code, Codex, Antigravity,
-                and T3 Code — running quietly in the background without burning coding quotas.
+                One local persistent memory store shared across Claude Code, Codex and
+                Antigravity — running quietly in the background without burning coding quotas.
               </p>
             </div>
 

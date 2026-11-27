@@ -75,7 +75,6 @@ pub struct Settings {
     pub embedding_mode: String,
     pub embedding_model: String,
     pub raw_event_retention_days: i64,
-    pub t3_watcher_enabled: bool,
     pub distill_idle_seconds: i64,
     pub onboarding_completed: bool,
     pub auto_update_check: bool,
@@ -94,7 +93,6 @@ impl Default for Settings {
             embedding_mode: "local_onnx".into(),
             embedding_model: "all-MiniLM-L6-v2".into(),
             raw_event_retention_days: 14,
-            t3_watcher_enabled: true,
             distill_idle_seconds: 120,
             onboarding_completed: false,
             auto_update_check: true,
@@ -149,9 +147,6 @@ impl Settings {
         {
             s.raw_event_retention_days = v;
         }
-        if let Some(v) = map.get("t3_watcher_enabled") {
-            s.t3_watcher_enabled = v == "true" || v == "1";
-        }
         if let Some(v) = map.get("distill_idle_seconds").and_then(|x| x.parse().ok()) {
             s.distill_idle_seconds = v;
         }
@@ -184,15 +179,6 @@ impl Settings {
         m.insert(
             "raw_event_retention_days".into(),
             self.raw_event_retention_days.to_string(),
-        );
-        m.insert(
-            "t3_watcher_enabled".into(),
-            if self.t3_watcher_enabled {
-                "true"
-            } else {
-                "false"
-            }
-            .into(),
         );
         m.insert(
             "distill_idle_seconds".into(),
@@ -324,7 +310,6 @@ impl Settings {
             embedding_mode: self.embedding_mode.clone(),
             embedding_model: self.embedding_model.clone(),
             raw_event_retention_days: self.raw_event_retention_days,
-            t3_watcher_enabled: self.t3_watcher_enabled,
             distill_idle_seconds: self.distill_idle_seconds,
             onboarding_completed: self.onboarding_completed,
             auto_update_check: self.auto_update_check,
@@ -346,7 +331,6 @@ pub struct SettingsView {
     pub embedding_mode: String,
     pub embedding_model: String,
     pub raw_event_retention_days: i64,
-    pub t3_watcher_enabled: bool,
     pub distill_idle_seconds: i64,
     pub onboarding_completed: bool,
     pub auto_update_check: bool,
@@ -366,7 +350,6 @@ pub struct SettingsPatch {
     pub embedding_mode: Option<String>,
     pub embedding_model: Option<String>,
     pub raw_event_retention_days: Option<i64>,
-    pub t3_watcher_enabled: Option<bool>,
     pub distill_idle_seconds: Option<i64>,
     pub onboarding_completed: Option<bool>,
     pub auto_update_check: Option<bool>,
@@ -412,9 +395,6 @@ impl Settings {
         }
         if let Some(v) = patch.raw_event_retention_days {
             self.raw_event_retention_days = v.clamp(1, 365);
-        }
-        if let Some(v) = patch.t3_watcher_enabled {
-            self.t3_watcher_enabled = v;
         }
         if let Some(v) = patch.distill_idle_seconds {
             self.distill_idle_seconds = v.clamp(15, 3600);
@@ -611,7 +591,6 @@ mod tests {
             embedding_mode: None,
             embedding_model: None,
             raw_event_retention_days: None,
-            t3_watcher_enabled: None,
             distill_idle_seconds: None,
             onboarding_completed: Some(true),
             auto_update_check: Some(false),

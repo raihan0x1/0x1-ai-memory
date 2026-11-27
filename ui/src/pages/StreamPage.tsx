@@ -49,7 +49,6 @@ const CLIENT_OPTIONS = [
   { value: 'claude-code', label: 'Claude Code' },
   { value: 'codex', label: 'Codex' },
   { value: 'antigravity', label: 'Antigravity' },
-  { value: 't3-code', label: 'T3 Code' },
   { value: 'mcp', label: 'MCP' },
   { value: 'ui', label: 'Manual UI' },
 ];
@@ -527,7 +526,7 @@ export function StreamPage({
         <div>
           <h1 className="page-title">Live cross-agent stream</h1>
           <p className="page-subtitle">
-            Real-time capture and shared memory across Claude Code, Codex, Antigravity, and T3 Code.
+            Real-time capture and shared memory across Claude Code, Codex and Antigravity.
           </p>
         </div>
         <div className="head-actions">
@@ -731,7 +730,7 @@ export function StreamPage({
           ) : filtered.length === 0 ? (
             <div className="empty-state">
               <p>
-                No memories recorded yet. Connect Claude Code, Codex, Antigravity, or T3 Code, or
+                No memories recorded yet. Connect Claude Code, Codex or Antigravity, or
                 save a decision directly.
               </p>
               <span className="field-hint measure">

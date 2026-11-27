@@ -15,7 +15,6 @@ use ox1_memory::llm::MemoryLlmClient;
 use ox1_memory::mcp::handle_rpc;
 use ox1_memory::models::{SearchFilter, StreamEvent};
 use ox1_memory::server::{AppState, build_router};
-use ox1_memory::t3_watcher::spawn_t3_watcher;
 use ox1_memory::updater::UpdateManager;
 use serde_json::{Value, json};
 use std::io::{self, BufRead, Read, Write};
@@ -28,7 +27,7 @@ use tokio::sync::{broadcast, watch};
 #[command(
     name = "0x1-memory",
     version,
-    about = "Local-first, anti-drain cross-agent AI memory (Claude Code, Codex, Antigravity, T3 Code)"
+    about = "Local-first, anti-drain cross-agent AI memory (Claude Code, Codex, Antigravity)"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -91,9 +90,9 @@ enum Commands {
         #[arg(long, hide = true, default_value_t = 0)]
         wait_port_ms: u64,
     },
-    /// CLI Setup: auto-detect and connect Claude Code, Codex, Antigravity, & T3 Code from terminal
+    /// CLI Setup: auto-detect and connect Claude Code, Codex and Antigravity from terminal
     Setup {
-        /// Target client (all, claude-code, codex, antigravity, t3-code)
+        /// Target client (all, claude-code, codex, antigravity)
         #[arg(long, default_value = "all")]
         client: String,
         #[arg(long, env = "OX1_MEMORY_PORT", default_value_t = DEFAULT_PORT)]
@@ -356,7 +355,6 @@ async fn run_serve(
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     let distill =
         spawn_distill_worker(db.clone(), embedder.clone(), llm.clone(), events_tx.clone());
-    spawn_t3_watcher(db.clone(), distill.clone());
 
     let home = dirs::home_dir().context("Home directory unavailable")?;
     let bin_path = std::env::current_exe().unwrap_or_else(|_| "0x1-memory".into());
@@ -378,7 +376,7 @@ async fn run_serve(
         events_tx.clone(),
     ));
 
-    // Seed onboarding and version state BEFORE inspect_all saves client_connections so fresh T3 installs aren't misread as upgrades.
+    // Seed onboarding and version state BEFORE inspect_all saves client_connections so a fresh install isn't misread as an upgrade.
     let has_clients = connectors.has_explicit_client_config();
     let onboarding_done = db.seed_onboarding_if_existing(has_clients).unwrap_or(false);
     let _ = updater.seed_version_state_on_startup(has_clients);

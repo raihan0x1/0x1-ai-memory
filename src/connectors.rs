@@ -84,12 +84,10 @@ impl ConnectorManager {
 
     pub fn inspect_all(&self, db: &MemoryDb) -> Result<Vec<ClientConnection>> {
         let heartbeats = db.get_client_heartbeats().unwrap_or_default();
-        let settings = db.get_settings().unwrap_or_default();
         let mut out = vec![
             self.inspect_claude(&heartbeats),
             self.inspect_codex(&heartbeats),
             self.inspect_antigravity(&heartbeats),
-            self.inspect_t3(&heartbeats, settings.t3_watcher_enabled),
         ];
         for c in &mut out {
             let _ = db.save_client_connection(c);
@@ -98,7 +96,7 @@ impl ConnectorManager {
     }
 
     /// Read-only check whether any actively wired client (Claude Code, Codex, Antigravity)
-    /// already has a `0x1-memory` entry on disk (ignores passive T3 watcher defaults).
+    /// already has a `0x1-memory` entry on disk.
     pub fn has_explicit_client_config(&self) -> bool {
         let empty = ClientHeartbeatMap::new();
         [
@@ -124,7 +122,7 @@ impl ConnectorManager {
                         .display()
                         .to_string(),
                 ],
-                summary: "Adds Streamable HTTP MCP server to ~/.claude.json and ultra-fast (<5ms) lifecycle hooks to ~/.claude/settings.json. Also auto-works inside T3 Code.".into(),
+                summary: "Adds Streamable HTTP MCP server to ~/.claude.json and ultra-fast (<5ms) lifecycle hooks to ~/.claude/settings.json.".into(),
                 diff_preview: format!(
                     "+ ~/.claude.json -> mcpServers[\"0x1-memory\"] = {{ \"type\": \"http\", \"url\": \"{url}\" }}\n\
                      + ~/.claude/settings.json -> hooks[SessionStart, UserPromptSubmit, PostToolUse, PreCompact, Stop, SessionEnd]\n\
@@ -145,7 +143,7 @@ impl ConnectorManager {
                         .display()
                         .to_string(),
                 ],
-                summary: "Adds Streamable HTTP MCP server + read-tool auto-approval to ~/.codex/config.toml (preserving comments) and static hook shims to ~/.codex/hooks.json. Also auto-works inside T3 Code.".into(),
+                summary: "Adds Streamable HTTP MCP server + read-tool auto-approval to ~/.codex/config.toml (preserving comments) and static hook shims to ~/.codex/hooks.json.".into(),
                 diff_preview: format!(
                     "+ ~/.codex/config.toml -> [features] hooks = true\n\
                      + ~/.codex/config.toml -> [mcp_servers.0x1_memory] url = \"{url}\"\n\
@@ -174,18 +172,6 @@ impl ConnectorManager {
                     "Restart or reload Antigravity session so the new 0x1-memory plugin hooks & MCP tools activate.".into(),
                 ),
             }),
-            "t3-code" => Ok(ConnectionPreview {
-                client_id: "t3-code".into(),
-                display_name: "T3 Code".into(),
-                target_files: vec![self
-                    .home_dir
-                    .join(".t3/userdata/statev2.sqlite")
-                    .display()
-                    .to_string()],
-                summary: "Enables read-only WAL watcher on ~/.t3/userdata/statev2.sqlite to capture Antigravity-in-T3 threads (where T3 isolates global GEMINI_HOME). Claude Code & Codex threads already inherit native hooks and are deduplicated automatically.".into(),
-                diff_preview: "+ settings.t3_watcher_enabled = true (read-only mode=ro; never writes to T3's database)".into(),
-                manual_step_hint: None,
-            }),
             other => bail!("Unknown client_id: {other}"),
         }
     }
@@ -195,12 +181,6 @@ impl ConnectorManager {
             "claude-code" => self.connect_claude()?,
             "codex" => self.connect_codex()?,
             "antigravity" => self.connect_antigravity()?,
-            "t3-code" => {
-                let mut settings = db.get_settings()?;
-                settings.t3_watcher_enabled = true;
-                db.save_settings(&settings)?;
-                None
-            }
             other => bail!("Unknown client_id: {other}"),
         };
 
@@ -221,11 +201,6 @@ impl ConnectorManager {
             "claude-code" => self.disconnect_claude()?,
             "codex" => self.disconnect_codex()?,
             "antigravity" => self.disconnect_antigravity()?,
-            "t3-code" => {
-                let mut settings = db.get_settings()?;
-                settings.t3_watcher_enabled = false;
-                db.save_settings(&settings)?;
-            }
             other => bail!("Unknown client_id: {other}"),
         }
         let all = self.inspect_all(db)?;
@@ -281,7 +256,7 @@ impl ConnectorManager {
             status_note: if port_mismatch {
                 port_mismatch_note(configured_port, self.port)
             } else if connected {
-                "Streamable HTTP MCP + 6 lifecycle hooks active (also inherited by T3 Code)".into()
+                "Streamable HTTP MCP + 6 lifecycle hooks active".into()
             } else if detected {
                 "Detected locally — ready to connect with 1 click".into()
             } else {
@@ -455,7 +430,8 @@ impl ConnectorManager {
                 if needs_manual {
                     "Configured! Waiting for one-time `/hooks` approval in Codex.".into()
                 } else {
-                    "Streamable HTTP MCP + trusted hooks active (shared across Codex CLI, App & T3 Code)".into()
+                    "Streamable HTTP MCP + trusted hooks active (shared across Codex CLI & App)"
+                        .into()
                 }
             } else if detected {
                 "Detected locally — ready to connect".into()
@@ -663,7 +639,7 @@ impl ConnectorManager {
             &json!({
                 "name": "0x1-memory",
                 "version": env!("CARGO_PKG_VERSION"),
-                "description": "Cross-agent local-first AI memory (shared with Claude Code, Codex, and T3 Code)"
+                "description": "Cross-agent local-first AI memory (shared with Claude Code and Codex)"
             }),
         )?;
 
@@ -708,7 +684,7 @@ impl ConnectorManager {
         write_atomic(
             &plugin_dir.join("rules/AGENTS.md"),
             "# 0x1-ai-memory\n\n\
-             You have shared cross-agent memory via the `0x1-memory` MCP server (shared with Claude Code, Codex, and T3 Code).\n\
+             You have shared cross-agent memory via the `0x1-memory` MCP server (shared with Claude Code and Codex).\n\
              - Use `memory_search` to check prior architectural decisions or bugfixes before re-investigating.\n\
              - Use `memory_get([ids])` to load full details for IDs mentioned in the SessionStart briefing.\n\
              - Use `memory_save` when the user states a durable preference or makes a key architectural decision.\n",
@@ -723,36 +699,6 @@ impl ConnectorManager {
             std::fs::remove_dir_all(&plugin_dir)?;
         }
         Ok(())
-    }
-
-    // --- T3 Code ---
-
-    fn inspect_t3(&self, hb: &ClientHeartbeatMap, watcher_enabled: bool) -> ClientConnection {
-        let t3_db = self.home_dir.join(".t3/userdata/statev2.sqlite");
-        let detected = t3_db.exists() || Path::new("/Applications/T3 Code (Beta).app").exists();
-        let (last_hb, last_ev, backup) = hb.get("t3-code").cloned().unwrap_or((None, None, None));
-
-        ClientConnection {
-            client_id: "t3-code".into(),
-            display_name: "T3 Code".into(),
-            detected,
-            connected: detected && watcher_enabled,
-            configured_port: None,
-            port_mismatch: false,
-            needs_manual_step: false,
-            manual_step_hint: None,
-            config_paths: vec![t3_db.display().to_string()],
-            config_backup_path: backup,
-            last_heartbeat_at: last_hb,
-            last_event_at: last_ev,
-            status_note: if detected && watcher_enabled {
-                "Read-only WAL watcher active for Antigravity-in-T3; Claude Code & Codex inherit native hooks automatically.".into()
-            } else if detected {
-                "Detected! Claude & Codex already pass through; enable watcher to capture isolated Antigravity-in-T3 threads.".into()
-            } else {
-                "~/.t3/userdata/statev2.sqlite not found on this machine".into()
-            },
-        }
     }
 
     fn backup_file(&self, src: &Path) -> Result<Option<String>> {
@@ -987,11 +933,10 @@ mod tests {
     }
 
     #[test]
-    fn flags_half_configured_port_mismatch_and_ignores_passive_t3_for_fresh_onboarding() {
+    fn flags_half_configured_port_mismatch_and_keeps_fresh_onboarding() {
         let tmp = tempdir().unwrap();
         let home = tmp.path().join("home");
-        std::fs::create_dir_all(home.join(".t3/userdata")).unwrap();
-        std::fs::write(home.join(".t3/userdata/statev2.sqlite"), "").unwrap();
+        std::fs::create_dir_all(&home).unwrap();
 
         let db = MemoryDb::open_in_memory().unwrap();
         let mgr = ConnectorManager::new(
@@ -1001,21 +946,9 @@ mod tests {
             10101,
         );
 
-        // Fresh machine with only T3 Code present must NOT skip Onboarding
+        // A fresh machine with no wired client must NOT skip Onboarding, even after inspect_all.
         assert!(!mgr.has_explicit_client_config());
-        assert!(
-            !db.seed_onboarding_if_existing(mgr.has_explicit_client_config())
-                .unwrap()
-        );
-
-        // Even after inspect_all persists passive t3-code (connected=1) from a prior run or restart,
-        // Onboarding must NOT be auto-skipped when no active client or memory exists.
-        let initial = mgr.inspect_all(&db).unwrap();
-        assert!(
-            initial
-                .iter()
-                .any(|c| c.client_id == "t3-code" && c.connected)
-        );
+        mgr.inspect_all(&db).unwrap();
         assert!(
             !db.seed_onboarding_if_existing(mgr.has_explicit_client_config())
                 .unwrap()

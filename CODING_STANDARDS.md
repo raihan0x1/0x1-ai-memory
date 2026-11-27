@@ -17,7 +17,7 @@ Every code path that sends text off-machine — LLM distillation (`src/llm.rs`),
 
 ## 3. Safe external client config mutation (`src/connectors.rs`)
 
-Mutating external AI client configs (`~/.claude*`, `~/.codex*`, `~/.gemini*`, `~/.t3*`) must always:
+Mutating external AI client configs (`~/.claude*`, `~/.codex*`, `~/.gemini*`) must always:
 
 - Create a timestamped backup before writing.
 - Fail safely if an existing config file cannot be parsed as valid JSON/TOML — never overwrite corrupt user config with `{}`.

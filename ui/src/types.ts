@@ -218,7 +218,6 @@ export interface SettingsView {
   embedding_mode: string;
   embedding_model: string;
   raw_event_retention_days: number;
-  t3_watcher_enabled: boolean;
   distill_idle_seconds: number;
   onboarding_completed: boolean;
   auto_update_check: boolean;

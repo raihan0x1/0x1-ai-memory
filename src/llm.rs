@@ -496,7 +496,7 @@ fn build_distill_prompts(
     existing_recent: &[MemoryHit],
 ) -> (String, String) {
     let system = r#"You are 0x1-ai-memory's stateless per-turn memory distiller.
-Extract ONLY durable, high-signal engineering knowledge from this completed coding turn so other AI agents (Claude Code, Codex, Antigravity, T3 Code) working on the same project stay aligned.
+Extract ONLY durable, high-signal engineering knowledge from this completed coding turn so other AI agents (Claude Code, Codex, Antigravity) working on the same project stay aligned.
 
 Rules:
 1. Ignore routine exploration noise (mere file reads, trivial ls/grep, typos). If nothing durable was learned or decided, return {"memories":[]}.

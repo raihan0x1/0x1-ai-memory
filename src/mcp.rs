@@ -22,7 +22,7 @@ pub fn tool_definitions() -> Value {
                     "project": { "type": "string", "description": "Optional project_id or repo path" },
                     "scope": { "type": "string", "enum": ["project", "global"] },
                     "type": { "type": "string", "enum": ["decision", "bugfix", "architecture", "preference", "pattern", "session_summary"] },
-                    "client": { "type": "string", "description": "Filter by source AI client (claude-code, codex, antigravity, t3-code)" },
+                    "client": { "type": "string", "description": "Filter by source AI client (claude-code, codex, antigravity, mcp)" },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 30 }
                 }
             }

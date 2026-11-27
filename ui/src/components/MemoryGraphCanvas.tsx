@@ -51,7 +51,6 @@ const CLIENT_COLORS: Record<string, string> = {
   'claude-code': '#ff8b3e',
   codex: '#5fd39a',
   antigravity: '#6fa8ff',
-  't3-code': '#d79cff',
   mcp: '#e8c468',
   ui: '#b8b2a8',
 };
@@ -432,7 +431,6 @@ export function MemoryGraphCanvas({
           ['claude-code', CLIENT_COLORS['claude-code']],
           ['codex', CLIENT_COLORS.codex],
           ['antigravity', CLIENT_COLORS.antigravity],
-          ['t3-code', CLIENT_COLORS['t3-code']],
         ]
       : [
           ['decision', TYPE_COLORS.decision],

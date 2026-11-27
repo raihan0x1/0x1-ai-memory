@@ -193,6 +193,7 @@ impl MemoryDb {
             );
             "
         ))?;
+        normalize_legacy_clients(&conn)?;
         Ok(())
     }
 
@@ -443,18 +444,6 @@ impl MemoryDb {
             last_turn_at: now,
             status: "active".into(),
         })
-    }
-
-    pub fn has_external_session(&self, external_session_id: &str) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
-        let exists: Option<i64> = conn
-            .query_row(
-                "SELECT 1 FROM sessions WHERE external_session_id = ?1 LIMIT 1",
-                params![external_session_id],
-                |r| r.get(0),
-            )
-            .optional()?;
-        Ok(exists.is_some())
     }
 
     pub fn end_session(&self, session_id: &str) -> Result<()> {
@@ -1743,8 +1732,8 @@ impl MemoryDb {
             "claude-code" => "Claude Code",
             "codex" => "Codex CLI & App",
             "antigravity" => "Antigravity",
-            "t3-code" => "T3 Code",
-            _ => &norm,
+            // `mcp` and `ui` are not Clients, so they get no connection row.
+            _ => return Ok(()),
         };
         conn.execute(
             "INSERT INTO client_connections(client_id, display_name, detected, connected, last_heartbeat_at, last_event_at, updated_at)
@@ -1920,14 +1909,41 @@ fn row_to_graph_record(r: &rusqlite::Row<'_>, score: f64) -> rusqlite::Result<Gr
     })
 }
 
+/// Rewrites Client names stored before normalization (MCP aliases, User-Agent fallbacks) and
+/// drops connection rows that are not Clients, including the removed T3 Code watcher.
+fn normalize_legacy_clients(conn: &Connection) -> Result<()> {
+    for table in ["memories", "raw_events", "sessions"] {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT DISTINCT source_client FROM {table}
+             WHERE source_client NOT IN ('claude-code', 'codex', 'antigravity', 'mcp', 'ui')"
+        ))?;
+        let legacy: Vec<String> = stmt
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        for old in legacy {
+            // OR IGNORE keeps an alias session whose canonical twin already exists.
+            conn.execute(
+                &format!(
+                    "UPDATE OR IGNORE {table} SET source_client = ?1 WHERE source_client = ?2"
+                ),
+                params![normalize_client(Some(&old)), old],
+            )?;
+        }
+    }
+    conn.execute_batch(
+        "DELETE FROM client_connections WHERE client_id NOT IN ('claude-code', 'codex', 'antigravity');
+         DELETE FROM settings WHERE key IN ('t3_watcher_enabled', '_meta:t3_watermark');",
+    )?;
+    Ok(())
+}
+
 fn has_existing_user_data_locked(conn: &Connection) -> Result<bool> {
     let has_memories: bool =
         conn.query_row("SELECT EXISTS(SELECT 1 FROM memories LIMIT 1)", [], |r| {
             r.get::<_, i64>(0)
         })? != 0;
-    // Ignore passive t3-code (marked connected by default whenever T3 Code is installed).
     let has_prior_conn: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM client_connections WHERE connected = 1 AND client_id != 't3-code' LIMIT 1)",
+        "SELECT EXISTS(SELECT 1 FROM client_connections WHERE connected = 1 LIMIT 1)",
         [],
         |r| r.get::<_, i64>(0),
     )? != 0;

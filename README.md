@@ -5,7 +5,7 @@
 
 Local-first, anti-drain, cross-agent persistent memory engine shipped as a **single Rust binary (`0x1-memory`)** with an embedded localhost Web UI.
 
-Built to connect **Claude Code**, **Codex CLI & App**, **Antigravity**, **T3 Code**, and any MCP client to one unified memory store — without burning coding subscriptions or requiring Python/Node/Bun/Chroma sidecars.
+Built to connect **Claude Code**, **Codex CLI & App**, **Antigravity**, and any MCP client to one unified memory store — without burning coding subscriptions or requiring Python/Node/Bun/Chroma sidecars.
 
 ## Why `0x1-ai-memory`?
 
@@ -66,7 +66,7 @@ cargo build --release
 | `0x1-memory logs [-n 50]` | Print recent lines from `~/.0x1-memory/daemon.log` |
 | `0x1-memory autostart <enable\|disable\|status>` | Opt-in login Auto-Start (`launchd` on macOS, `systemd --user` on Linux) |
 | `0x1-memory serve [--port 10101] [--open] [--foreground]` | Run Daemon in foreground (debugging, `launchd`, or `systemd`) |
-| `0x1-memory setup [--client all\|claude-code\|codex\|antigravity\|t3-code] [--yes] [--disconnect]` | CLI Setup: auto-detect & connect clients with diff preview and backups in `~/.0x1-memory/backups/` |
+| `0x1-memory setup [--client all\|claude-code\|codex\|antigravity] [--yes] [--disconnect]` | CLI Setup: auto-detect & connect clients with diff preview and backups in `~/.0x1-memory/backups/` |
 | `0x1-memory status` | Show Daemon health, Auto-Start, connected/mismatched clients, memory totals, and today's usage |
 | `0x1-memory hook <claude\|codex\|antigravity> [event]` | Ultra-fast (<10ms) lifecycle hook shim (fails open if daemon is stopped) |
 | `0x1-memory mcp-stdio` | Optional stdio JSON-RPC MCP fallback for clients without Streamable HTTP |

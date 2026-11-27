@@ -46,7 +46,6 @@ const CLIENT_OPTIONS = [
   { value: 'claude-code', label: 'Claude Code' },
   { value: 'codex', label: 'Codex' },
   { value: 'antigravity', label: 'Antigravity' },
-  { value: 't3-code', label: 'T3 Code' },
   { value: 'mcp', label: 'MCP' },
   { value: 'ui', label: 'Manual UI' },
 ];
