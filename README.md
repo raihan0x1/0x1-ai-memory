@@ -10,6 +10,7 @@
   <a href="https://github.com/raihan0x1/0x1-ai-memory/releases"><img src="https://img.shields.io/github/v/release/raihan0x1/0x1-ai-memory?style=flat-square&color=111111&label=release" alt="GitHub release"></a>
   <a href="https://github.com/raihan0x1/0x1-ai-memory/actions/workflows/ci.yml"><img src="https://github.com/raihan0x1/0x1-ai-memory/actions/workflows/ci.yml/badge.svg?style=flat-square" alt="CI"></a>
   <a href="https://sonarcloud.io/summary/new_code?id=raihan0x1_0x1-ai-memory"><img src="https://sonarcloud.io/api/project_badges/measure?project=raihan0x1_0x1-ai-memory&metric=alert_status" alt="Quality Gate Status"></a>
+  <a href="https://m8ven.ai/mcp/raihan0x1/0x1-ai-memory?s=readme"><img src="https://m8ven.ai/badge/mcp/raihan0x1/0x1-ai-memory?variant=verified" alt="M8ven Verified"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-111111?style=flat-square" alt="MIT license"></a>
 </p>
 <p align="center">
