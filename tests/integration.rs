@@ -3492,3 +3492,145 @@ async fn usage_summary_counts_only_today_via_range_predicate() {
     let cost = summary["today_cost_usd"].as_f64().unwrap();
     assert!((cost - 0.05).abs() < 1e-6, "{cost}");
 }
+
+#[tokio::test]
+async fn mcp_http_endpoint_exposes_annotations_and_all_five_tools() {
+    let tmp = tempdir().unwrap();
+    let state = test_state(tmp.path());
+    let app = build_router(state);
+
+    let mcp_call = |body: Value| {
+        let app = app.clone();
+        async move {
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/mcp")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            body_json(resp).await
+        }
+    };
+
+    let list = mcp_call(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" })).await;
+    let tools = list["result"]["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 5);
+    for (name, read_only, destructive, idempotent, open_world) in [
+        ("memory_search", true, false, true, false),
+        ("memory_get", true, false, true, false),
+        ("memory_timeline", true, false, true, false),
+        ("memory_save", false, false, false, false),
+        ("memory_update", false, true, true, false),
+    ] {
+        let tool = tools
+            .iter()
+            .find(|t| t["name"].as_str() == Some(name))
+            .unwrap_or_else(|| panic!("missing tool {name}"));
+        let ann = tool["annotations"].as_object().unwrap();
+        assert_eq!(
+            ann.get("readOnlyHint").and_then(Value::as_bool),
+            Some(read_only)
+        );
+        assert_eq!(
+            ann.get("destructiveHint").and_then(Value::as_bool),
+            Some(destructive)
+        );
+        assert_eq!(
+            ann.get("idempotentHint").and_then(Value::as_bool),
+            Some(idempotent)
+        );
+        assert_eq!(
+            ann.get("openWorldHint").and_then(Value::as_bool),
+            Some(open_world)
+        );
+    }
+
+    let call_tool = |id: u64, name: &'static str, arguments: Value| {
+        let fut = mcp_call(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": { "name": name, "arguments": arguments }
+        }));
+        async move {
+            let resp = fut.await;
+            assert_eq!(resp["result"]["isError"], json!(false), "{resp}");
+            let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+            serde_json::from_str::<Value>(text).unwrap()
+        }
+    };
+
+    let saved1 = call_tool(
+        2,
+        "memory_save",
+        json!({
+            "title": "MCP HTTP alpha decision",
+            "summary": "First saved memory over HTTP MCP",
+            "content": "Full body for first memory",
+            "type": "decision",
+            "scope": "global"
+        }),
+    )
+    .await;
+    let id1 = saved1["memory"]["id"].as_str().unwrap().to_string();
+
+    let saved2 = call_tool(
+        3,
+        "memory_save",
+        json!({
+            "title": "MCP HTTP beta pattern",
+            "summary": "Second saved memory over HTTP MCP",
+            "content": "Full body for second memory",
+            "type": "pattern",
+            "scope": "global"
+        }),
+    )
+    .await;
+    let id2 = saved2["memory"]["id"].as_str().unwrap().to_string();
+
+    let search = call_tool(4, "memory_search", json!({ "query": "alpha" })).await;
+    assert_eq!(search["count"], json!(1));
+    assert_eq!(search["results"][0]["id"], json!(id1));
+
+    let fetched = call_tool(5, "memory_get", json!({ "ids": [id1] })).await;
+    assert_eq!(fetched["count"], json!(1));
+    assert_eq!(
+        fetched["memories"][0]["content"],
+        json!("Full body for first memory")
+    );
+
+    let timeline = call_tool(
+        6,
+        "memory_timeline",
+        json!({ "memory_id": id1, "before": 2, "after": 2 }),
+    )
+    .await;
+    assert_eq!(timeline["count"], json!(2));
+    let timeline_ids: Vec<&str> = timeline["timeline"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m["id"].as_str())
+        .collect();
+    assert!(timeline_ids.contains(&id1.as_str()));
+    assert!(timeline_ids.contains(&id2.as_str()));
+
+    let updated = call_tool(
+        7,
+        "memory_update",
+        json!({ "id": id1, "status": "pinned", "title": "MCP HTTP roundtrip pinned" }),
+    )
+    .await;
+    assert_eq!(updated["updated"], json!(true));
+    assert_eq!(updated["memory"]["status"], json!("pinned"));
+    assert_eq!(
+        updated["memory"]["title"],
+        json!("MCP HTTP roundtrip pinned")
+    );
+}
